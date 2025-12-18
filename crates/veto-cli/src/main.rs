@@ -38,6 +38,10 @@ enum Command {
         /// Scope: staged|worktree|repo (overrides config)
         #[arg(long)]
         scope: Option<String>,
+
+        /// Explain findings (verbose metadata)
+        #[arg(long)]
+        explain: bool,
     },
 
     /// Print environment & basic diagnostics
@@ -67,13 +71,19 @@ fn main() -> Result<()> {
             println!("- rust: {}", env!("CARGO_PKG_RUST_VERSION"));
             Ok(())
         }
-        Command::Scan { format, scope } => {
+        Command::Scan {
+            format,
+            scope,
+            explain,
+        } => {
             let format = format
                 .or_else(|| Some(cfg.output.format.clone()))
                 .unwrap_or_else(|| "text".into());
             let scope = scope
                 .or_else(|| Some(cfg.scope.mode.clone()))
                 .unwrap_or_else(|| "staged".into());
+
+            // ... context logic ...
 
             let ctx = Context {
                 repo_root,
@@ -87,6 +97,9 @@ fn main() -> Result<()> {
                 threshold: cfg.entropy_guard.threshold,
                 ignore_extensions: cfg.entropy_guard.ignore_ext.clone(),
                 allowlist: cfg.allowlist.patterns.clone(),
+                max_file_bytes: cfg.entropy_guard.max_file_bytes,
+                max_line_length: cfg.entropy_guard.max_line_length,
+                max_tokens_per_file: cfg.entropy_guard.max_tokens_per_file,
             };
             let runner = Runner::new().with_check(Box::new(entropy_guard));
 
@@ -98,7 +111,7 @@ fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 _ => {
-                    print_text(&report);
+                    print_text(&report, explain);
                 }
             }
 
@@ -156,7 +169,7 @@ fn exit_code_from(cfg: &Config, worst: Option<Severity>) -> i32 {
     }
 }
 
-fn print_text(report: &veto_core::Report) {
+fn print_text(report: &veto_core::Report, explain: bool) {
     if report.findings.is_empty() {
         println!("OK (no findings) — {}ms", report.duration_ms);
         return;
@@ -180,5 +193,13 @@ fn print_text(report: &veto_core::Report) {
             loc
         );
         println!("  {}", f.message);
+        if explain {
+            if let Some(d) = &f.details {
+                println!(
+                    "  [Explain] entropy={:.2}, len={}, charset={}",
+                    d.entropy, d.token_len, d.charset
+                );
+            }
+        }
     }
 }

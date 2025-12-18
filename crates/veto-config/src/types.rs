@@ -87,6 +87,12 @@ pub struct EntropyGuardConfig {
     pub threshold: f64,
     #[serde(default)]
     pub ignore_ext: Vec<String>,
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_max_line_length")]
+    pub max_line_length: usize,
+    #[serde(default = "default_max_tokens_per_file")]
+    pub max_tokens_per_file: usize,
 }
 
 fn default_enabled() -> bool {
@@ -97,6 +103,15 @@ fn default_min_length() -> usize {
 }
 fn default_threshold() -> f64 {
     4.2
+}
+fn default_max_file_bytes() -> u64 {
+    1_048_576 // 1MB
+}
+fn default_max_line_length() -> usize {
+    10_000
+}
+fn default_max_tokens_per_file() -> usize {
+    2_000
 }
 
 impl Default for EntropyGuardConfig {
@@ -113,6 +128,9 @@ impl Default for EntropyGuardConfig {
                 "pdf".into(),
                 "lock".into(),
             ],
+            max_file_bytes: default_max_file_bytes(),
+            max_line_length: default_max_line_length(),
+            max_tokens_per_file: default_max_tokens_per_file(),
         }
     }
 }

@@ -46,6 +46,9 @@ veto doctor
   - 出力形式。`veto.toml` の `[output].format` を上書きします。
 - `--scope <staged|worktree|repo>`
   - スキャン範囲。`veto.toml` の `[scope].mode` を上書きします。
+- `--explain`
+  - ヒット時の詳細メタデータ（entropy値, token長, charset判定）を表示します。
+  - **重要**: 生のトークン値（secrets）は表示されません。安全です。
 
 **Examples:**
 

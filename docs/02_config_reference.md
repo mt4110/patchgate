@@ -8,8 +8,9 @@ Purpose: 設定ファイルの全オプションと仕様。
 ## Overview
 `veto.toml` をプロジェクトルートに配置することで、スキャンの挙動をカスタマイズできます。
 
-> **Implementation status (v0.2.0)**
+> **Implementation status (v0.2.2)**
 > Entropy Guard 設定は実装済・検証済です。
+> DoS対策（max_file_bytes等）が追加されました。
 > `allowlist` は部分一致(substring match)として機能します。正規表現は未対応です。
 
 ## Precedence
@@ -47,6 +48,9 @@ enabled = true
 min_length = 24
 threshold = 4.2
 ignore_ext = ["png", "jpg", "gif", "mp4", "pdf"]
+max_file_bytes = 1048576       # 1MB
+max_line_length = 10000
+max_tokens_per_file = 2000
 ```
 
 ## Reference
@@ -97,6 +101,15 @@ ignore_ext = ["png", "jpg", "gif", "mp4", "pdf"]
 - **`ignore_ext`** (Vec<String>)
     - デフォルト: `["png", "jpg", "gif", "mp4", "pdf"]`
     - 説明: エントロピーチェックから除外する拡張子（バイナリファイル等）。
+- **`max_file_bytes`** (u64)
+    - デフォルト: `1048576` (1MB)
+    - 説明: スキャンする最大ファイルサイズ。これを超えるとスキップされます（DoS対策）。
+- **`max_line_length`** (usize)
+    - デフォルト: `10000`
+    - 説明: スキャンする1行の最大文字数。超えた行はスキップされます。
+- **`max_tokens_per_file`** (usize)
+    - デフォルト: `2000`
+    - 説明: 1ファイルあたりに抽出する最大トークン数。超えると残りは無視されます。
 
 ## Notes
 - **ファイルパス**: 設定ファイルはデフォルトで **実行時のカレントディレクトリ** の `veto.toml` を探します。
