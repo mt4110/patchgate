@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub output: OutputConfig,
@@ -10,17 +10,6 @@ pub struct Config {
     pub allowlist: AllowlistConfig,
     #[serde(default)]
     pub entropy_guard: EntropyGuardConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            output: OutputConfig::default(),
-            scope: ScopeConfig::default(),
-            allowlist: AllowlistConfig::default(),
-            entropy_guard: EntropyGuardConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,16 +54,10 @@ impl Default for ScopeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AllowlistConfig {
     #[serde(default)]
     pub patterns: Vec<String>,
-}
-
-impl Default for AllowlistConfig {
-    fn default() -> Self {
-        Self { patterns: vec![] }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
