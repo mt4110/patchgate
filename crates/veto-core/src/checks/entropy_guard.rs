@@ -293,12 +293,10 @@ fn extract_runs(line: &str) -> Vec<(&str, CharsetHint)> {
             if start.is_none() {
                 start = Some(i);
             }
-        } else {
-            if let Some(s) = start {
-                let token = &line[s..i];
-                results.push((token, detect_charset(token)));
-                start = None;
-            }
+        } else if let Some(s) = start {
+            let token = &line[s..i];
+            results.push((token, detect_charset(token)));
+            start = None;
         }
     }
     if let Some(s) = start {
