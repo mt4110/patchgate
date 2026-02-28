@@ -1,0 +1,91 @@
+# patchgate policy (MVP)
+
+[output]
+format = "text"          # text | json
+mode = "warn"            # warn | enforce
+fail_threshold = 70       # 0..=100, score below this fails in enforce mode
+
+[scope]
+mode = "staged"          # staged | worktree | repo
+
+[cache]
+enabled = true
+db_path = ".patchgate/cache.db"
+
+[exclude]
+# Skip generated files or vendored code
+globs = [
+  "vendor/**",
+  "**/generated/**",
+]
+
+[weights]
+test_gap_max_penalty = 35
+dangerous_change_max_penalty = 45
+dependency_update_max_penalty = 30
+
+[test_gap]
+enabled = true
+test_globs = [
+  "tests/**",
+  "**/__tests__/**",
+  "**/*.test.*",
+  "**/*.spec.*",
+]
+production_ignore_globs = [
+  "docs/**",
+  "**/*.md",
+  "**/*.txt",
+  "**/*.rst",
+  "**/*.adoc",
+  "**/*.yaml",
+  "**/*.yml",
+]
+missing_tests_penalty = 28
+large_change_lines = 200
+large_change_penalty = 8
+
+[dangerous_change]
+enabled = true
+# patterns: high-risk paths (base penalty)
+patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+  "migrations/**",
+  "db/migrate/**",
+  "**/auth/**",
+  "**/security/**",
+]
+# critical_patterns: subset of patterns that receive extra critical bonus penalty
+critical_patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+]
+per_file_penalty = 10
+critical_bonus_penalty = 6
+
+[dependency_update]
+enabled = true
+# manifest_globs: direct dependency declarations
+manifest_globs = [
+  "**/Cargo.toml",
+  "**/package.json",
+  "**/go.mod",
+  "**/pyproject.toml",
+]
+# lockfile_globs: resolved dependency graph snapshots
+lockfile_globs = [
+  "**/Cargo.lock",
+  "**/package-lock.json",
+  "**/yarn.lock",
+  "**/pnpm-lock.yaml",
+  "**/go.sum",
+]
+manifest_penalty = 18
+lockfile_penalty = 8
+large_lockfile_churn = 200
+large_lockfile_penalty = 10

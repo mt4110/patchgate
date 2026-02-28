@@ -1,53 +1,53 @@
-# veto-rs
-**Local verification gates** for developers and CI: stop accidents *before* they land.
+# patchgate
 
-## What it is
-`veto` is a Rust CLI that runs a set of **checks** against your repo (or staged diff) and returns:
-- human-readable output (safe by default)
-- machine-readable JSON
-- non-zero exit codes to block commits/CI when needed
+**patchgate** is a diff-based quality gate for pull requests.
+It computes a single score (0-100) from:
 
-This repo is structured as a small workspace:
-- `veto-core`  : check framework + report model (no CLI, no IO assumptions)
-- `veto-config`: config parsing + defaults
-- `veto-cli`   : user-facing CLI (subcommands, formats, exit codes)
-- `xtask`      : release/dev helpers (optional)
+- Missing test coverage (`test_gap`)
+- Dangerous file changes (`dangerous_change`)
+- Dependency update risk (`dependency_update`)
+- Review priority (`P0`..`P3`)
 
-## Prerequisites
+## Principles
+- Nix-first developer workflow
+- Multi-platform validation (Linux / macOS / Windows)
+- Low variable cost (run logic locally/CI, cloud only for metadata)
 
-To ensure reproducibility across platforms, please use **Nix**.
+## Quickstart
 
 ```bash
-# Recommended (with direnv)
-direnv allow
-
-# Or explicitly
 nix develop
-```
-
-Please ensure you are inside the Nix environment before running `cargo`.
-
-## Quick start
-```bash
-cargo run -p veto-cli -- scan
+cargo run -p patchgate-cli -- scan --mode warn
 ```
 
 JSON output:
+
 ```bash
-cargo run -p veto-cli -- scan --format json
+cargo run -p patchgate-cli -- scan --format json
 ```
 
-## Config
-Copy:
-- `config/veto.toml.example` → `veto.toml`
+Publish PR comment and check run to GitHub:
 
-## Optional infra
-- `infra/postgres/docker-compose.yml` (only if you later want audit logs / shared state)
+```bash
+GITHUB_TOKEN=... cargo run -p patchgate-cli -- scan --github-publish
+```
 
-## Roadmap (high level)
-- Entropy Guard (staged diff secret blocker)
-- Dependency checks (Cargo.lock / npm lock / OSV)
-- Signature verification (tags / commits)
-- Build reproducibility checks (Nix-oriented)
+## Policy file
 
-See: `docs/ROADMAP.md`
+```bash
+cp config/policy.toml.example policy.toml
+```
+
+## CLI
+
+- `patchgate scan --mode warn|enforce --scope staged|worktree|repo --format text|json`
+- `patchgate doctor`
+
+Exit code:
+- `0`: success (`warn`, or `enforce` gate pass)
+- `1`: gate failed in `enforce` (`score < fail_threshold`)
+- `2`: input error (invalid `scan` option value)
+- `3`: config error (config load or config value validation)
+- `4`: runtime error (diff collection, evaluation, cache)
+- `5`: output error (JSON/report write)
+- `6`: GitHub publish error

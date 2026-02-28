@@ -1,16 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/veto-core",
-  "crates/veto-config",
-  "crates/veto-cli",
+  "crates/patchgate-core",
+  "crates/patchgate-config",
+  "crates/patchgate-cli",
+  "crates/patchgate-github",
   "crates/xtask",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mt4110/veto-rs"
+repository = "https://github.com/mt4110/patchgate"
 rust-version = "1.75"
 
 [workspace.dependencies]

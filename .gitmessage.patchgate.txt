@@ -1,0 +1,14 @@
+<type>(<area>): <summary>
+
+Phase: <phase-number>
+PR: <PR01-PR20>
+
+Checklist:
+- [ ] impl
+- [ ] test
+- [ ] docs
+- [ ] cargo test --workspace
+- [ ] compatibility impact checked
+
+Notes:
+- <optional>

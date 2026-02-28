@@ -1,0 +1,46 @@
+name: patchgate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # keep base parent reachable for worktree diff materialization
+          fetch-depth: 2
+
+      - uses: cachix/install-nix-action@v30
+
+      - name: Materialize PR diff into worktree
+        if: github.event_name == 'pull_request'
+        run: |
+          # checkout is pull_request merge commit by default.
+          # move HEAD to base parent while keeping merged tree in worktree.
+          # this makes `git diff` represent the PR delta.
+          git reset --mixed HEAD^1
+
+      - name: Run patchgate (publish priority-first PR comment + check-run)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --mode enforce \
+            --scope worktree \
+            --format json \
+            --github-comment patchgate-comment.md \
+            --github-publish
+
+      - name: Upload report artifact (includes Priority findings section)
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchgate-comment
+          path: patchgate-comment.md

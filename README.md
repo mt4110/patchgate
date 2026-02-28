@@ -1,57 +1,67 @@
-# veto-rs
+# patchgate
 
 [English](README_EN.md) | **日本語**
 
-**開発者とCIのためのローカル検証ゲート**: 事故が起きる *前* に阻止します。
+`patchgate` は **PR変更差分の品質ゲート** です。
+セキュリティ専用ではなく、次の4軸を1つのスコア (0-100) で判定します。
 
-## 概要
-`veto` は、リポジトリ（またはステージングされた差分）に対して一連の **チェック** を実行する Rust 製 CLI ツールです。
+- テスト不足 (`test_gap`)
+- 破壊的変更リスク (`dangerous_change`)
+- 依存更新リスク (`dependency_update`)
+- レビュー優先度 (`P0`..`P3`)
 
-- 人間に読みやすい出力（デフォルトで安全）
-- 機械可読な JSON 出力
-- 必要に応じてコミットや CI をブロックするための非ゼロ終了コード
-
-このリポジトリは小さなワークスペースとして構成されています：
-- `veto-core`  : チェックのフレームワーク + レポートモデル（CLIなし、IO仮定なし）
-- `veto-config`: 設定のパース + デフォルト値
-- `veto-cli`   : ユーザー向け CLI（サブコマンド、フォーマット、終了コード）
-- `xtask`      : リリース/開発ヘルパー（オプション）
-
-## 前提条件 (Prerequisites)
-
-マルチプラットフォームでの動作と再現性を保証するため、開発には **Nix** の使用を強く推奨します。
-
-```bash
-# direnvを使用する場合（推奨）
-direnv allow
-
-# または明示的にシェルに入る場合
-nix develop
-```
-
-`cargo` コマンドを実行する前に、必ず上記のいずれかで Nix 環境に入ってください。
+## 方針
+- **Nix前提**: 開発・CIの実行環境を固定
+- **マルチプラットフォーム必須**: Linux / macOS / Windows で検証
+- **低変動費設計**: 実行の主役はローカル/CI、SaaSはメタデータのみ
 
 ## クイックスタート
+
 ```bash
-cargo run -p veto-cli -- scan
+# Nix shell
+nix develop
+
+# 実行
+cargo run -p patchgate-cli -- scan --mode warn
 ```
 
-JSON 出力:
+JSON出力:
+
 ```bash
-cargo run -p veto-cli -- scan --format json
+cargo run -p patchgate-cli -- scan --format json
 ```
 
-## 設定 (Config)
-コピーして使用します：
-- `config/veto.toml.example` → `veto.toml`
+## policy.toml
 
-## オプションのインフラ`
-- `infra/postgres/docker-compose.yml` (監査ログや共有状態が必要な場合のみ)
+`config/policy.toml.example` をコピーして `policy.toml` として使います。
 
-## ロードマップ (High level)
-- Entropy Guard (ステージングされた差分からの秘密情報検出)
-- 依存関係チェック (Cargo.lock / npm lock / OSV)
-- 署名検証 (タグ / コミット)
-- ビルド再現性チェック (Nix 指向)
+```bash
+cp config/policy.toml.example policy.toml
+```
 
-参照: `docs/ROADMAP.md`
+## CLI
+
+- `patchgate scan --mode warn|enforce --scope staged|worktree|repo --format text|json`
+- `patchgate doctor`
+
+### Exit Code
+
+- `0`: 成功（`warn` 実行、または `enforce` で gate pass）
+- `1`: `enforce` で `score < fail_threshold`（gate fail）
+- `2`: 入力エラー（`scan` オプション値不正）
+- `3`: 設定エラー（設定ファイル読み込み/設定値不正）
+- `4`: 実行エラー（差分収集・評価・キャッシュ）
+- `5`: 出力エラー（JSON/レポート書き込み）
+- `6`: GitHub publish エラー
+
+## GitHub Actions テンプレ
+
+`docs/patchgate-action.yml` を参照してください。
+
+## MVPに含むチェック
+
+- 差分ベースの3チェック (テスト不足 / 危険ファイル変更 / 依存更新)
+- スコアリングとfail threshold
+- `warn` / `enforce` モード
+- JSON出力
+- SQLiteキャッシュ（同一差分は再計算スキップ）

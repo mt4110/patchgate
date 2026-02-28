@@ -1,5 +1,5 @@
 [package]
-name = "veto-config"
+name = "patchgate-config"
 version = "0.2.2"
 edition.workspace = true
 license.workspace = true

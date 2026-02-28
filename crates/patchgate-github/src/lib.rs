@@ -1,0 +1,256 @@
+use anyhow::{Context as _, Result};
+use patchgate_core::Report;
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use serde::{Deserialize, Serialize};
+
+const MARKER: &str = "<!-- patchgate:report -->";
+
+#[derive(Debug, Clone)]
+pub struct PublishRequest {
+    pub repo: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub token: String,
+    pub check_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PublishResult {
+    pub comment_url: Option<String>,
+    pub check_run_url: Option<String>,
+}
+
+pub fn publish_report(
+    report: &Report,
+    markdown: &str,
+    req: &PublishRequest,
+) -> Result<PublishResult> {
+    let client = github_client(&req.token)?;
+
+    let body = ensure_comment_marker(markdown);
+    let comment_url = upsert_pr_comment(&client, &req.repo, req.pr_number, &body)?;
+
+    let check_run_url = publish_check_run(&client, report, req, markdown)?;
+
+    Ok(PublishResult {
+        comment_url,
+        check_run_url,
+    })
+}
+
+fn github_client(token: &str) -> Result<Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("patchgate/0.2"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    let auth = format!("Bearer {token}");
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&auth).context("failed to build auth header")?,
+    );
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("failed to build github client")
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueComment {
+    id: u64,
+    body: Option<String>,
+    html_url: Option<String>,
+}
+
+fn upsert_pr_comment(
+    client: &Client,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<Option<String>> {
+    let mut page = 1u32;
+    loop {
+        let comments_url = format!(
+            "https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}"
+        );
+
+        let comments: Vec<IssueComment> = client
+            .get(&comments_url)
+            .send()
+            .context("failed to list issue comments")?
+            .error_for_status()
+            .context("github returned error listing issue comments")?
+            .json()
+            .context("failed to decode issue comments")?;
+
+        if let Some(existing) = comments
+            .iter()
+            .find(|c| c.body.as_deref().is_some_and(|b| b.contains(MARKER)))
+        {
+            let update_url = format!(
+                "https://api.github.com/repos/{repo}/issues/comments/{}",
+                existing.id
+            );
+            let updated: IssueComment = client
+                .patch(&update_url)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .context("failed to update issue comment")?
+                .error_for_status()
+                .context("github returned error updating issue comment")?
+                .json()
+                .context("failed to decode updated issue comment")?;
+            return Ok(updated.html_url);
+        }
+
+        if comments.len() < 100 {
+            break;
+        }
+        page = page.saturating_add(1);
+    }
+
+    let created: IssueComment = client
+        .post(format!(
+            "https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+        ))
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .context("failed to create issue comment")?
+        .error_for_status()
+        .context("github returned error creating issue comment")?
+        .json()
+        .context("failed to decode created issue comment")?;
+
+    Ok(created.html_url)
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunResponse {
+    html_url: Option<String>,
+}
+
+fn publish_check_run(
+    client: &Client,
+    report: &Report,
+    req: &PublishRequest,
+    markdown: &str,
+) -> Result<Option<String>> {
+    let conclusion = check_run_conclusion(report);
+
+    let status_line = format!(
+        "Score {}/100 (threshold {}, mode {})",
+        report.score, report.threshold, report.mode
+    );
+
+    let payload = serde_json::json!({
+        "name": req.check_name,
+        "head_sha": req.head_sha,
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": {
+            "title": "patchgate quality gate",
+            "summary": status_line,
+            "text": truncate(markdown, 65000)
+        }
+    });
+
+    let check: CheckRunResponse = client
+        .post(format!(
+            "https://api.github.com/repos/{}/check-runs",
+            req.repo
+        ))
+        .json(&payload)
+        .send()
+        .context("failed to create check run")?
+        .error_for_status()
+        .context("github returned error creating check run")?
+        .json()
+        .context("failed to decode check run response")?;
+
+    Ok(check.html_url)
+}
+
+fn check_run_conclusion(report: &Report) -> &'static str {
+    if report.mode == "enforce" && report.should_fail {
+        "failure"
+    } else if report.findings.is_empty() {
+        "success"
+    } else {
+        "neutral"
+    }
+}
+
+fn truncate(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect()
+}
+
+fn ensure_comment_marker(markdown: &str) -> String {
+    if markdown.contains(MARKER) {
+        markdown.to_string()
+    } else {
+        format!("{MARKER}\n\n{markdown}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use patchgate_core::{CheckId, CheckScore, Report, ReportMeta};
+
+    use super::{check_run_conclusion, ensure_comment_marker, truncate, MARKER};
+
+    #[test]
+    fn truncate_keeps_short_text() {
+        let s = "abc";
+        assert_eq!(truncate(s, 10), "abc");
+    }
+
+    #[test]
+    fn truncate_cuts_long_text() {
+        let s = "abcdef";
+        assert_eq!(truncate(s, 4), "abcd");
+    }
+
+    #[test]
+    fn ensure_comment_marker_is_added_once() {
+        let no_marker = "## report";
+        let with_marker = format!("{MARKER}\n\n## report");
+        assert!(ensure_comment_marker(no_marker).starts_with(MARKER));
+        assert_eq!(ensure_comment_marker(&with_marker), with_marker);
+    }
+
+    #[test]
+    fn check_run_conclusion_respects_mode() {
+        let base_report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 40,
+                max_penalty: 40,
+                triggered: true,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        assert!(base_report.should_fail);
+        assert_eq!(check_run_conclusion(&base_report), "success");
+
+        let enforce_report = Report {
+            mode: "enforce".to_string(),
+            ..base_report.clone()
+        };
+        assert_eq!(check_run_conclusion(&enforce_report), "failure");
+    }
+}
