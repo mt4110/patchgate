@@ -31,6 +31,8 @@ test_globs = [
   "**/__tests__/**",
   "**/*.test.*",
   "**/*.spec.*",
+  "**/*_test.go",
+  "**/test_*.py",
 ]
 production_ignore_globs = [
   "docs/**",
@@ -38,8 +40,6 @@ production_ignore_globs = [
   "**/*.txt",
   "**/*.rst",
   "**/*.adoc",
-  "**/*.yaml",
-  "**/*.yml",
 ]
 missing_tests_penalty = 28
 large_change_lines = 200
@@ -53,10 +53,14 @@ patterns = [
   "infra/**",
   "terraform/**",
   "k8s/**",
+  "helm/**",
   "migrations/**",
   "db/migrate/**",
   "**/auth/**",
   "**/security/**",
+  "Dockerfile",
+  "docker-compose*.yml",
+  "docker-compose*.yaml",
 ]
 # critical_patterns: subset of patterns that receive extra critical bonus penalty
 critical_patterns = [
@@ -64,6 +68,7 @@ critical_patterns = [
   "infra/**",
   "terraform/**",
   "k8s/**",
+  "migrations/**",
 ]
 per_file_penalty = 10
 critical_bonus_penalty = 6
@@ -75,7 +80,12 @@ manifest_globs = [
   "**/Cargo.toml",
   "**/package.json",
   "**/go.mod",
+  "**/requirements*.txt",
   "**/pyproject.toml",
+  "**/Gemfile",
+  "**/pom.xml",
+  "**/build.gradle",
+  "**/build.gradle.kts",
 ]
 # lockfile_globs: resolved dependency graph snapshots
 lockfile_globs = [
@@ -84,6 +94,9 @@ lockfile_globs = [
   "**/yarn.lock",
   "**/pnpm-lock.yaml",
   "**/go.sum",
+  "**/Pipfile.lock",
+  "**/poetry.lock",
+  "**/Gemfile.lock",
 ]
 manifest_penalty = 18
 lockfile_penalty = 8

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
     pub output: OutputConfig,
@@ -20,7 +20,7 @@ pub struct Config {
     pub dependency_update: DependencyUpdateConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputConfig {
     #[serde(default = "default_format")]
     pub format: String, // "text" | "json"
@@ -52,7 +52,7 @@ fn default_fail_threshold() -> u8 {
     70
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeConfig {
     #[serde(default = "default_scope_mode")]
     pub mode: String, // "staged" | "worktree" | "repo"
@@ -70,7 +70,7 @@ fn default_scope_mode() -> String {
     "staged".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -95,13 +95,25 @@ fn default_db_path() -> String {
     ".patchgate/cache.db".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExcludeConfig {
-    #[serde(default)]
+    #[serde(default = "default_exclude_globs")]
     pub globs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for ExcludeConfig {
+    fn default() -> Self {
+        Self {
+            globs: default_exclude_globs(),
+        }
+    }
+}
+
+fn default_exclude_globs() -> Vec<String> {
+    vec!["vendor/**".into(), "**/generated/**".into()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WeightsConfig {
     #[serde(default = "default_test_gap_max")]
     pub test_gap_max_penalty: u8,
@@ -133,7 +145,7 @@ fn default_dependency_update_max() -> u8 {
     30
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TestGapConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -195,7 +207,7 @@ fn default_large_change_penalty() -> u8 {
     8
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DangerousChangeConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -256,7 +268,7 @@ fn default_critical_bonus_penalty() -> u8 {
     6
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DependencyUpdateConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,

@@ -20,3 +20,6 @@ sha2 = "0.10"
 patchgate-core = { path = "../patchgate-core" }
 patchgate-config = { path = "../patchgate-config" }
 patchgate-github = { path = "../patchgate-github" }
+
+[dev-dependencies]
+serde_json.workspace = true

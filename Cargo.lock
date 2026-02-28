@@ -727,6 +727,7 @@ name = "patchgate-config"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "globset",
  "serde",
  "thiserror 1.0.69",
  "toml",
@@ -1749,6 +1750,8 @@ name = "xtask"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
