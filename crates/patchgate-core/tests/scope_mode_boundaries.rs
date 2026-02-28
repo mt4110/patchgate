@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use patchgate_config::Config;
@@ -14,11 +15,17 @@ struct TestRepo {
     root: PathBuf,
 }
 
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl TestRepo {
     fn create() -> TestResult<Self> {
         let mut root = std::env::temp_dir();
         let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        root.push(format!("patchgate-scope-test-{}-{ts}", std::process::id()));
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        root.push(format!(
+            "patchgate-scope-test-{}-{ts}-{seq}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root)?;
 
         let repo = Self { root };
