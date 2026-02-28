@@ -1,65 +1,31 @@
 # 00 Quickstart
 
-Purpose: 3分で導入して「動いた」を確認する。
-
-- Status: Verified
-- Last verified: 2025-12-18 (Entropy Guard detected, Veto Doctor verified)
-
-## Prerequisites
-- Rust 1.75+ toolchain included
-
-## Installation
-
-開発中のため、ソースコードからインストールします。
+## 1) Nix shell
 
 ```bash
-# プロジェクトルートで実行
-cargo install --path crates/veto-cli --locked
+nix develop
 ```
 
-インストール後、ヘルプが表示できるか確認します。
-```bash
-veto --help
-```
-
-## Basic Usage
-
-### 1. 動作確認 (Veto Doctor)
-環境が正しくセットアップされているか確認します。
+## 2) Install / run
 
 ```bash
-veto doctor
+cargo install --path crates/patchgate-cli --locked
+patchgate --help
 ```
 
-### 2. 最小設定の作成
-デフォルトでも動作しますが、設定ファイル `veto.toml` を置くことで挙動を制御できます。
+## 3) Add policy
 
-```toml
-# veto.toml
-[output]
-format = "text"
-fail_on = "high"
-```
-
-### 3. スキャンの実行
 ```bash
-# デフォルト（Gitステージング済みファイルのみ対象）
-veto scan
-
-# 作業ディレクトリ全体を対象にする場合
-veto scan --scope worktree
+cp config/policy.toml.example policy.toml
 ```
 
-### 4. 検出例 (Entropy Guard)
-秘密情報のような高エントロピー文字列が含まれている場合、`High-entropy token detected` として報告され、終了コード 1 で失敗します。
+## 4) Scan
 
-```text
-- [HIGH] High-entropy token detected @ src/secrets.rs:10
-  Possible secret detected (entropy: 4.88, len: 40). Content: sk_l...8d9a
+```bash
+patchgate scan --mode warn
+patchgate scan --mode enforce --format json
 ```
-(生のトークン値はマスクされ、ログには残りません)
 
-## Common Pitfalls
+## 5) CI template
 
-- **`veto scan` が何も出力しない**: デフォルトは `staged` (コミット予定のファイル) のみが対象です。git add していないファイルはスキャンされません。`--scope worktree` を試してください。
-- **設定ファイルが読み込まれない**: カレントディレクトリにある `veto.toml` のみが読み込まれます。
+`docs/patchgate-action.yml` を `.github/workflows/patchgate.yml` にコピーして使います。

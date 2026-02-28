@@ -1,19 +1,14 @@
 [package]
-name = "veto-cli"
+name = "patchgate-github"
 version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "veto"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-veto-core = { path = "../veto-core" }
-veto-config = { path = "../veto-config" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+patchgate-core = { path = "../patchgate-core" }

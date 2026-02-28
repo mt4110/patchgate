@@ -1,5 +1,5 @@
 {
-  description = "veto-rs - local verification gates (Rust)";
+  description = "patchgate - diff quality gate (Rust)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
@@ -21,17 +21,19 @@
             pkgs.openssl
             pkgs.git
             pkgs.just
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
           ];
           RUST_BACKTRACE = "1";
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "veto";
+          pname = "patchgate";
           version = "0.2.2";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
+          buildInputs = [ pkgs.openssl ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
         };
       }
     );

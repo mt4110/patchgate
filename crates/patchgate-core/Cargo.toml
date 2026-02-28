@@ -1,5 +1,5 @@
 [package]
-name = "veto-core"
+name = "patchgate-core"
 version = "0.2.2"
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+globset = "0.4"
+sha2 = "0.10"
+patchgate-config = { path = "../patchgate-config" }

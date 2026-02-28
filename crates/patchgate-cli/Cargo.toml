@@ -1,0 +1,22 @@
+[package]
+name = "patchgate-cli"
+version = "0.2.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "patchgate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.33", features = ["bundled"] }
+sha2 = "0.10"
+patchgate-core = { path = "../patchgate-core" }
+patchgate-config = { path = "../patchgate-config" }
+patchgate-github = { path = "../patchgate-github" }

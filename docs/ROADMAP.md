@@ -1,37 +1,39 @@
 # Roadmap
 
-This is intentionally short. The goal is to ship small, then grow.
+This roadmap tracks the patchgate pivot.
 
-## v0.2.1: Stable Release Process (Reproducibility)
-- Fix dates and versions in docs/config
-- Ensure clean tarball (no `._*` files) via `git archive`
-- Include release checklist
+## Detailed phase design
 
-## v0.2.2: Entropy Guard Tuning (Field Ready)
-- Improved tokenization (URL/Base64 handling)
-- File/Line size limits (DoS prevention)
-- --explain output (no raw values)
+- [Phase Backcast (1-100)](06_phase_backcast_1_100.md)
+- [PR Plan: Phase1-10](07_pr_plan_phase1_10.md)
+- [PR Plan: Phase11-20](08_pr_plan_phase11_20.md)
+- [PR Execution Checklist Template](09_pr_execution_checklist.md)
 
-## v0.2.3: Repo Scan (EG-2)
-- Repo-wide scan implementation
-- Default directory ignores (`.git`, `target`, etc.)
-- Output stability
+## v0.3.0 (MVP)
+- Diff-based quality gate with 3 checks
+  - `test_gap`
+  - `dangerous_change`
+  - `dependency_update`
+- Score `0..100` and `fail_threshold`
+- `warn|enforce` execution mode
+- JSON output + GitHub comment markdown
+- SQLite cache for unchanged diff fingerprint
 
-## v0.2.4: Robust Allowlist
-- Regex support
-- Scoped allowlist
-- Config validation improvements
+## v0.3.1
+- Check result explainability improvements
+- Better language-specific test heuristics
+- More precise dependency risk signals
 
-## v0.2.5: CI/Dev UX
-- `veto install-hook`
-- CI mode optimization
-- GitHub Actions snippets
+## v0.3.2
+- GitHub adapter as standalone crate
+- Check-run + PR comment posting helpers
+- Policy distribution and version pinning
 
-## v0.3.0: Baseline (Stop the Bleeding)
-- `veto baseline create`
-- `veto scan` with baseline support
-- Stable baseline file format
+## v0.4.0
+- Historical trend API (metadata only)
+- Team/repo policy presets
+- Review-priority analytics dashboard
 
-## v0.4+ "Trust chain & Repro"
-- Release signature verification
-- Nix build reproducibility check
+## Non-goals (current phase)
+- Full remote source scan as primary path
+- High-cost cloud inference in hot path

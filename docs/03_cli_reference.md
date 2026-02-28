@@ -43,6 +43,9 @@ GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SH
   - `41..65`: `P1`
   - `66..85`: `P2`
   - `86..100`: `P3`
+- 表記:
+  - text出力/Markdownでは `P0..P3`
+  - JSON (`review_priority`) では `p0..p3`
 
 ## JSON contract (`scan --format json`)
 

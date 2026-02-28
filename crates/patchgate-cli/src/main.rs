@@ -175,7 +175,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Command::Doctor => {
-            let config_path = resolve_config_path(cli.config.as_deref());
+            let config_path = resolve_config_path(&repo_root, cli.config.as_deref());
             println!("patchgate doctor");
             println!("- repo_root: {}", repo_root.display());
             println!(
@@ -221,7 +221,7 @@ fn execute_scan(
         github_check_name,
     } = scan;
 
-    let config_path = resolve_config_path(config_override);
+    let config_path = resolve_config_path(repo_root, config_override);
     let mut cfg = load_config(config_path.as_deref()).map_err(|err| {
         ScanError::new(
             ScanErrorKind::Config,
@@ -229,9 +229,7 @@ fn execute_scan(
         )
     })?;
 
-    if let Some(t) = threshold {
-        cfg.output.fail_threshold = t.min(100);
-    }
+    apply_threshold_override(&mut cfg, threshold)?;
 
     let opts = resolve_scan_options(&cfg, format.as_deref(), scope.as_deref(), mode.as_deref())?;
 
@@ -441,19 +439,35 @@ fn pr_number_from_ref(reference: &str) -> Option<u64> {
     None
 }
 
-fn resolve_config_path(override_path: Option<&Path>) -> Option<PathBuf> {
+fn resolve_config_path(repo_root: &Path, override_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = override_path {
-        return Some(path.to_path_buf());
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        return Some(repo_root.join(path));
     }
 
     for candidate in ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"] {
-        let path = PathBuf::from(candidate);
+        let path = repo_root.join(candidate);
         if path.exists() {
             return Some(path);
         }
     }
 
     None
+}
+
+fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResult<()> {
+    if let Some(t) = threshold {
+        if t > 100 {
+            return Err(ScanError::new(
+                ScanErrorKind::Input,
+                anyhow!("invalid value for scan.threshold from cli: `{t}` (expected: 0..=100)"),
+            ));
+        }
+        cfg.output.fail_threshold = t;
+    }
+    Ok(())
 }
 
 fn load_config(path: Option<&Path>) -> Result<Config> {
@@ -733,6 +747,8 @@ fn render_github_comment(report: &Report) -> String {
         .filter(|f| f.severity == Severity::Low)
         .count();
 
+    lines.push("<!-- patchgate:report -->".to_string());
+    lines.push(String::new());
     lines.push("## patchgate report".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -836,13 +852,17 @@ fn render_github_comment(report: &Report) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use patchgate_config::Config;
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
 
     use super::{
-        build_cache_key, gate_exit_code, parse_mode, parse_scope, pr_number_from_event_payload,
-        pr_number_from_ref, render_github_comment, resolve_scan_options,
-        sorted_findings_for_comment, OptionSource, ScanErrorKind, ScopeMode,
+        apply_threshold_override, build_cache_key, gate_exit_code, parse_mode, parse_scope,
+        pr_number_from_event_payload, pr_number_from_ref, render_github_comment,
+        resolve_config_path, resolve_scan_options, sorted_findings_for_comment, OptionSource,
+        ScanErrorKind, ScopeMode,
     };
 
     #[test]
@@ -1002,5 +1022,56 @@ mod tests {
             build_cache_key("diff-a", "policy-a", "enforce", "staged")
         );
         assert_ne!(base, build_cache_key("diff-a", "policy-a", "warn", "repo"));
+    }
+
+    #[test]
+    fn threshold_over_100_returns_input_error() {
+        let mut cfg = Config::default();
+        let err = apply_threshold_override(&mut cfg, Some(101)).expect_err("must reject >100");
+        assert_eq!(err.kind(), ScanErrorKind::Input);
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn resolve_config_path_uses_repo_root_candidates() {
+        let mut repo_root = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        repo_root.push(format!("patchgate-cli-config-test-{ts}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(&policy_path, "mode = \"warn\"\n").expect("write policy");
+
+        let resolved = resolve_config_path(&repo_root, None).expect("should resolve policy");
+        assert_eq!(resolved, policy_path);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn github_comment_includes_upsert_marker() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let comment = render_github_comment(&report);
+        assert!(comment.starts_with("<!-- patchgate:report -->"));
     }
 }
