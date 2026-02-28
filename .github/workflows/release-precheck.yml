@@ -26,4 +26,8 @@ jobs:
         run: nix develop --command cargo run -p patchgate-cli -- doctor
 
       - name: Benchmark baseline compare
-        run: nix develop --command cargo run -p xtask -- bench compare --case ci-worktree
+        run: |
+          nix develop --command cargo run -p xtask -- bench compare \
+            --case ci-worktree \
+            --output config/benchmarks/ci-worktree-baseline.jsonl \
+            --require-baseline

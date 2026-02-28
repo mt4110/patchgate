@@ -12,7 +12,7 @@
 - `repo_root` / `config_path` / Rust version
 - `git`: repository判定、HEAD、dirty file数
 - `config`: 設定読込とバリデーション結果
-- `cache`: DB接続とテーブル初期化可否
+- `cache`: DB存在確認と読み取り診断（副作用なし）
 
 ### `patchgate scan`
 PR差分に対して品質ゲートを実行します。

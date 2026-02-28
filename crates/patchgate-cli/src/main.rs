@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use patchgate_github::{publish_report, PublishRequest};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -230,7 +230,10 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
 
     let db_full_path = repo_root.join(&effective_cfg.cache.db_path);
     match diagnose_cache(repo_root, &effective_cfg.cache.db_path) {
-        Ok(()) => println!("- cache: ok ({})", db_full_path.display()),
+        Ok(CacheDoctorStatus::Ok) => println!("- cache: ok ({})", db_full_path.display()),
+        Ok(CacheDoctorStatus::Missing) => {
+            println!("- cache: missing ({})", db_full_path.display())
+        }
         Err(err) => println!("- cache: error ({:#})", err),
     }
 
@@ -276,16 +279,21 @@ fn diagnose_git(repo_root: &Path) -> Result<(String, usize)> {
     Ok((head_str, dirty))
 }
 
-fn diagnose_cache(repo_root: &Path, db_path: &str) -> Result<()> {
+enum CacheDoctorStatus {
+    Ok,
+    Missing,
+}
+
+fn diagnose_cache(repo_root: &Path, db_path: &str) -> Result<CacheDoctorStatus> {
     let db_full_path = repo_root.join(db_path);
-    if let Some(parent) = db_full_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create cache dir: {}", parent.display()))?;
+    if !db_full_path.exists() {
+        return Ok(CacheDoctorStatus::Missing);
     }
-    let conn = Connection::open(&db_full_path)
+    let conn = Connection::open_with_flags(&db_full_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", db_full_path.display()))?;
-    init_cache_table(&conn)?;
-    Ok(())
+    conn.query_row("SELECT 1", [], |_row| Ok(()))
+        .context("cache db probe query failed")?;
+    Ok(CacheDoctorStatus::Ok)
 }
 
 fn execute_scan(

@@ -25,6 +25,8 @@ struct BenchOptions {
     repo: PathBuf,
     output: PathBuf,
     max_regression_pct: f64,
+    require_baseline: bool,
+    append_on_pass: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,14 +70,23 @@ fn main() -> Result<()> {
             if let Some(prev) = previous {
                 print_comparison(&prev, &sample);
                 let regressed = is_duration_regressed(&prev, &sample, options.max_regression_pct);
-                append_sample(&options.output, &sample)?;
                 if regressed {
                     bail!(
                         "benchmark regression: duration exceeded {:.1}% threshold",
                         options.max_regression_pct
                     );
                 }
+                if options.append_on_pass {
+                    append_sample(&options.output, &sample)?;
+                }
             } else {
+                if options.require_baseline {
+                    bail!(
+                        "no baseline found for case `{}` in {}",
+                        sample.case_name,
+                        options.output.display()
+                    );
+                }
                 println!(
                     "no baseline found for case `{}` in {}. recording first sample.",
                     sample.case_name,
@@ -91,7 +102,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass]"
     );
 }
 
@@ -110,6 +121,8 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
     let mut repo = std::env::current_dir().context("failed to get current directory")?;
     let mut output = PathBuf::from(DEFAULT_OUTPUT);
     let mut max_regression_pct = DEFAULT_MAX_REGRESSION_PCT;
+    let mut require_baseline = false;
+    let mut append_on_pass = false;
 
     while let Some(flag) = iter.next() {
         match flag.to_string_lossy().as_ref() {
@@ -140,6 +153,12 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
                     .parse::<f64>()
                     .context("failed to parse --max-regression-pct")?;
             }
+            "--require-baseline" => {
+                require_baseline = true;
+            }
+            "--append-on-pass" => {
+                append_on_pass = true;
+            }
             other => bail!("unsupported flag `{other}`"),
         }
     }
@@ -150,6 +169,8 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
         repo,
         output,
         max_regression_pct,
+        require_baseline,
+        append_on_pass,
     })
 }
 

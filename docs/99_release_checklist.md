@@ -9,7 +9,7 @@ Purpose: Ensure reproducible patchgate releases.
 - `fmt/lint/test` (`just ci-check`)
 - `doctor` 実行
 - `._*` 混入チェック
-- ベンチ基準値比較 (`cargo run -p xtask -- bench compare --case ci-worktree`)
+- ベンチ基準値比較 (`cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline`)
 
 以下は引き続き手動:
 
@@ -25,7 +25,7 @@ Purpose: Ensure reproducible patchgate releases.
   - `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`
   - `nix develop --command cargo test --workspace`
 - [ ] **Doctor**: `nix develop --command cargo run -p patchgate-cli -- doctor` (CI自動化済み)
-- [ ] **Benchmark**: `nix develop --command cargo run -p xtask -- bench compare --case ci-worktree` (CI自動化済み)
+- [ ] **Benchmark**: `nix develop --command cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline` (CI自動化済み)
 - [ ] **Docs**: Sync docs with current CLI/config behavior.
 - [ ] **Version**: Bump version in:
   - `flake.nix`
