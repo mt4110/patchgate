@@ -1,69 +1,96 @@
 # 03 CLI Reference
 
-Purpose: コマンドライン引数とサブコマンドの詳細（`--help` を一次ソースとして整理）。
+`patchgate` は差分ベースで品質リスクを判定するCLIです。
 
-- Status: Verified
-- Last verified: 2025-12-18 (Entropy Guard exit codes verified)
+## Commands
 
-## Overview
-`veto` はローカル実行（pre-commit / pre-push / 手動）やCIで使える検証CLIです。
+### `patchgate doctor`
+環境情報と設定ファイル探索結果を表示します。
 
-> [!NOTE]
-> v0.2.0 で Entropy Guard が実装され、実チェックが稼働しています。
+### `patchgate scan`
+PR差分に対して品質ゲートを実行します。
 
-## Global options
-
-- `--repo <REPO>`
-  - スキャン対象のリポジトリルート（デフォルト: カレントディレクトリ）
-- `--config <CONFIG>`
-  - 設定ファイル `veto.toml` のパスを明示指定
-  - 指定がない場合は **実行時カレントディレクトリ**の `veto.toml` (または `veri.toml`) を探索します
-- `-h, --help`
-  - ヘルプ表示: そのコマンドの使い方を表示
-- `-V, --version`
-  - バージョン表示: 現在のバージョンを表示（例: `veto 0.1.0`）
-
-## Subcommands
-
-### `veto doctor`
-環境情報と基本診断を表示します。
-
-```bash
-veto doctor
-```
-
-**出力例（概要）**:
-- `repo_root`: スキャン対象のルートパス
-- `config`: 読み込まれた設定（custom path / default file / none）
-- `rust`: Rustツールチェーンの状態（表示できる場合）
-
-### `veto scan`
-チェックを実行し、結果を text / json で出力します。
-
-**Options:**
+Options:
 
 - `--format <text|json>`
-  - 出力形式。`veto.toml` の `[output].format` を上書きします。
 - `--scope <staged|worktree|repo>`
-  - スキャン範囲。`veto.toml` の `[scope].mode` を上書きします。
-- `--explain`
-  - ヒット時の詳細メタデータ（entropy値, token長, charset判定）を表示します。
-  - **重要**: 生のトークン値（secrets）は表示されません。安全です。
+- `--mode <warn|enforce>`
+- `--threshold <0..=100>`
+- `--no-cache`
+- `--github-comment <path>`
+- `--github-publish`
+- `--github-repo <owner/repo>`
+- `--github-pr <number>`
+- `--github-sha <sha>`
+- `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
+- `--github-check-name <name>`
 
-**Examples:**
+## GitHub publish
 
-```bash
-# デフォルト（configがあれば読み、なければデフォルト）
-veto scan
+`--github-publish` で以下を実行します。
 
-# JSON出力（CIなどで利用）
-veto scan --format json
+- PRコメントを upsert (`<!-- patchgate:report -->` マーカー)
+- Check Run を作成
 
-# 範囲を変更（作業中の全変更をスキャン）
-veto scan --scope worktree
-```
+GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SHA` / `GITHUB_EVENT_PATH` から自動解決されます。
 
-## Exit codes
+## Score
 
-- `0`: findings が無い、または `fail_on` しきい値未満
-- `1`: しきい値以上の severity が存在する
+- 100 から各チェックの penalty を減算
+- `score < fail_threshold` で fail 判定
+- 優先度は以下にマップ
+  - `0..40`: `P0`
+  - `41..65`: `P1`
+  - `66..85`: `P2`
+  - `86..100`: `P3`
+
+## JSON contract (`scan --format json`)
+
+トップレベルキー:
+
+- `findings` (required): finding配列
+- `checks` (required): チェック別スコア配列
+- `score` (required): 0..100
+- `threshold` (required): fail閾値
+- `should_fail` (required): gate fail判定
+- `mode` (required): `warn` | `enforce`
+- `scope` (required): `staged` | `worktree` | `repo`
+- `review_priority` (required): `p0` | `p1` | `p2` | `p3`
+- `fingerprint` (required): diff fingerprint
+- `duration_ms` (required): 評価時間
+- `skipped_by_cache` (required): cache hit時 `true`
+
+`finding` 要素:
+
+- `id` (required): ルールID（例: `TG-001`）
+- `check` (required): `test_gap` | `dangerous_change` | `dependency_update`
+- `title` (required): 短い要約
+- `message` (required): 詳細説明
+- `severity` (required): `low` | `medium` | `high` | `critical`
+- `penalty` (required): スコア減点値
+- `location` (optional): `{ file, line }`。位置がない場合は `null`
+- `tags` (required): 分類タグ配列
+
+`check` 要素:
+
+- `check` (required): check id
+- `label` (required): 表示ラベル
+- `penalty` (required): 実減点
+- `max_penalty` (required): 上限減点
+- `triggered` (required): 該当有無
+
+### Compatibility policy (Phase1-20)
+
+- 既存キーの削除・改名・型変更は行わない
+- 新規キー追加は許可（追加時は defaults/optional を維持）
+- enum値追加は許可（既存値の意味は変更しない）
+
+## Exit code
+
+- `0`: 成功（`warn` での実行、または `enforce` で gate pass）
+- `1`: gate fail（`enforce` で `score < fail_threshold`）
+- `2`: 入力エラー（`scan` の不正オプション値）
+- `3`: 設定エラー（設定ファイル読み込み/設定値不正）
+- `4`: 実行エラー（差分収集・評価・キャッシュ処理）
+- `5`: 出力エラー（JSON/レポート書き込み）
+- `6`: GitHub publish エラー（publish入力解決・API実行）
