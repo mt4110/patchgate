@@ -167,6 +167,7 @@ struct ResolvedScanOptions {
 }
 
 type ScanResult<T> = std::result::Result<T, ScanError>;
+const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -544,14 +545,28 @@ fn config_hash(cfg: &Config) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serialized)))
 }
 
+fn build_cache_key(diff_fingerprint: &str, policy_hash: &str, mode: &str, scope: &str) -> String {
+    let material = format!(
+        "schema={}|cli={}|diff={}|policy={}|mode={}|scope={}",
+        CACHE_KEY_SCHEMA_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        diff_fingerprint,
+        policy_hash,
+        mode,
+        scope
+    );
+    format!("{:x}", Sha256::digest(material.as_bytes()))
+}
+
 fn load_cache(
     repo_root: &Path,
     db_path: &str,
-    fingerprint: &str,
+    diff_fingerprint: &str,
     policy_hash: &str,
     mode: &str,
     scope: &str,
 ) -> Result<Option<Report>> {
+    let cache_key = build_cache_key(diff_fingerprint, policy_hash, mode, scope);
     let db_full_path = repo_root.join(db_path);
     if !db_full_path.exists() {
         return Ok(None);
@@ -562,11 +577,11 @@ fn load_cache(
 
     let mut stmt = conn.prepare(
         "SELECT report_json FROM runs
-         WHERE fingerprint = ?1 AND policy_hash = ?2 AND mode = ?3 AND scope = ?4
+         WHERE fingerprint = ?1
          ORDER BY created_at DESC LIMIT 1",
     )?;
 
-    let mut rows = stmt.query(params![fingerprint, policy_hash, mode, scope])?;
+    let mut rows = stmt.query(params![cache_key])?;
     if let Some(row) = rows.next()? {
         let json: String = row.get(0)?;
         let report = serde_json::from_str::<Report>(&json)?;
@@ -577,6 +592,12 @@ fn load_cache(
 }
 
 fn store_cache(repo_root: &Path, db_path: &str, report: &Report, policy_hash: &str) -> Result<()> {
+    let cache_key = build_cache_key(
+        &report.fingerprint,
+        policy_hash,
+        &report.mode,
+        &report.scope,
+    );
     let db_full_path = repo_root.join(db_path);
     if let Some(parent) = db_full_path.parent() {
         fs::create_dir_all(parent)?;
@@ -593,7 +614,7 @@ fn store_cache(repo_root: &Path, db_path: &str, report: &Report, policy_hash: &s
            report_json = excluded.report_json,
            created_at = excluded.created_at",
         params![
-            report.fingerprint,
+            cache_key,
             policy_hash,
             report.mode,
             report.scope,
@@ -819,9 +840,9 @@ mod tests {
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
 
     use super::{
-        gate_exit_code, parse_mode, parse_scope, pr_number_from_event_payload, pr_number_from_ref,
-        render_github_comment, resolve_scan_options, sorted_findings_for_comment, OptionSource,
-        ScanErrorKind, ScopeMode,
+        build_cache_key, gate_exit_code, parse_mode, parse_scope, pr_number_from_event_payload,
+        pr_number_from_ref, render_github_comment, resolve_scan_options,
+        sorted_findings_for_comment, OptionSource, ScanErrorKind, ScopeMode,
     };
 
     #[test]
@@ -956,5 +977,30 @@ mod tests {
             .expect("critical finding line");
         assert!(critical_line_idx > priority_idx);
         assert!(critical_line_idx < all_idx);
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_for_same_inputs() {
+        let key1 = build_cache_key("diff-a", "policy-a", "warn", "staged");
+        let key2 = build_cache_key("diff-a", "policy-a", "warn", "staged");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn cache_key_changes_when_any_dimension_changes() {
+        let base = build_cache_key("diff-a", "policy-a", "warn", "staged");
+        assert_ne!(
+            base,
+            build_cache_key("diff-b", "policy-a", "warn", "staged")
+        );
+        assert_ne!(
+            base,
+            build_cache_key("diff-a", "policy-b", "warn", "staged")
+        );
+        assert_ne!(
+            base,
+            build_cache_key("diff-a", "policy-a", "enforce", "staged")
+        );
+        assert_ne!(base, build_cache_key("diff-a", "policy-a", "warn", "repo"));
     }
 }

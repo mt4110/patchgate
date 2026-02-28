@@ -1,30 +1,48 @@
 # Architecture
 
-## Design goals
-- **Fast**: most checks should run on staged diff or small scope by default.
-- **Safe output**: never print raw secrets; prefer masked snippets.
-- **Composable**: checks are pluggable modules; same engine can power CLI & CI.
-- **Mono-core / multi-tool**: keep one core engine, allow multiple thin front-ends.
+## Overview
 
-## Workspace crates
-- `veto-core`
-  - Domain model: `Finding`, `Report`, `Severity`
-  - Check framework: `Check` trait, `Runner`
-  - Context: repo root, execution scope (staged diff / full tree / etc.)
-- `veto-config`
-  - `veto.toml` parsing + defaults (keeps policy outside code)
-- `veto-cli`
-  - CLI UX: `scan`, `doctor`, formats, exit codes
-- `xtask`
-  - Optional developer tooling (release notes, version bump, etc.)
+`patchgate` は差分ベース品質ゲートです。
 
-## Check lifecycle
-1. CLI builds `Context` and loads config
-2. Runner executes selected checks
-3. Report is printed as text or JSON
-4. Exit code is derived from findings (configurable threshold)
+- `patchgate-core` (core)
+  - Git差分収集
+  - 3チェック実行 (`test_gap`, `dangerous_change`, `dependency_update`)
+  - スコアリング (0-100) とレビュー優先度判定
+- `patchgate-config`
+  - `policy.toml` の読み込みとデフォルト
+- `patchgate-github`
+  - PRコメント upsert
+  - Check Run publish
+- `patchgate-cli`
+  - `scan` / `doctor`
+  - `warn|enforce` のexit code制御
+  - JSON/Text出力
+  - SQLiteキャッシュ
+  - GitHub publish 呼び出し
 
-## Future: storage/DB
-For audit logs or multi-repo dashboards, add a storage layer:
-- `Storage` trait (append report, query summaries)
-- `postgres` adapter behind a feature flag
+## Data flow
+
+1. CLI が `policy.toml` を読み込む
+2. core が git diff から `DiffData` を生成
+3. `cache_key` で SQLite cache を引く
+4. miss なら 3チェックを実行し score を算出
+5. text/json と GitHub comment markdown を出力
+6. opt-in で GitHubに comment/check-run をpublish
+
+## Cache key contract
+
+`scan` の cache hit/miss は次のキーで固定する:
+
+- schema version (`v1`)
+- CLI version (`CARGO_PKG_VERSION`)
+- diff fingerprint
+- policy hash
+- mode (`warn|enforce`)
+- scope (`staged|worktree|repo`)
+
+同一キーなら hit、いずれか1要素でも変われば miss とする。  
+`--no-cache` または `cache.enabled=false` では常に miss 扱いで再評価する。
+
+## Cost model
+
+実行はローカル/CIで完結し、クラウドは履歴集計等のメタデータのみを想定。
