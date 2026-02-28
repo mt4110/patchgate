@@ -28,7 +28,7 @@ pub fn publish_report(
 ) -> Result<PublishResult> {
     let client = github_client(&req.token)?;
 
-    let body = format!("{}\n\n{}", MARKER, markdown);
+    let body = ensure_comment_marker(markdown);
     let comment_url = upsert_pr_comment(&client, &req.repo, req.pr_number, &body)?;
 
     let check_run_url = publish_check_run(&client, report, req, markdown)?;
@@ -71,36 +71,45 @@ fn upsert_pr_comment(
     pr_number: u64,
     body: &str,
 ) -> Result<Option<String>> {
-    let comments_url =
-        format!("https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100");
-
-    let comments: Vec<IssueComment> = client
-        .get(&comments_url)
-        .send()
-        .context("failed to list issue comments")?
-        .error_for_status()
-        .context("github returned error listing issue comments")?
-        .json()
-        .context("failed to decode issue comments")?;
-
-    if let Some(existing) = comments
-        .iter()
-        .find(|c| c.body.as_deref().is_some_and(|b| b.contains(MARKER)))
-    {
-        let update_url = format!(
-            "https://api.github.com/repos/{repo}/issues/comments/{}",
-            existing.id
+    let mut page = 1u32;
+    loop {
+        let comments_url = format!(
+            "https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}"
         );
-        let updated: IssueComment = client
-            .patch(&update_url)
-            .json(&serde_json::json!({ "body": body }))
+
+        let comments: Vec<IssueComment> = client
+            .get(&comments_url)
             .send()
-            .context("failed to update issue comment")?
+            .context("failed to list issue comments")?
             .error_for_status()
-            .context("github returned error updating issue comment")?
+            .context("github returned error listing issue comments")?
             .json()
-            .context("failed to decode updated issue comment")?;
-        return Ok(updated.html_url);
+            .context("failed to decode issue comments")?;
+
+        if let Some(existing) = comments
+            .iter()
+            .find(|c| c.body.as_deref().is_some_and(|b| b.contains(MARKER)))
+        {
+            let update_url = format!(
+                "https://api.github.com/repos/{repo}/issues/comments/{}",
+                existing.id
+            );
+            let updated: IssueComment = client
+                .patch(&update_url)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .context("failed to update issue comment")?
+                .error_for_status()
+                .context("github returned error updating issue comment")?
+                .json()
+                .context("failed to decode updated issue comment")?;
+            return Ok(updated.html_url);
+        }
+
+        if comments.len() < 100 {
+            break;
+        }
+        page = page.saturating_add(1);
     }
 
     let created: IssueComment = client
@@ -177,9 +186,17 @@ fn truncate(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
+fn ensure_comment_marker(markdown: &str) -> String {
+    if markdown.contains(MARKER) {
+        markdown.to_string()
+    } else {
+        format!("{MARKER}\n\n{markdown}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{ensure_comment_marker, truncate, MARKER};
 
     #[test]
     fn truncate_keeps_short_text() {
@@ -191,5 +208,13 @@ mod tests {
     fn truncate_cuts_long_text() {
         let s = "abcdef";
         assert_eq!(truncate(s, 4), "abcd");
+    }
+
+    #[test]
+    fn ensure_comment_marker_is_added_once() {
+        let no_marker = "## report";
+        let with_marker = format!("{MARKER}\n\n## report");
+        assert!(ensure_comment_marker(no_marker).starts_with(MARKER));
+        assert_eq!(ensure_comment_marker(&with_marker), with_marker);
     }
 }

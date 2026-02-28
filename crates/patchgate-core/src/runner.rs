@@ -165,6 +165,10 @@ fn evaluate_test_gap(
         if file.status == ChangeStatus::Deleted {
             continue;
         }
+        // Skip metadata-only changes (e.g. pure rename/mode change) to reduce false positives.
+        if file.added == 0 && file.deleted == 0 {
+            continue;
+        }
         if test_set.is_match(&file.path) {
             test_files.push(file.path.clone());
             continue;
@@ -173,10 +177,6 @@ fn evaluate_test_gap(
             || manifest_set.is_match(&file.path)
             || lock_set.is_match(&file.path)
         {
-            continue;
-        }
-        // Skip metadata-only changes (e.g. pure rename/mode change) to reduce false positives.
-        if file.added == 0 && file.deleted == 0 {
             continue;
         }
         production_churn = production_churn.saturating_add(file.added + file.deleted);
@@ -612,7 +612,7 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
             continue;
         }
 
-        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@") {
             continue;
         }
 
@@ -639,13 +639,12 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
 }
 
 fn parse_path_from_diff_header(line: &str) -> Option<String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 4 {
-        return None;
-    }
-
-    let from = parts[2].strip_prefix("a/").unwrap_or(parts[2]);
-    let to = parts[3].strip_prefix("b/").unwrap_or(parts[3]);
+    let rest = line.strip_prefix("diff --git ")?;
+    let split_idx = rest.rfind(" b/")?;
+    let from = &rest[..split_idx];
+    let to = &rest[split_idx + 1..];
+    let from = from.strip_prefix("a/").unwrap_or(from);
+    let to = to.strip_prefix("b/").unwrap_or(to);
 
     if to == "/dev/null" {
         Some(from.to_string())
@@ -685,6 +684,28 @@ mod tests {
         let file = files.get("src/lib.rs").expect("missing file");
         assert_eq!(file.added, 2);
         assert_eq!(file.deleted, 1);
+    }
+
+    #[test]
+    fn parse_path_from_diff_header_supports_spaces() {
+        let line = "diff --git a/dir with/file name.txt b/dir with/file name.txt";
+        let path = parse_path_from_diff_header(line).expect("path");
+        assert_eq!(path, "dir with/file name.txt");
+    }
+
+    #[test]
+    fn apply_patch_stats_counts_lines_starting_with_plusplus_or_minusminus() {
+        let mut files = parse_name_status("M\tsrc/lib.rs\n");
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n---old\n+++new\n";
+        apply_patch_stats(&mut files, patch);
+        let file = files.get("src/lib.rs").expect("missing file");
+        assert_eq!(file.added, 1);
+        assert_eq!(file.deleted, 1);
+        assert_eq!(file.added_lines.first().map(String::as_str), Some("++new"));
+        assert_eq!(
+            file.removed_lines.first().map(String::as_str),
+            Some("--old")
+        );
     }
 
     #[test]
@@ -769,6 +790,41 @@ mod tests {
         assert!(
             eval.findings.is_empty(),
             "metadata-only rename should not trigger test_gap"
+        );
+    }
+
+    #[test]
+    fn test_gap_does_not_count_metadata_only_test_rename() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "src/lib.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 12,
+                    deleted: 3,
+                    added_lines: vec!["new".to_string()],
+                    removed_lines: vec!["old".to_string()],
+                },
+                ChangedFile {
+                    path: "tests/new_name.rs".to_string(),
+                    status: ChangeStatus::Renamed,
+                    old_path: Some("tests/old_name.rs".to_string()),
+                    added: 0,
+                    deleted: 0,
+                    added_lines: vec![],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval = evaluate_test_gap(&policy, &diff, &exclude_set).expect("evaluate");
+        assert!(
+            eval.findings.iter().any(|f| f.id == "TG-001"),
+            "metadata-only test rename must not suppress missing test finding"
         );
     }
 

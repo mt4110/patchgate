@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
@@ -206,6 +207,7 @@ fn execute_scan(
     config_override: Option<&Path>,
     scan: ScanArgs,
 ) -> ScanResult<i32> {
+    let run_start = Instant::now();
     let ScanArgs {
         format,
         scope,
@@ -270,6 +272,7 @@ fn execute_scan(
             )
         })? {
             cached.skipped_by_cache = true;
+            cached.duration_ms = run_start.elapsed().as_millis();
             cached
         } else {
             let evaluated = runner.evaluate(&ctx, diff, &opts.mode).map_err(|err| {
@@ -387,9 +390,14 @@ fn resolve_publish_request(
         )?,
     };
 
-    let head_sha = github_sha
-        .or_else(|| std::env::var("GITHUB_SHA").ok())
-        .context("head SHA was not provided (use --github-sha or GITHUB_SHA)")?;
+    let head_sha = match github_sha {
+        Some(sha) => sha,
+        None => detect_head_sha_from_env()?
+            .or_else(|| std::env::var("GITHUB_SHA").ok())
+            .context(
+                "head SHA was not provided (use --github-sha, pull_request.head.sha, or GITHUB_SHA)",
+            )?,
+    };
 
     let token_env = github_token_env.unwrap_or_else(|| "GITHUB_TOKEN".to_string());
     let token = std::env::var(&token_env)
@@ -424,11 +432,31 @@ fn detect_pr_number_from_env() -> Result<Option<u64>> {
     Ok(None)
 }
 
+fn detect_head_sha_from_env() -> Result<Option<String>> {
+    if let Ok(event_path) = std::env::var("GITHUB_EVENT_PATH") {
+        let payload = fs::read_to_string(event_path).context("failed to read GITHUB_EVENT_PATH")?;
+        let json: Value = serde_json::from_str(&payload).context("failed to parse github event")?;
+        if let Some(head_sha) = pr_head_sha_from_event_payload(&json) {
+            return Ok(Some(head_sha));
+        }
+    }
+    Ok(None)
+}
+
 fn pr_number_from_event_payload(payload: &Value) -> Option<u64> {
     payload
         .get("pull_request")
         .and_then(|pr| pr.get("number"))
         .and_then(Value::as_u64)
+}
+
+fn pr_head_sha_from_event_payload(payload: &Value) -> Option<String> {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("head"))
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn pr_number_from_ref(reference: &str) -> Option<u64> {
@@ -860,9 +888,9 @@ mod tests {
 
     use super::{
         apply_threshold_override, build_cache_key, gate_exit_code, parse_mode, parse_scope,
-        pr_number_from_event_payload, pr_number_from_ref, render_github_comment,
-        resolve_config_path, resolve_scan_options, sorted_findings_for_comment, OptionSource,
-        ScanErrorKind, ScopeMode,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        render_github_comment, resolve_config_path, resolve_scan_options,
+        sorted_findings_for_comment, OptionSource, ScanErrorKind, ScopeMode,
     };
 
     #[test]
@@ -879,6 +907,21 @@ mod tests {
             }
         });
         assert_eq!(pr_number_from_event_payload(&payload), Some(123));
+    }
+
+    #[test]
+    fn pr_head_sha_parsed_from_event() {
+        let payload = serde_json::json!({
+            "pull_request": {
+                "head": {
+                    "sha": "abc123"
+                }
+            }
+        });
+        assert_eq!(
+            pr_head_sha_from_event_payload(&payload).as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
