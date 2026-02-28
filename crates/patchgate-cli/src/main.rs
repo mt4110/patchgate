@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use patchgate_config::Config;
-use patchgate_core::{Context, Report, Runner, ScopeMode};
+use patchgate_core::{Context, Finding, Report, Runner, ScopeMode, Severity};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -668,8 +668,50 @@ fn print_text(report: &Report) {
     }
 }
 
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Critical => 3,
+        Severity::High => 2,
+        Severity::Medium => 1,
+        Severity::Low => 0,
+    }
+}
+
+fn sorted_findings_for_comment(findings: &[Finding]) -> Vec<&Finding> {
+    let mut sorted: Vec<&Finding> = findings.iter().collect();
+    sorted.sort_by(|a, b| {
+        severity_rank(b.severity)
+            .cmp(&severity_rank(a.severity))
+            .then_with(|| b.penalty.cmp(&a.penalty))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    sorted
+}
+
 fn render_github_comment(report: &Report) -> String {
     let mut lines = Vec::new();
+    let sorted_findings = sorted_findings_for_comment(&report.findings);
+    let critical_count = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .count();
+    let high_count = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
+    let medium_count = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium)
+        .count();
+    let low_count = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Low)
+        .count();
+
     lines.push("## patchgate report".to_string());
     lines.push(String::new());
     lines.push(format!(
@@ -690,8 +732,46 @@ fn render_github_comment(report: &Report) -> String {
             "miss"
         }
     ));
+    lines.push(format!(
+        "- Findings: {} (critical: {}, high: {}, medium: {}, low: {})",
+        report.findings.len(),
+        critical_count,
+        high_count,
+        medium_count,
+        low_count
+    ));
     lines.push(String::new());
 
+    lines.push("### Priority findings".to_string());
+    if sorted_findings.is_empty() {
+        lines.push("- No findings".to_string());
+    } else {
+        let mut priority: Vec<&Finding> = sorted_findings
+            .iter()
+            .copied()
+            .filter(|f| matches!(f.severity, Severity::Critical | Severity::High))
+            .take(5)
+            .collect();
+        if priority.is_empty() {
+            priority = sorted_findings.iter().copied().take(3).collect();
+        }
+        for finding in priority {
+            let loc = finding
+                .location
+                .as_ref()
+                .map(|l| l.file.clone())
+                .unwrap_or_else(|| "-".to_string());
+            lines.push(format!(
+                "- **{}** [{} +{}] `{}`",
+                finding.title,
+                format!("{:?}", finding.severity).to_uppercase(),
+                finding.penalty,
+                loc
+            ));
+        }
+    }
+
+    lines.push(String::new());
     lines.push("### Check penalties".to_string());
     for check in &report.checks {
         lines.push(format!(
@@ -708,12 +788,12 @@ fn render_github_comment(report: &Report) -> String {
     }
 
     lines.push(String::new());
-    lines.push("### Findings".to_string());
+    lines.push("### All findings".to_string());
 
-    if report.findings.is_empty() {
+    if sorted_findings.is_empty() {
         lines.push("- No findings".to_string());
     } else {
-        for finding in &report.findings {
+        for finding in sorted_findings {
             let loc = finding
                 .location
                 .as_ref()
@@ -736,10 +816,12 @@ fn render_github_comment(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use patchgate_config::Config;
+    use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
 
     use super::{
         gate_exit_code, parse_mode, parse_scope, pr_number_from_event_payload, pr_number_from_ref,
-        resolve_scan_options, OptionSource, ScanErrorKind, ScopeMode,
+        render_github_comment, resolve_scan_options, sorted_findings_for_comment, OptionSource,
+        ScanErrorKind, ScopeMode,
     };
 
     #[test]
@@ -800,5 +882,79 @@ mod tests {
         assert_eq!(opts.format, "json");
         assert_eq!(opts.mode, "enforce");
         assert_eq!(opts.scope.as_str(), ScopeMode::Repo.as_str());
+    }
+
+    fn finding(id: &str, severity: Severity, penalty: u8) -> Finding {
+        Finding {
+            id: id.to_string(),
+            check: CheckId::TestGap,
+            title: id.to_string(),
+            message: format!("message-{id}"),
+            severity,
+            penalty,
+            location: None,
+            tags: vec!["test".to_string()],
+        }
+    }
+
+    #[test]
+    fn sorted_findings_prioritize_severity_then_penalty() {
+        let input = vec![
+            finding("medium-high-penalty", Severity::Medium, 20),
+            finding("critical-low-penalty", Severity::Critical, 5),
+            finding("high-high-penalty", Severity::High, 30),
+            finding("critical-high-penalty", Severity::Critical, 15),
+        ];
+
+        let sorted = sorted_findings_for_comment(&input);
+        let ids: Vec<String> = sorted.iter().map(|f| f.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "critical-high-penalty".to_string(),
+                "critical-low-penalty".to_string(),
+                "high-high-penalty".to_string(),
+                "medium-high-penalty".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn github_comment_places_priority_findings_section_first() {
+        let report = Report::new(
+            vec![
+                finding("medium-find", Severity::Medium, 8),
+                finding("critical-find", Severity::Critical, 4),
+                finding("high-find", Severity::High, 10),
+            ],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 12,
+                max_penalty: 35,
+                triggered: true,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let comment = render_github_comment(&report);
+        let priority_idx = comment
+            .find("### Priority findings")
+            .expect("priority section");
+        let all_idx = comment.find("### All findings").expect("all section");
+        assert!(priority_idx < all_idx);
+
+        let critical_line_idx = comment
+            .find("**critical-find** [CRITICAL")
+            .expect("critical finding line");
+        assert!(critical_line_idx > priority_idx);
+        assert!(critical_line_idx < all_idx);
     }
 }
