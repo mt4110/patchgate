@@ -47,6 +47,7 @@ large_change_penalty = 8
 
 [dangerous_change]
 enabled = true
+# patterns: high-risk paths (base penalty)
 patterns = [
   ".github/workflows/**",
   "infra/**",
@@ -57,6 +58,7 @@ patterns = [
   "**/auth/**",
   "**/security/**",
 ]
+# critical_patterns: subset of patterns that receive extra critical bonus penalty
 critical_patterns = [
   ".github/workflows/**",
   "infra/**",

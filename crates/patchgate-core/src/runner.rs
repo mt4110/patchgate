@@ -304,7 +304,16 @@ fn evaluate_dangerous_change(
             } else {
                 "High-risk path changed".to_string()
             },
-            message: format!("{} was changed (status: {:?}).", file.path, file.status),
+            message: format!(
+                "{} was changed (status: {:?}, classification: {}).",
+                file.path,
+                file.status,
+                if is_critical {
+                    "critical (matched dangerous_change.critical_patterns)"
+                } else {
+                    "non-critical (matched dangerous_change.patterns only)"
+                }
+            ),
             severity: if is_critical {
                 Severity::Critical
             } else {
@@ -315,7 +324,14 @@ fn evaluate_dangerous_change(
                 file: file.path.clone(),
                 line: None,
             }),
-            tags: vec!["dangerous-change".to_string()],
+            tags: vec![
+                "dangerous-change".to_string(),
+                if is_critical {
+                    "critical".to_string()
+                } else {
+                    "non-critical".to_string()
+                },
+            ],
         });
     }
 
@@ -749,6 +765,68 @@ mod tests {
         assert!(
             eval.findings.is_empty(),
             "metadata-only rename should not trigger test_gap"
+        );
+    }
+
+    #[test]
+    fn dangerous_change_classifies_non_critical_path() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/auth/service.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 3,
+                deleted: 1,
+                added_lines: vec!["new".to_string()],
+                removed_lines: vec!["old".to_string()],
+            }],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set).expect("evaluate");
+        assert_eq!(eval.score.penalty, policy.dangerous_change.per_file_penalty);
+        let finding = eval.findings.first().expect("finding");
+        assert_eq!(finding.id, "DC-001");
+        assert_eq!(finding.severity, Severity::High);
+        assert!(
+            finding
+                .tags
+                .iter()
+                .any(|tag| tag == "non-critical"),
+            "expected non-critical tag"
+        );
+    }
+
+    #[test]
+    fn dangerous_change_classifies_critical_path() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: ".github/workflows/ci.yml".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 2,
+                deleted: 2,
+                added_lines: vec!["new".to_string()],
+                removed_lines: vec!["old".to_string()],
+            }],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set).expect("evaluate");
+        assert_eq!(
+            eval.score.penalty,
+            policy.dangerous_change.per_file_penalty + policy.dangerous_change.critical_bonus_penalty
+        );
+        let finding = eval.findings.first().expect("finding");
+        assert_eq!(finding.id, "DC-002");
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(
+            finding.tags.iter().any(|tag| tag == "critical"),
+            "expected critical tag"
         );
     }
 }
