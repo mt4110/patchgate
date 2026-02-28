@@ -1,15 +1,28 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 fmt:
-  cargo fmt --all
+  nix develop --command cargo fmt --all
 
-clippy:
-  cargo clippy --workspace --all-targets -- -D warnings
+fmt-check:
+  nix develop --command cargo fmt --all -- --check
+
+lint:
+  nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+
+clippy: lint
 
 test:
-  cargo test --workspace
+  nix develop --command cargo test --workspace
 
 run:
-  cargo run -p veto-cli -- scan
+  nix develop --command cargo run -p patchgate-cli -- scan --mode warn
 
-ci: fmt clippy test
+ci-check: fmt-check lint test
+
+ci: ci-check
+
+install-commit-template:
+  git config commit.template .gitmessage.patchgate.txt
+
+commit:
+  git commit
