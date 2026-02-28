@@ -70,12 +70,14 @@ critical_bonus_penalty = 6
 
 [dependency_update]
 enabled = true
+# manifest_globs: direct dependency declarations
 manifest_globs = [
   "**/Cargo.toml",
   "**/package.json",
   "**/go.mod",
   "**/pyproject.toml",
 ]
+# lockfile_globs: resolved dependency graph snapshots
 lockfile_globs = [
   "**/Cargo.lock",
   "**/package-lock.json",

@@ -380,6 +380,10 @@ fn evaluate_dependency_update(
         if exclude_set.is_match(&file.path) {
             continue;
         }
+        // Ignore metadata-only diffs to avoid manifest/lock false positives.
+        if file.added == 0 && file.deleted == 0 {
+            continue;
+        }
         if manifest_set.is_match(&file.path) {
             manifests.push(file.path.clone());
         }
@@ -828,5 +832,73 @@ mod tests {
             finding.tags.iter().any(|tag| tag == "critical"),
             "expected critical tag"
         );
+    }
+
+    #[test]
+    fn dependency_update_detects_manifest_and_lockfile_changes() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Cargo.toml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 2,
+                    deleted: 1,
+                    added_lines: vec!["dep = \"1\"".to_string()],
+                    removed_lines: vec!["dep = \"0\"".to_string()],
+                },
+                ChangedFile {
+                    path: "Cargo.lock".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 20,
+                    deleted: 10,
+                    added_lines: vec!["pkg".to_string()],
+                    removed_lines: vec!["old".to_string()],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set).expect("evaluate");
+        assert!(eval.findings.iter().any(|f| f.id == "DU-001"));
+        assert!(eval.findings.iter().any(|f| f.id == "DU-002"));
+        assert!(eval.score.penalty >= policy.dependency_update.manifest_penalty);
+        assert!(eval.score.penalty >= policy.dependency_update.lockfile_penalty);
+    }
+
+    #[test]
+    fn dependency_update_ignores_metadata_only_manifest_or_lockfile_changes() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Cargo.toml".to_string(),
+                    status: ChangeStatus::Renamed,
+                    old_path: Some("Cargo.old.toml".to_string()),
+                    added: 0,
+                    deleted: 0,
+                    added_lines: vec![],
+                    removed_lines: vec![],
+                },
+                ChangedFile {
+                    path: "Cargo.lock".to_string(),
+                    status: ChangeStatus::Renamed,
+                    old_path: Some("Cargo.old.lock".to_string()),
+                    added: 0,
+                    deleted: 0,
+                    added_lines: vec![],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set).expect("evaluate");
+        assert_eq!(eval.score.penalty, 0);
+        assert!(eval.findings.is_empty());
     }
 }
