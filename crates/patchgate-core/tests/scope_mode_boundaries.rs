@@ -55,7 +55,10 @@ impl TestRepo {
     }
 
     fn git(&self, args: &[&str]) -> TestResult<String> {
-        let output = Command::new("git").args(args).current_dir(&self.root).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .output()?;
         if output.status.success() {
             Ok(String::from_utf8(output.stdout)?)
         } else {

@@ -795,10 +795,7 @@ mod tests {
         assert_eq!(finding.id, "DC-001");
         assert_eq!(finding.severity, Severity::High);
         assert!(
-            finding
-                .tags
-                .iter()
-                .any(|tag| tag == "non-critical"),
+            finding.tags.iter().any(|tag| tag == "non-critical"),
             "expected non-critical tag"
         );
     }
@@ -823,7 +820,8 @@ mod tests {
         let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set).expect("evaluate");
         assert_eq!(
             eval.score.penalty,
-            policy.dangerous_change.per_file_penalty + policy.dangerous_change.critical_bonus_penalty
+            policy.dangerous_change.per_file_penalty
+                + policy.dangerous_change.critical_bonus_penalty
         );
         let finding = eval.findings.first().expect("finding");
         assert_eq!(finding.id, "DC-002");
