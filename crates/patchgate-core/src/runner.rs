@@ -597,22 +597,42 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
 
     for line in patch.lines() {
         if line.starts_with("diff --git ") {
-            current_path = parse_path_from_diff_header(line);
-            if let Some(path) = &current_path {
-                files.entry(path.clone()).or_insert_with(|| ChangedFile {
-                    path: path.clone(),
-                    status: ChangeStatus::Unknown,
-                    old_path: None,
-                    added: 0,
-                    deleted: 0,
-                    added_lines: Vec::new(),
-                    removed_lines: Vec::new(),
-                });
-            }
+            current_path = None;
             continue;
         }
 
-        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@") {
+        if let Some(path) = parse_patch_file_header_path(line, "+++ b/") {
+            current_path = Some(path.clone());
+            files.entry(path.clone()).or_insert_with(|| ChangedFile {
+                path,
+                status: ChangeStatus::Unknown,
+                old_path: None,
+                added: 0,
+                deleted: 0,
+                added_lines: Vec::new(),
+                removed_lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(path) = parse_patch_file_header_path(line, "--- a/") {
+            current_path = Some(path.clone());
+            files.entry(path.clone()).or_insert_with(|| ChangedFile {
+                path,
+                status: ChangeStatus::Unknown,
+                old_path: None,
+                added: 0,
+                deleted: 0,
+                added_lines: Vec::new(),
+                removed_lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if line.starts_with("+++ /dev/null")
+            || line.starts_with("--- /dev/null")
+            || line.starts_with("@@")
+        {
             continue;
         }
 
@@ -638,19 +658,14 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
     }
 }
 
-fn parse_path_from_diff_header(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("diff --git ")?;
-    let split_idx = rest.rfind(" b/")?;
-    let from = &rest[..split_idx];
-    let to = &rest[split_idx + 1..];
-    let from = from.strip_prefix("a/").unwrap_or(from);
-    let to = to.strip_prefix("b/").unwrap_or(to);
-
-    if to == "/dev/null" {
-        Some(from.to_string())
-    } else {
-        Some(to.to_string())
-    }
+fn parse_patch_file_header_path(line: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?;
+    let path = rest
+        .split_once('\t')
+        .map(|(p, _)| p)
+        .unwrap_or(rest)
+        .to_string();
+    Some(path)
 }
 
 fn compile_globs(patterns: &[String]) -> Result<GlobSet> {
@@ -679,7 +694,7 @@ mod tests {
     #[test]
     fn apply_patch_stats_counts_lines() {
         let mut files = parse_name_status("M\tsrc/lib.rs\n");
-        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n";
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n";
         apply_patch_stats(&mut files, patch);
         let file = files.get("src/lib.rs").expect("missing file");
         assert_eq!(file.added, 2);
@@ -687,16 +702,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_path_from_diff_header_supports_spaces() {
-        let line = "diff --git a/dir with/file name.txt b/dir with/file name.txt";
-        let path = parse_path_from_diff_header(line).expect("path");
+    fn parse_patch_file_header_path_supports_spaces() {
+        let line = "+++ b/dir with/file name.txt\t";
+        let path = parse_patch_file_header_path(line, "+++ b/").expect("path");
         assert_eq!(path, "dir with/file name.txt");
     }
 
     #[test]
     fn apply_patch_stats_counts_lines_starting_with_plusplus_or_minusminus() {
         let mut files = parse_name_status("M\tsrc/lib.rs\n");
-        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n---old\n+++new\n";
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n---old\n+++new\n";
         apply_patch_stats(&mut files, patch);
         let file = files.get("src/lib.rs").expect("missing file");
         assert_eq!(file.added, 1);

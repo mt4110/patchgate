@@ -17,7 +17,7 @@
 - [ ] 実装が完了した
 - [ ] テストを追加または更新した
 - [ ] ドキュメントを更新した
-- [ ] `cargo test --workspace` が通過した
+- [ ] `nix develop --command cargo test --workspace` が通過した
 - [ ] 互換性影響（CLI/JSON/出力）を確認した
 - [ ] 既知の未対応項目をコミットメッセージに記載した
 

@@ -138,13 +138,7 @@ fn publish_check_run(
     req: &PublishRequest,
     markdown: &str,
 ) -> Result<Option<String>> {
-    let conclusion = if report.should_fail {
-        "failure"
-    } else if report.findings.is_empty() {
-        "success"
-    } else {
-        "neutral"
-    };
+    let conclusion = check_run_conclusion(report);
 
     let status_line = format!(
         "Score {}/100 (threshold {}, mode {})",
@@ -179,6 +173,16 @@ fn publish_check_run(
     Ok(check.html_url)
 }
 
+fn check_run_conclusion(report: &Report) -> &'static str {
+    if report.mode == "enforce" && report.should_fail {
+        "failure"
+    } else if report.findings.is_empty() {
+        "success"
+    } else {
+        "neutral"
+    }
+}
+
 fn truncate(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -196,7 +200,9 @@ fn ensure_comment_marker(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_comment_marker, truncate, MARKER};
+    use patchgate_core::{CheckId, CheckScore, Report, ReportMeta};
+
+    use super::{check_run_conclusion, ensure_comment_marker, truncate, MARKER};
 
     #[test]
     fn truncate_keeps_short_text() {
@@ -216,5 +222,35 @@ mod tests {
         let with_marker = format!("{MARKER}\n\n## report");
         assert!(ensure_comment_marker(no_marker).starts_with(MARKER));
         assert_eq!(ensure_comment_marker(&with_marker), with_marker);
+    }
+
+    #[test]
+    fn check_run_conclusion_respects_mode() {
+        let base_report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 40,
+                max_penalty: 40,
+                triggered: true,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        assert!(base_report.should_fail);
+        assert_eq!(check_run_conclusion(&base_report), "success");
+
+        let enforce_report = Report {
+            mode: "enforce".to_string(),
+            ..base_report.clone()
+        };
+        assert_eq!(check_run_conclusion(&enforce_report), "failure");
     }
 }

@@ -6,7 +6,7 @@ Example `.git/hooks/pre-commit` (bash, Nix-first):
 #!/usr/bin/env bash
 set -euo pipefail
 
-nix develop --command patchgate scan --scope staged --mode warn
+nix develop --command cargo run -p patchgate-cli -- scan --scope staged --mode warn
 ```
 
 Make it executable:
