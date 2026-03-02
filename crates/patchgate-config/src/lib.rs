@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::Result as AnyResult;
 use globset::Glob;
 use thiserror::Error;
 
@@ -69,7 +70,11 @@ impl ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
-pub fn load_from(path: impl AsRef<Path>) -> Result<Config> {
+pub fn load_from(path: impl AsRef<Path>) -> AnyResult<Config> {
+    load_from_typed(path).map_err(anyhow::Error::new)
+}
+
+pub fn load_from_typed(path: impl AsRef<Path>) -> Result<Config> {
     let path_ref = path.as_ref();
     let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
         path: path_ref.to_path_buf(),
@@ -359,7 +364,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{load_from, Config, ConfigError, ValidationCategory};
+    use super::{load_from, load_from_typed, Config, ConfigError, ValidationCategory};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -384,7 +389,7 @@ format = "markdown"
 "#,
         );
 
-        let err = load_from(&path).expect_err("must fail for invalid enum");
+        let err = load_from_typed(&path).expect_err("must fail for invalid enum");
         assert_eq!(err.category(), Some(ValidationCategory::Type));
         match err {
             ConfigError::Validation {
@@ -408,7 +413,7 @@ large_change_lines = 0
 "#,
         );
 
-        let err = load_from(&path).expect_err("must fail for range violation");
+        let err = load_from_typed(&path).expect_err("must fail for range violation");
         assert_eq!(err.category(), Some(ValidationCategory::Range));
         match err {
             ConfigError::Validation {
@@ -433,7 +438,7 @@ critical_patterns = [".github/workflows/**"]
 "#,
         );
 
-        let err = load_from(&path).expect_err("must fail for dependency violation");
+        let err = load_from_typed(&path).expect_err("must fail for dependency violation");
         assert_eq!(err.category(), Some(ValidationCategory::Dependency));
         match err {
             ConfigError::Validation {
@@ -454,5 +459,18 @@ critical_patterns = [".github/workflows/**"]
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/policy.toml.example");
         let loaded = load_from(&example_path).expect("load policy example");
         assert_eq!(loaded, Config::default());
+    }
+
+    #[test]
+    fn load_from_typed_preserves_structured_error_category() {
+        let path = write_temp_policy(
+            r#"
+[output]
+format = "invalid"
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("must fail");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        let _ = fs::remove_file(path);
     }
 }

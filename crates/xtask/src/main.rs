@@ -29,7 +29,7 @@ struct BenchOptions {
     append_on_pass: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct BenchSample {
     case_name: String,
     unix_ts: u64,
@@ -68,6 +68,7 @@ fn main() -> Result<()> {
         BenchSubcommand::Compare => {
             let previous = load_latest_sample(&options.output, &sample.case_name)?;
             if let Some(prev) = previous {
+                validate_workload_identity(&prev, &sample)?;
                 print_comparison(&prev, &sample);
                 let regressed = is_duration_regressed(&prev, &sample, options.max_regression_pct);
                 if regressed {
@@ -288,6 +289,24 @@ fn load_latest_sample(path: &Path, case_name: &str) -> Result<Option<BenchSample
     Ok(last)
 }
 
+fn validate_workload_identity(previous: &BenchSample, current: &BenchSample) -> Result<()> {
+    if previous.fingerprint != current.fingerprint {
+        bail!(
+            "benchmark workload mismatch: fingerprint changed (baseline={}, current={})",
+            previous.fingerprint,
+            current.fingerprint
+        );
+    }
+    if previous.changed_files != current.changed_files {
+        bail!(
+            "benchmark workload mismatch: changed_files changed (baseline={}, current={})",
+            previous.changed_files,
+            current.changed_files
+        );
+    }
+    Ok(())
+}
+
 fn print_comparison(previous: &BenchSample, current: &BenchSample) {
     let duration_delta = signed_delta(previous.duration_ms as f64, current.duration_ms as f64);
     let file_delta = signed_delta(previous.changed_files as f64, current.changed_files as f64);
@@ -316,4 +335,40 @@ fn is_duration_regressed(
     max_regression_pct: f64,
 ) -> bool {
     signed_delta(previous.duration_ms as f64, current.duration_ms as f64) > max_regression_pct
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_workload_identity, BenchSample};
+
+    fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
+        BenchSample {
+            case_name: case_name.to_string(),
+            unix_ts: 0,
+            duration_ms: 10,
+            changed_files,
+            score: 100,
+            threshold: 70,
+            fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    #[test]
+    fn workload_identity_requires_same_fingerprint_and_changed_files() {
+        let prev = sample("ci-worktree", 0, "abc");
+        let same = sample("ci-worktree", 0, "abc");
+        validate_workload_identity(&prev, &same).expect("same workload must pass");
+
+        let mismatch_fp = sample("ci-worktree", 0, "def");
+        assert!(
+            validate_workload_identity(&prev, &mismatch_fp).is_err(),
+            "fingerprint mismatch should fail"
+        );
+
+        let mismatch_files = sample("ci-worktree", 1, "abc");
+        assert!(
+            validate_workload_identity(&prev, &mismatch_files).is_err(),
+            "changed_files mismatch should fail"
+        );
+    }
 }

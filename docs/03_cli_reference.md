@@ -48,7 +48,8 @@ Cache behavior:
 ### 部分成功時の挙動
 
 - comment成功 / check失敗、またはその逆は「部分成功」として処理継続
-- 両方失敗した場合のみ publish エラー（exit code `6`）
+- comment と check の両方 API 呼び出しが失敗した場合は publish エラー（exit code `6`）
+- publish入力解決（例: `GITHUB_REPOSITORY` 不足）で失敗した場合も publish エラー（exit code `6`）
 - 部分成功時は標準エラー出力に失敗理由を個別表示
 
 ### 入力解決の優先順

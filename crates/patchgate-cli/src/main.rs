@@ -219,7 +219,8 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
         }
         Err(err) => {
             println!("- config: error ({err:#})");
-            Config::default()
+            println!("- cache: unknown (skipping cache diagnostics because config failed to load)");
+            return Ok(());
         }
     };
 
@@ -341,17 +342,23 @@ fn execute_scan(
             err.context("failed to collect git diff"),
         )
     })?;
+    let diff_fingerprint = diff.fingerprint.clone();
+    let mut diff_for_eval = Some(diff);
 
     let cache_enabled = cfg.cache.enabled && !no_cache;
-    let evaluate_report = || -> ScanResult<Report> {
-        runner
-            .evaluate(&ctx, diff.clone(), &opts.mode)
-            .map_err(|err| {
-                ScanError::new(
-                    ScanErrorKind::Runtime,
-                    err.context("failed to evaluate scan checks"),
-                )
-            })
+    let mut evaluate_report = || -> ScanResult<Report> {
+        let eval_diff = diff_for_eval.take().ok_or_else(|| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                anyhow!("internal error: diff already consumed before evaluation"),
+            )
+        })?;
+        runner.evaluate(&ctx, eval_diff, &opts.mode).map_err(|err| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                err.context("failed to evaluate scan checks"),
+            )
+        })
     };
 
     let report = if cache_enabled {
@@ -365,7 +372,7 @@ fn execute_scan(
         match load_cache(
             repo_root,
             &cfg.cache.db_path,
-            &diff.fingerprint,
+            &diff_fingerprint,
             &policy_hash,
             &opts.mode,
             opts.scope.as_str(),
@@ -1065,6 +1072,7 @@ fn render_github_comment(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1088,6 +1096,26 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock poisoned")
+    }
+
+    struct EnvSnapshot(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvSnapshot {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(v) = value {
+                    env::set_var(key, v);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
     }
 
     fn write_temp_event(payload: &serde_json::Value) -> std::path::PathBuf {
@@ -1140,6 +1168,7 @@ mod tests {
     #[test]
     fn env_pr_number_prefers_event_payload_over_github_ref() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
         let event_path = write_temp_event(&serde_json::json!({
             "number": 321,
             "pull_request": { "head": { "sha": "eventsha" } }
@@ -1158,6 +1187,7 @@ mod tests {
     #[test]
     fn env_pr_number_falls_back_to_github_ref() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
         env::remove_var("GITHUB_EVENT_PATH");
         env::set_var("GITHUB_REF", "refs/pull/456/merge");
 
@@ -1170,6 +1200,7 @@ mod tests {
     #[test]
     fn env_pr_number_falls_back_to_ref_when_event_payload_is_invalid() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
         let mut bad_event = std::env::temp_dir();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1191,6 +1222,7 @@ mod tests {
     #[test]
     fn env_head_sha_detected_from_event() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH"]);
         let event_path = write_temp_event(&serde_json::json!({
             "number": 5,
             "pull_request": { "head": { "sha": "event-sha-001" } }
@@ -1207,6 +1239,7 @@ mod tests {
     #[test]
     fn env_head_sha_falls_back_when_event_payload_is_invalid() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH"]);
         let mut bad_event = std::env::temp_dir();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1226,6 +1259,12 @@ mod tests {
     #[test]
     fn resolve_publish_request_prefers_cli_over_env() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
         env::set_var("GITHUB_REPOSITORY", "env/repo");
         env::set_var("GITHUB_REF", "refs/pull/999/merge");
         env::set_var("GITHUB_SHA", "env-sha");
@@ -1255,6 +1294,13 @@ mod tests {
     #[test]
     fn resolve_publish_request_uses_event_then_fallback_sha() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_EVENT_PATH",
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
         let event_path = write_temp_event(&serde_json::json!({
             "number": 88,
             "pull_request": { "head": { "sha": "event-sha-88" } }
@@ -1282,6 +1328,12 @@ mod tests {
     #[test]
     fn resolve_publish_request_uses_github_sha_when_event_has_no_head_sha() {
         let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_EVENT_PATH",
+            "GITHUB_REPOSITORY",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
         let event_path = write_temp_event(&serde_json::json!({
             "number": 42,
             "pull_request": { "head": {} }
