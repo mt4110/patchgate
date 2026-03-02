@@ -33,7 +33,7 @@ struct BenchOptions {
 struct BenchSample {
     case_name: String,
     unix_ts: u64,
-    duration_ms: u64,
+    duration_ms: u128,
     changed_files: usize,
     score: u64,
     threshold: u64,
@@ -214,7 +214,7 @@ fn changed_file_count(repo: &Path) -> Result<usize> {
 
 #[derive(Debug, Deserialize)]
 struct ScanReport {
-    duration_ms: u64,
+    duration_ms: u128,
     score: u64,
     threshold: u64,
     fingerprint: String,
