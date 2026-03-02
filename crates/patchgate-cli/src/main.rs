@@ -766,7 +766,7 @@ fn execute_scan(
             github_suppress_comment_low_priority,
             github_suppress_comment_rerun,
         );
-        let req = resolve_publish_request(
+        let req = resolve_publish_request(PublishRequestInput {
             github_repo,
             github_pr,
             github_sha,
@@ -774,17 +774,17 @@ fn execute_scan(
             github_check_name,
             github_auth,
             github_app_token_env,
-            RetryPolicy {
+            retry_policy: RetryPolicy {
                 max_attempts: github_retry_max_attempts,
                 backoff_base_ms: github_retry_backoff_ms,
                 backoff_max_ms: github_retry_max_backoff_ms,
             },
             github_dry_run,
-            !github_no_comment,
-            !github_no_check_run,
-            github_apply_labels,
+            publish_comment: !github_no_comment,
+            publish_check_run: !github_no_check_run,
+            apply_priority_label: github_apply_labels,
             suppressed_comment_reason,
-        )
+        })
         .map_err(|err| {
             ScanError::new(
                 ScanErrorKind::Publish,
@@ -865,20 +865,24 @@ fn execute_scan(
 }
 
 fn resolve_publish_request(
-    github_repo: Option<String>,
-    github_pr: Option<u64>,
-    github_sha: Option<String>,
-    github_token_env: Option<String>,
-    github_check_name: Option<String>,
-    github_auth: Option<String>,
-    github_app_token_env: Option<String>,
-    retry_policy: RetryPolicy,
-    github_dry_run: bool,
-    publish_comment: bool,
-    publish_check_run: bool,
-    apply_priority_label: bool,
-    suppressed_comment_reason: Option<String>,
+    input: PublishRequestInput,
 ) -> Result<PublishRequest> {
+    let PublishRequestInput {
+        github_repo,
+        github_pr,
+        github_sha,
+        github_token_env,
+        github_check_name,
+        github_auth,
+        github_app_token_env,
+        retry_policy,
+        github_dry_run,
+        publish_comment,
+        publish_check_run,
+        apply_priority_label,
+        suppressed_comment_reason,
+    } = input;
+
     let repo = github_repo
         .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
         .context("github repository was not provided (use --github-repo or GITHUB_REPOSITORY)")?;
@@ -940,6 +944,22 @@ fn resolve_publish_request(
     req.dry_run = github_dry_run;
     req.suppressed_comment_reason = suppressed_comment_reason;
     Ok(req)
+}
+
+struct PublishRequestInput {
+    github_repo: Option<String>,
+    github_pr: Option<u64>,
+    github_sha: Option<String>,
+    github_token_env: Option<String>,
+    github_check_name: Option<String>,
+    github_auth: Option<String>,
+    github_app_token_env: Option<String>,
+    retry_policy: RetryPolicy,
+    github_dry_run: bool,
+    publish_comment: bool,
+    publish_check_run: bool,
+    apply_priority_label: bool,
+    suppressed_comment_reason: Option<String>,
 }
 
 fn detect_pr_number_from_env() -> Result<Option<u64>> {
@@ -1568,7 +1588,7 @@ mod tests {
         pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
         resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
         resolve_publish_request, resolve_scan_options, sorted_findings_for_comment, OptionSource,
-        PolicyExitCode, RetryPolicy, ScanErrorKind, ScopeMode,
+        PolicyExitCode, PublishRequestInput, RetryPolicy, ScanErrorKind, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1757,21 +1777,21 @@ mod tests {
         env::set_var("GITHUB_SHA", "env-sha");
         env::set_var("GITHUB_TOKEN", "env-token");
 
-        let req = resolve_publish_request(
-            Some("cli/repo".to_string()),
-            Some(12),
-            Some("cli-sha".to_string()),
-            None,
-            Some("cli-check".to_string()),
-            Some("token".to_string()),
-            None,
-            RetryPolicy::default(),
-            false,
-            true,
-            true,
-            false,
-            None,
-        )
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: Some("cli/repo".to_string()),
+            github_pr: Some(12),
+            github_sha: Some("cli-sha".to_string()),
+            github_token_env: None,
+            github_check_name: Some("cli-check".to_string()),
+            github_auth: Some("token".to_string()),
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: false,
+            publish_comment: true,
+            publish_check_run: true,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
         .expect("resolve publish request");
 
         assert_eq!(req.repo, "cli/repo");
@@ -1809,21 +1829,21 @@ mod tests {
         env::set_var("GITHUB_SHA", "fallback-sha");
         env::set_var("GITHUB_TOKEN", "env-token");
 
-        let req = resolve_publish_request(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            RetryPolicy::default(),
-            false,
-            true,
-            true,
-            false,
-            None,
-        )
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: false,
+            publish_comment: true,
+            publish_check_run: true,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
         .expect("resolve from env");
         assert_eq!(req.repo, "env/repo");
         assert_eq!(req.pr_number, 88);
@@ -1856,21 +1876,21 @@ mod tests {
         env::set_var("GITHUB_SHA", "fallback-sha-42");
         env::set_var("GITHUB_TOKEN", "env-token");
 
-        let req = resolve_publish_request(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            RetryPolicy::default(),
-            false,
-            true,
-            true,
-            false,
-            None,
-        )
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: false,
+            publish_comment: true,
+            publish_check_run: true,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
         .expect("resolve from env");
         assert_eq!(req.pr_number, 42);
         assert_eq!(req.head_sha, "fallback-sha-42");
@@ -1898,21 +1918,21 @@ mod tests {
         env::set_var("GITHUB_APP_INSTALLATION_TOKEN", "app-token");
         env::set_var("GITHUB_APP_ID", "12345");
 
-        let req = resolve_publish_request(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("app".to_string()),
-            None,
-            RetryPolicy::default(),
-            false,
-            true,
-            true,
-            false,
-            None,
-        )
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: Some("app".to_string()),
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: false,
+            publish_comment: true,
+            publish_check_run: true,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
         .expect("resolve app auth");
 
         match req.auth {
@@ -1941,21 +1961,21 @@ mod tests {
         env::set_var("GITHUB_SHA", "sha7");
         env::remove_var("GITHUB_TOKEN");
 
-        let req = resolve_publish_request(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            RetryPolicy::default(),
-            true,
-            true,
-            true,
-            false,
-            None,
-        )
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: true,
+            publish_comment: true,
+            publish_check_run: true,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
         .expect("dry run should not require token");
 
         match req.auth {

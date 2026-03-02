@@ -891,8 +891,10 @@ mode = "warn"
 
     #[test]
     fn compatibility_warning_is_empty_for_current_version() {
-        let mut cfg = Config::default();
-        cfg.policy_version = POLICY_VERSION_CURRENT;
+        let cfg = Config {
+            policy_version: POLICY_VERSION_CURRENT,
+            ..Config::default()
+        };
         let warnings = compatibility_warnings(&cfg, PolicyVersionSource::Explicit);
         assert!(warnings.is_empty());
     }
