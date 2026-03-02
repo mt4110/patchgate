@@ -54,6 +54,13 @@ This roadmap tracks the patchgate pivot.
 - Rate-limit-aware degraded operation
 - Dry-run and E2E verification for GitHub publishing
 
+### Phase31-40 implementation notes
+- Check Run and PR comment are idempotent upsert operations
+- Publish has retry/backoff policy and rate-limit degraded mode
+- Auth abstraction supports `token|app` mode
+- Optional review-priority label integration and comment suppression rules
+- Dry-run payload generation is available via CLI and workflow
+
 ## v0.4.0
 - Historical trend API (metadata only)
 - Team/repo policy presets

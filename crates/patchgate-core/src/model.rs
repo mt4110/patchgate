@@ -59,6 +59,15 @@ pub struct Finding {
     pub tags: Vec<String>,
 }
 
+impl Finding {
+    pub fn pr_template_hint(&self) -> String {
+        format!(
+            "- [ ] `{}` ({}) {}",
+            self.rule_id, self.category, self.title
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckScore {
     pub check: CheckId,

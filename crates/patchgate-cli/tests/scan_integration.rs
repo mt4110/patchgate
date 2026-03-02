@@ -164,6 +164,93 @@ fn scan_github_publish_path_returns_publish_error_without_required_env() -> Test
     Ok(())
 }
 
+#[test]
+fn scan_github_publish_dry_run_writes_payload_file() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.append_line("src/lib.rs", "pub fn changed_for_dry_run() -> i32 { 10 }")?;
+    let payload_path = repo.root().join("artifacts/github-dry-run.json");
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+            "--github-publish",
+            "--github-dry-run",
+            "--github-repo",
+            "example/repo",
+            "--github-pr",
+            "123",
+            "--github-sha",
+            "deadbeef",
+            "--github-dry-run-output",
+            payload_path
+                .to_str()
+                .ok_or("invalid payload output path utf8")?,
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "dry-run publish should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = fs::read_to_string(payload_path)?;
+    assert!(payload.contains("\"check_run_payload\""));
+    assert!(payload.contains("\"auth_mode\": \"token\""));
+
+    Ok(())
+}
+
+#[test]
+fn scan_github_publish_dry_run_can_suppress_comment() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    let payload_path = repo.root().join("artifacts/github-dry-run-suppressed.json");
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+            "--github-publish",
+            "--github-dry-run",
+            "--github-repo",
+            "example/repo",
+            "--github-pr",
+            "456",
+            "--github-sha",
+            "cafebabe",
+            "--github-suppress-comment-no-change",
+            "--github-dry-run-output",
+            payload_path
+                .to_str()
+                .ok_or("invalid payload output path utf8")?,
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "dry-run publish should succeed on no-change: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = fs::read_to_string(payload_path)?;
+    assert!(payload.contains("\"suppressed_comment_reason\""));
+
+    Ok(())
+}
+
 fn run_patchgate(repo: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_patchgate"))
         .current_dir(repo)

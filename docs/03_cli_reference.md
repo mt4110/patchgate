@@ -18,21 +18,40 @@
 ### `patchgate scan`
 PR差分に対して品質ゲートを実行します。
 
-Options:
+Policy options:
 
 - `--policy-preset <strict|balanced|relaxed>`
+
+Core options:
+
 - `--format <text|json>`
 - `--scope <staged|worktree|repo>`
 - `--mode <warn|enforce>`
 - `--threshold <0..=100>`
 - `--no-cache`
+
+GitHub publish options:
+
 - `--github-comment <path>`
 - `--github-publish`
 - `--github-repo <owner/repo>`
 - `--github-pr <number>`
 - `--github-sha <sha>`
-- `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
 - `--github-check-name <name>`
+- `--github-auth <token|app>`
+- `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
+- `--github-app-token-env <env_name>` (default: `GITHUB_APP_INSTALLATION_TOKEN`)
+- `--github-retry-max-attempts <n>`
+- `--github-retry-backoff-ms <ms>`
+- `--github-retry-max-backoff-ms <ms>`
+- `--github-dry-run`
+- `--github-dry-run-output <path>`
+- `--github-no-comment`
+- `--github-no-check-run`
+- `--github-apply-labels`
+- `--github-suppress-comment-no-change`
+- `--github-suppress-comment-low-priority`
+- `--github-suppress-comment-rerun`
 
 Policy load order:
 
@@ -70,23 +89,37 @@ Options:
 `--github-publish` で以下を実行します。
 
 - PRコメントを upsert (`<!-- patchgate:report -->` マーカー)
-- Check Run を作成
+- Check Run を idempotent update/create
+- （opt-in）`review_priority` 対応ラベルを付与
 
-### 部分成功時の挙動
+### Check Run conclusion mapping
 
-- comment成功 / check失敗、またはその逆は「部分成功」として処理継続
-- comment と check の両方 API 呼び出しが失敗した場合は publish エラー（exit code `6`）
-- publish入力解決（例: `GITHUB_REPOSITORY` 不足）で失敗した場合も publish エラー（exit code `6`）
-- 部分成功時は標準エラー出力に失敗理由を個別表示
+| mode | should_fail | findings | conclusion |
+|---|---:|---|---|
+| enforce | true | any | failure |
+| any | false | none | success |
+| warn | false | criticalあり | action_required |
+| any | false | high/criticalあり | neutral |
+| enforce | false | low/mediumのみ | success |
+| warn | false | low/mediumのみ | neutral |
 
-### 入力解決の優先順
+### Retry/backoff and degraded operation
 
-- `repo`: `--github-repo` > `GITHUB_REPOSITORY`
-- `pr_number`: `--github-pr` > `GITHUB_EVENT_PATH` payload (`number`) > `GITHUB_REF`
-- `head_sha`: `--github-sha` > `GITHUB_EVENT_PATH` payload (`pull_request.head.sha`) > `GITHUB_SHA`
-- `token`: `--github-token-env`（未指定時 `GITHUB_TOKEN`）で環境変数を解決
+- 一時障害（timeout/connect/5xx/429）に対して retry/backoff を実行
+- rate limit 検知時は `degraded_mode` を出力し、残り経路（comment-only / check-only）を継続
+- comment/check の両方が失敗した場合のみ publish エラー
 
-GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SHA` / `GITHUB_EVENT_PATH` から自動解決されます。
+### Auth abstraction
+
+- `token` モード: PAT/GITHUB_TOKEN を使用
+- `app` モード: GitHub App installation token を使用（`--github-app-token-env`）
+
+### Dry-run
+
+`--github-dry-run` 指定時は GitHub API を呼ばず、送信予定 payload を生成します。
+
+- 標準エラーに JSON 表示
+- `--github-dry-run-output` でファイル保存
 
 ## Score
 

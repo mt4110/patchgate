@@ -13,21 +13,43 @@ patchgate policy migrate --from 1 --to 2 --path policy.toml --write
 patchgate policy lint --path policy.toml --require-current-version
 ```
 
-### CI で policy 互換性をゲートする
+### GitHub publish を dry-run で検証する
 
 ```bash
-patchgate policy lint --path config/policy.toml.example --require-current-version
-for preset in strict balanced relaxed; do
-  patchgate policy lint --path "config/presets/${preset}.toml" --require-current-version
-done
+patchgate scan \
+  --scope worktree \
+  --mode warn \
+  --format json \
+  --github-publish \
+  --github-dry-run \
+  --github-repo owner/repo \
+  --github-pr 123 \
+  --github-sha <sha> \
+  --github-dry-run-output artifacts/github-payload.json
 ```
 
-### リポジトリごとに preset を切り替える
+### retry/backoff と comment抑制を有効化する
 
 ```bash
-patchgate scan --policy-preset strict --mode enforce
-patchgate scan --policy-preset balanced --mode warn
-patchgate scan --policy-preset relaxed --mode warn
+patchgate scan \
+  --scope worktree \
+  --mode enforce \
+  --github-publish \
+  --github-retry-max-attempts 5 \
+  --github-retry-backoff-ms 500 \
+  --github-retry-max-backoff-ms 5000 \
+  --github-suppress-comment-low-priority \
+  --github-suppress-comment-rerun
+```
+
+### review_priority ベースのラベル付与（opt-in）
+
+```bash
+patchgate scan \
+  --scope worktree \
+  --mode warn \
+  --github-publish \
+  --github-apply-labels
 ```
 
 ## Policy distribution template

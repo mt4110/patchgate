@@ -36,6 +36,19 @@ jobs:
               --require-current-version
           done
 
+      - name: GitHub publish dry-run smoke test
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --github-publish \
+            --github-dry-run \
+            --github-repo example/repo \
+            --github-pr 1 \
+            --github-sha deadbeef \
+            --github-dry-run-output artifacts/github-payload.json
+
       - name: Benchmark baseline compare
         run: |
           nix develop --command cargo run -p xtask -- bench compare \

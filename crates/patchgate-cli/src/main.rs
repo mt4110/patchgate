@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
-use patchgate_github::{publish_report, PublishRequest};
+use patchgate_github::{publish_report, PublishAuth, PublishRequest, RetryPolicy};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,7 +14,7 @@ use patchgate_config::{
     Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
     POLICY_VERSION_CURRENT,
 };
-use patchgate_core::{Context, Finding, Report, Runner, ScopeMode, Severity};
+use patchgate_core::{Context, Finding, Report, ReviewPriority, Runner, ScopeMode, Severity};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +100,58 @@ struct ScanArgs {
     /// Check-run name (default: patchgate)
     #[arg(long)]
     github_check_name: Option<String>,
+
+    /// GitHub auth mode: token|app
+    #[arg(long)]
+    github_auth: Option<String>,
+
+    /// Environment variable name for GitHub App installation token
+    #[arg(long)]
+    github_app_token_env: Option<String>,
+
+    /// Max retry attempts for GitHub publish operations
+    #[arg(long, default_value_t = 3)]
+    github_retry_max_attempts: u8,
+
+    /// Initial retry backoff in milliseconds
+    #[arg(long, default_value_t = 300)]
+    github_retry_backoff_ms: u64,
+
+    /// Max retry backoff in milliseconds
+    #[arg(long, default_value_t = 3000)]
+    github_retry_max_backoff_ms: u64,
+
+    /// Build GitHub payloads but do not call GitHub API
+    #[arg(long)]
+    github_dry_run: bool,
+
+    /// Write dry-run payload JSON to a file
+    #[arg(long)]
+    github_dry_run_output: Option<PathBuf>,
+
+    /// Skip PR comment publishing
+    #[arg(long)]
+    github_no_comment: bool,
+
+    /// Skip check-run publishing
+    #[arg(long)]
+    github_no_check_run: bool,
+
+    /// Apply review-priority label to PR (opt-in)
+    #[arg(long)]
+    github_apply_labels: bool,
+
+    /// Suppress comment when result is unchanged/cache-hit style run
+    #[arg(long)]
+    github_suppress_comment_no_change: bool,
+
+    /// Suppress comment when review priority is low (P3)
+    #[arg(long)]
+    github_suppress_comment_low_priority: bool,
+
+    /// Suppress comment on rerun attempts (GITHUB_RUN_ATTEMPT > 1)
+    #[arg(long)]
+    github_suppress_comment_rerun: bool,
 }
 
 #[derive(Args, Debug)]
@@ -246,6 +298,22 @@ impl PolicyExitCode {
 enum OptionSource {
     Cli,
     Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubAuthMode {
+    Token,
+    App,
+}
+
+impl GitHubAuthMode {
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw.unwrap_or("token") {
+            "token" => Ok(GitHubAuthMode::Token),
+            "app" => Ok(GitHubAuthMode::App),
+            other => Err(format!("`{other}` (expected: token|app)")),
+        }
+    }
 }
 
 struct ResolvedScanOptions {
@@ -550,6 +618,19 @@ fn execute_scan(
         github_sha,
         github_token_env,
         github_check_name,
+        github_auth,
+        github_app_token_env,
+        github_retry_max_attempts,
+        github_retry_backoff_ms,
+        github_retry_max_backoff_ms,
+        github_dry_run,
+        github_dry_run_output,
+        github_no_comment,
+        github_no_check_run,
+        github_apply_labels,
+        github_suppress_comment_no_change,
+        github_suppress_comment_low_priority,
+        github_suppress_comment_rerun,
     } = scan;
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
         ScanError::new(
@@ -679,12 +760,30 @@ fn execute_scan(
     }
 
     if github_publish {
+        let suppressed_comment_reason = resolve_comment_suppression_reason(
+            &report,
+            github_suppress_comment_no_change,
+            github_suppress_comment_low_priority,
+            github_suppress_comment_rerun,
+        );
         let req = resolve_publish_request(
             github_repo,
             github_pr,
             github_sha,
             github_token_env,
             github_check_name,
+            github_auth,
+            github_app_token_env,
+            RetryPolicy {
+                max_attempts: github_retry_max_attempts,
+                backoff_base_ms: github_retry_backoff_ms,
+                backoff_max_ms: github_retry_max_backoff_ms,
+            },
+            github_dry_run,
+            !github_no_comment,
+            !github_no_check_run,
+            github_apply_labels,
+            suppressed_comment_reason,
         )
         .map_err(|err| {
             ScanError::new(
@@ -698,11 +797,48 @@ fn execute_scan(
                 err.context("failed to publish report to GitHub"),
             )
         })?;
+        if let Some(payload) = published.dry_run_payload.as_ref() {
+            let pretty = serde_json::to_string_pretty(payload).map_err(|err| {
+                ScanError::new(
+                    ScanErrorKind::Output,
+                    anyhow!("failed to encode github dry-run payload: {err}"),
+                )
+            })?;
+            eprintln!("github dry-run payload:\n{pretty}");
+            if let Some(path) = github_dry_run_output.as_ref() {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        ScanError::new(
+                            ScanErrorKind::Output,
+                            anyhow!("failed to create dry-run output directory: {parent:?}: {err}"),
+                        )
+                    })?;
+                }
+                fs::write(path, pretty).map_err(|err| {
+                    ScanError::new(
+                        ScanErrorKind::Output,
+                        anyhow!("failed to write github dry-run payload: {path:?}: {err}"),
+                    )
+                })?;
+            }
+        }
+        if let Some(reason) = published.skipped_comment_reason.as_ref() {
+            eprintln!("github comment skipped: {reason}");
+        }
         if let Some(err) = published.comment_error.as_ref() {
             eprintln!("warning: failed to publish PR comment: {err}");
         }
         if let Some(err) = published.check_run_error.as_ref() {
             eprintln!("warning: failed to publish check run: {err}");
+        }
+        if let Some(err) = published.label_error.as_ref() {
+            eprintln!("warning: failed to apply labels: {err}");
+        }
+        if let Some(mode) = published.degraded_mode.as_ref() {
+            eprintln!("warning: publish degraded mode activated: {mode}");
+        }
+        if !published.applied_labels.is_empty() {
+            eprintln!("applied PR labels: {}", published.applied_labels.join(", "));
         }
         if let Some(url) = published.comment_url {
             eprintln!("published PR comment: {url}");
@@ -734,6 +870,14 @@ fn resolve_publish_request(
     github_sha: Option<String>,
     github_token_env: Option<String>,
     github_check_name: Option<String>,
+    github_auth: Option<String>,
+    github_app_token_env: Option<String>,
+    retry_policy: RetryPolicy,
+    github_dry_run: bool,
+    publish_comment: bool,
+    publish_check_run: bool,
+    apply_priority_label: bool,
+    suppressed_comment_reason: Option<String>,
 ) -> Result<PublishRequest> {
     let repo = github_repo
         .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
@@ -755,19 +899,47 @@ fn resolve_publish_request(
             )?,
     };
 
-    let token_env = github_token_env.unwrap_or_else(|| "GITHUB_TOKEN".to_string());
-    let token = std::env::var(&token_env)
-        .with_context(|| format!("missing GitHub token env var: {token_env}"))?;
-
+    let auth_mode = GitHubAuthMode::parse(github_auth.as_deref())
+        .map_err(|err| anyhow!("invalid value for github_auth: {err}"))?;
     let check_name = github_check_name.unwrap_or_else(|| "patchgate".to_string());
+    let auth = match auth_mode {
+        GitHubAuthMode::Token => {
+            let token_env = github_token_env.unwrap_or_else(|| "GITHUB_TOKEN".to_string());
+            let token = if github_dry_run {
+                std::env::var(&token_env).unwrap_or_else(|_| "<dry-run-token>".to_string())
+            } else {
+                std::env::var(&token_env)
+                    .with_context(|| format!("missing GitHub token env var: {token_env}"))?
+            };
+            PublishAuth::Token { token }
+        }
+        GitHubAuthMode::App => {
+            let app_token_env =
+                github_app_token_env.unwrap_or_else(|| "GITHUB_APP_INSTALLATION_TOKEN".to_string());
+            let installation_token = if github_dry_run {
+                std::env::var(&app_token_env)
+                    .unwrap_or_else(|_| "<dry-run-app-installation-token>".to_string())
+            } else {
+                std::env::var(&app_token_env).with_context(|| {
+                    format!("missing GitHub App installation token env var: {app_token_env}")
+                })?
+            };
+            let app_id = std::env::var("GITHUB_APP_ID").ok();
+            PublishAuth::App {
+                installation_token,
+                app_id,
+            }
+        }
+    };
 
-    Ok(PublishRequest {
-        repo,
-        pr_number,
-        head_sha,
-        token,
-        check_name,
-    })
+    let mut req = PublishRequest::new(repo, pr_number, head_sha, auth, check_name);
+    req.retry_policy = retry_policy;
+    req.publish_comment = publish_comment;
+    req.publish_check_run = publish_check_run;
+    req.apply_priority_label = apply_priority_label;
+    req.dry_run = github_dry_run;
+    req.suppressed_comment_reason = suppressed_comment_reason;
+    Ok(req)
 }
 
 fn detect_pr_number_from_env() -> Result<Option<u64>> {
@@ -866,6 +1038,35 @@ fn resolve_policy_path(
         return resolve_config_path(repo_root, Some(path));
     }
     resolve_config_path(repo_root, config_override)
+}
+
+fn resolve_comment_suppression_reason(
+    report: &Report,
+    suppress_no_change: bool,
+    suppress_low_priority: bool,
+    suppress_rerun: bool,
+) -> Option<String> {
+    if suppress_no_change && (report.skipped_by_cache || report.findings.is_empty()) {
+        return Some("suppressed by --github-suppress-comment-no-change".to_string());
+    }
+
+    if suppress_low_priority && report.review_priority == ReviewPriority::P3 {
+        return Some("suppressed by --github-suppress-comment-low-priority".to_string());
+    }
+
+    if suppress_rerun {
+        let attempt = std::env::var("GITHUB_RUN_ATTEMPT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        if attempt > 1 {
+            return Some(format!(
+                "suppressed by --github-suppress-comment-rerun (GITHUB_RUN_ATTEMPT={attempt})"
+            ));
+        }
+    }
+
+    None
 }
 
 fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResult<()> {
@@ -1311,6 +1512,16 @@ fn render_github_comment(report: &Report) -> String {
     }
 
     lines.push(String::new());
+    lines.push("### PR template hints".to_string());
+    if sorted_findings.is_empty() {
+        lines.push("- No action items".to_string());
+    } else {
+        for finding in sorted_findings.iter().take(5) {
+            lines.push(finding.pr_template_hint());
+        }
+    }
+
+    lines.push(String::new());
     lines.push("### All findings".to_string());
 
     if sorted_findings.is_empty() {
@@ -1348,14 +1559,16 @@ mod tests {
 
     use patchgate_config::Config;
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
+    use patchgate_github::PublishAuth;
 
     use super::{
         apply_threshold_override, build_cache_key, detect_head_sha_from_env,
         detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
         parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
         pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        sorted_findings_for_comment, OptionSource, PolicyExitCode, ScanErrorKind, ScopeMode,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, sorted_findings_for_comment, OptionSource,
+        PolicyExitCode, RetryPolicy, ScanErrorKind, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1550,14 +1763,25 @@ mod tests {
             Some("cli-sha".to_string()),
             None,
             Some("cli-check".to_string()),
+            Some("token".to_string()),
+            None,
+            RetryPolicy::default(),
+            false,
+            true,
+            true,
+            false,
+            None,
         )
         .expect("resolve publish request");
 
         assert_eq!(req.repo, "cli/repo");
         assert_eq!(req.pr_number, 12);
         assert_eq!(req.head_sha, "cli-sha");
-        assert_eq!(req.token, "env-token");
         assert_eq!(req.check_name, "cli-check");
+        match req.auth {
+            PublishAuth::Token { token } => assert_eq!(token, "env-token"),
+            _ => panic!("expected token auth"),
+        }
 
         env::remove_var("GITHUB_REPOSITORY");
         env::remove_var("GITHUB_REF");
@@ -1585,7 +1809,22 @@ mod tests {
         env::set_var("GITHUB_SHA", "fallback-sha");
         env::set_var("GITHUB_TOKEN", "env-token");
 
-        let req = resolve_publish_request(None, None, None, None, None).expect("resolve from env");
+        let req = resolve_publish_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetryPolicy::default(),
+            false,
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("resolve from env");
         assert_eq!(req.repo, "env/repo");
         assert_eq!(req.pr_number, 88);
         assert_eq!(req.head_sha, "event-sha-88");
@@ -1617,7 +1856,22 @@ mod tests {
         env::set_var("GITHUB_SHA", "fallback-sha-42");
         env::set_var("GITHUB_TOKEN", "env-token");
 
-        let req = resolve_publish_request(None, None, None, None, None).expect("resolve from env");
+        let req = resolve_publish_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetryPolicy::default(),
+            false,
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("resolve from env");
         assert_eq!(req.pr_number, 42);
         assert_eq!(req.head_sha, "fallback-sha-42");
 
@@ -1626,6 +1880,88 @@ mod tests {
         env::remove_var("GITHUB_SHA");
         env::remove_var("GITHUB_TOKEN");
         let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn resolve_publish_request_supports_app_auth() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_APP_INSTALLATION_TOKEN",
+            "GITHUB_APP_ID",
+        ]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_REF", "refs/pull/42/merge");
+        env::set_var("GITHUB_SHA", "sha42");
+        env::set_var("GITHUB_APP_INSTALLATION_TOKEN", "app-token");
+        env::set_var("GITHUB_APP_ID", "12345");
+
+        let req = resolve_publish_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("app".to_string()),
+            None,
+            RetryPolicy::default(),
+            false,
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("resolve app auth");
+
+        match req.auth {
+            PublishAuth::App {
+                installation_token,
+                app_id,
+            } => {
+                assert_eq!(installation_token, "app-token");
+                assert_eq!(app_id.as_deref(), Some("12345"));
+            }
+            _ => panic!("expected app auth"),
+        }
+    }
+
+    #[test]
+    fn resolve_publish_request_allows_dry_run_without_token() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_REF", "refs/pull/7/merge");
+        env::set_var("GITHUB_SHA", "sha7");
+        env::remove_var("GITHUB_TOKEN");
+
+        let req = resolve_publish_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            RetryPolicy::default(),
+            true,
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("dry run should not require token");
+
+        match req.auth {
+            PublishAuth::Token { token } => assert_eq!(token, "<dry-run-token>"),
+            _ => panic!("expected token auth"),
+        }
     }
 
     #[test]
@@ -1879,6 +2215,35 @@ mod tests {
         assert_eq!(PolicyExitCode::MigrationRequired.as_i32(), 14);
         assert_eq!(PolicyExitCode::MigrationFailed.as_i32(), 15);
         assert_eq!(PolicyExitCode::IoFailed.as_i32(), 16);
+    }
+
+    #[test]
+    fn comment_suppression_uses_priority_rules() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: true,
+            },
+        );
+        let reason = resolve_comment_suppression_reason(&report, true, false, false);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|msg| msg.contains("no-change")),
+            "must suppress by no-change rule"
+        );
     }
 
     #[test]

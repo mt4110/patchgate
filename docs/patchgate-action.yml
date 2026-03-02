@@ -28,7 +28,7 @@ jobs:
           # this makes `git diff` represent the PR delta.
           git reset --mixed HEAD^1
 
-      - name: Run patchgate (publish priority-first PR comment + check-run)
+      - name: Run patchgate (idempotent publish + retry/backoff)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -37,10 +37,36 @@ jobs:
             --scope worktree \
             --format json \
             --github-comment patchgate-comment.md \
-            --github-publish
+            --github-publish \
+            --github-retry-max-attempts 5 \
+            --github-retry-backoff-ms 500 \
+            --github-retry-max-backoff-ms 5000 \
+            --github-suppress-comment-rerun
 
-      - name: Upload report artifact (includes Priority findings section)
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: patchgate-comment
           path: patchgate-comment.md
+
+  dry-run-publish-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+      - name: Build GitHub publish payload preview
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --mode warn \
+            --scope staged \
+            --format json \
+            --github-publish \
+            --github-dry-run \
+            --github-repo ${{ github.repository }} \
+            --github-pr ${{ github.event.pull_request.number || 0 }} \
+            --github-sha ${{ github.sha }} \
+            --github-dry-run-output patchgate-github-payload.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patchgate-github-payload
+          path: patchgate-github-payload.json

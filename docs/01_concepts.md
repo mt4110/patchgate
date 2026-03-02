@@ -43,6 +43,14 @@
 - `category`: ルールカテゴリ（例: `test_coverage`, `change_risk`, `dependency`）
 - `docs_url`: 参照ドキュメントURL
 
+## GitHub publish model (Phase31-40)
+
+- Idempotent: check-run/comment は update/create の upsert で再実行時の重複を抑制
+- Resilient: 一時障害（timeout/connect/5xx/429）は retry/backoff で吸収
+- Degraded operation: rate limit 時は `comment_only` / `check_only` の劣化運転を許容
+- Dry-run first: 本番 publish 前に payload を確認できる
+- Noise control: no-change / low-priority / rerun 条件でコメント抑制が可能
+
 ## JSON output contract
 
 `scan --format json` は運用連携用の契約出力です。主要キー:

@@ -25,6 +25,19 @@ jobs:
               --require-current-version
           done
 
+      - name: GitHub publish dry-run E2E path
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --github-publish \
+            --github-dry-run \
+            --github-repo example/repo \
+            --github-pr 1 \
+            --github-sha deadbeef \
+            --github-dry-run-output artifacts/github-payload.json
+
   cross-platform:
     strategy:
       fail-fast: false
