@@ -223,7 +223,6 @@ fn evaluate_test_gap(
         .collect();
     package_markers.sort_by_key(|marker| std::cmp::Reverse(marker.len()));
 
-    let mut test_files = Vec::new();
     let mut tests_by_package: BTreeMap<String, usize> = BTreeMap::new();
     let mut production_files_by_package: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut production_churn_by_package: BTreeMap<String, u32> = BTreeMap::new();
@@ -244,7 +243,6 @@ fn evaluate_test_gap(
             continue;
         }
         if is_test_related_file(policy, file, &test_set) {
-            test_files.push(file.path.clone());
             let package = infer_package_root(&file.path, &package_markers);
             *tests_by_package.entry(package).or_insert(0) += 1;
             continue;
@@ -276,7 +274,6 @@ fn evaluate_test_gap(
     let global_test_updates = tests_by_package.get(".").copied().unwrap_or_default();
     let mut uncovered_packages = Vec::new();
     let mut uncovered_files = Vec::new();
-    let mut uncovered_churn = 0u32;
     let mut under_tested_packages = Vec::new();
     let mut under_tested_files = Vec::new();
     let mut under_tested_churn = 0u32;
@@ -291,12 +288,6 @@ fn evaluate_test_gap(
         if matching_test_updates == 0 {
             uncovered_packages.push(package.clone());
             uncovered_files.extend(files.iter().cloned());
-            uncovered_churn = uncovered_churn.saturating_add(
-                production_churn_by_package
-                    .get(package)
-                    .copied()
-                    .unwrap_or_default(),
-            );
         }
         if matching_test_updates <= 1 {
             under_tested_packages.push(package.clone());

@@ -408,6 +408,7 @@ struct ScanReport {
 }
 
 fn run_patchgate_scan(repo: &Path) -> Result<ScanReport> {
+    let repo = canonical_repo_path(repo)?;
     let repo_arg = repo
         .to_str()
         .ok_or_else(|| anyhow!("invalid repo path utf8 for scan command"))?;
@@ -445,6 +446,7 @@ fn run_patchgate_scan(repo: &Path) -> Result<ScanReport> {
 }
 
 fn run_patchgate_scan_with_profile(repo: &Path, profile_output: &Path) -> Result<()> {
+    let repo = canonical_repo_path(repo)?;
     let repo_arg = repo
         .to_str()
         .ok_or_else(|| anyhow!("invalid repo path utf8 for scan command"))?;
@@ -483,6 +485,11 @@ fn run_patchgate_scan_with_profile(repo: &Path, profile_output: &Path) -> Result
         "patchgate scan with profile failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     )
+}
+
+fn canonical_repo_path(repo: &Path) -> Result<PathBuf> {
+    repo.canonicalize()
+        .with_context(|| format!("failed to canonicalize --repo path `{}`", repo.display()))
 }
 
 fn workspace_root() -> PathBuf {
@@ -605,7 +612,10 @@ fn is_duration_regressed(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_workload_identity, BenchSample};
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    use super::{canonical_repo_path, validate_workload_identity, BenchSample, TEMP_SEQ};
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
         BenchSample {
@@ -636,5 +646,20 @@ mod tests {
             validate_workload_identity(&prev, &mismatch_files).is_err(),
             "changed_files mismatch should fail"
         );
+    }
+
+    #[test]
+    fn canonical_repo_path_resolves_relative_path_against_caller_cwd() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let rel = format!("target/xtask-relative-repo-{seq}");
+        let cwd = std::env::current_dir().expect("cwd");
+        let abs = cwd.join(&rel);
+        std::fs::create_dir_all(&abs).expect("create temp repo dir");
+
+        let resolved = canonical_repo_path(Path::new(&rel)).expect("resolve relative repo path");
+        let expected = abs.canonicalize().expect("canonicalized expected path");
+        assert_eq!(resolved, expected);
+
+        std::fs::remove_dir_all(&abs).expect("cleanup temp repo dir");
     }
 }
