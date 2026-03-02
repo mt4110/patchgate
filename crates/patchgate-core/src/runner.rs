@@ -438,9 +438,6 @@ fn evaluate_dangerous_change(
         if exclude_set.is_match(&file.path) {
             continue;
         }
-        if is_metadata_only_change(file) {
-            continue;
-        }
         if !pattern_set.is_match(&file.path) {
             continue;
         }
@@ -1698,6 +1695,36 @@ mod tests {
             finding.tags.iter().any(|tag| tag == "critical"),
             "expected critical tag"
         );
+    }
+
+    #[test]
+    fn dangerous_change_detects_metadata_only_critical_rename() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: ".github/workflows/ci-main.yml".to_string(),
+                status: ChangeStatus::Renamed,
+                old_path: Some(".github/workflows/ci.yml".to_string()),
+                added: 0,
+                deleted: 0,
+                added_lines: vec![],
+                removed_lines: vec![],
+            }],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set, &generated_set)
+            .expect("evaluate");
+        assert_eq!(
+            eval.score.penalty,
+            policy.dangerous_change.per_file_penalty
+                + policy.dangerous_change.critical_bonus_penalty
+        );
+        let finding = eval.findings.first().expect("finding");
+        assert_eq!(finding.id, "DC-002");
+        assert_eq!(finding.severity, Severity::Critical);
     }
 
     #[test]
