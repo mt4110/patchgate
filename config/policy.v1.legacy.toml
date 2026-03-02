@@ -1,0 +1,94 @@
+[output]
+format = "text"
+mode = "warn"
+fail_threshold = 70
+
+[scope]
+mode = "staged"
+
+[cache]
+enabled = true
+db_path = ".patchgate/cache.db"
+
+[exclude]
+globs = ["vendor/**", "**/generated/**"]
+
+[weights]
+test_gap_max_penalty = 35
+dangerous_change_max_penalty = 45
+dependency_update_max_penalty = 30
+
+[test_gap]
+enabled = true
+test_globs = [
+  "tests/**",
+  "**/__tests__/**",
+  "**/*.test.*",
+  "**/*.spec.*",
+  "**/*_test.go",
+  "**/test_*.py",
+]
+production_ignore_globs = [
+  "docs/**",
+  "**/*.md",
+  "**/*.txt",
+  "**/*.rst",
+  "**/*.adoc",
+]
+missing_tests_penalty = 28
+large_change_lines = 200
+large_change_penalty = 8
+
+[dangerous_change]
+enabled = true
+patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+  "helm/**",
+  "migrations/**",
+  "db/migrate/**",
+  "**/auth/**",
+  "**/security/**",
+  "Dockerfile",
+  "docker-compose*.yml",
+  "docker-compose*.yaml",
+]
+critical_patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+  "migrations/**",
+]
+per_file_penalty = 10
+critical_bonus_penalty = 6
+
+[dependency_update]
+enabled = true
+manifest_globs = [
+  "**/Cargo.toml",
+  "**/package.json",
+  "**/go.mod",
+  "**/requirements*.txt",
+  "**/pyproject.toml",
+  "**/Gemfile",
+  "**/pom.xml",
+  "**/build.gradle",
+  "**/build.gradle.kts",
+]
+lockfile_globs = [
+  "**/Cargo.lock",
+  "**/package-lock.json",
+  "**/yarn.lock",
+  "**/pnpm-lock.yaml",
+  "**/go.sum",
+  "**/Pipfile.lock",
+  "**/poetry.lock",
+  "**/Gemfile.lock",
+]
+manifest_penalty = 18
+lockfile_penalty = 8
+large_lockfile_churn = 200
+large_lockfile_penalty = 10

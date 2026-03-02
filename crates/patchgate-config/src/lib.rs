@@ -184,13 +184,6 @@ pub fn load_effective_from_typed(
     path: Option<&Path>,
     preset: Option<PolicyPreset>,
 ) -> Result<LoadedConfig> {
-    let mut merged = default_config_value();
-
-    if let Some(preset) = preset {
-        let preset_value = parse_toml_value(preset_toml(preset))?;
-        deep_merge(&mut merged, preset_value);
-    }
-
     let (config, version_source) = if let Some(path_ref) = path {
         let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
             path: path_ref.to_path_buf(),
@@ -198,6 +191,15 @@ pub fn load_effective_from_typed(
         })?;
         let policy_value = parse_toml_value(&text)?;
         let has_explicit_version = has_explicit_policy_version(&policy_value);
+        let mut merged = if has_explicit_version {
+            default_config_value()
+        } else {
+            legacy_default_config_value()
+        };
+        if let Some(preset) = preset {
+            let preset_value = parse_toml_value(preset_toml(preset))?;
+            deep_merge(&mut merged, preset_value);
+        }
         deep_merge(&mut merged, policy_value);
 
         let mut cfg = parse_config_from_value(merged)?;
@@ -209,6 +211,11 @@ pub fn load_effective_from_typed(
         };
         (cfg, source)
     } else {
+        let mut merged = default_config_value();
+        if let Some(preset) = preset {
+            let preset_value = parse_toml_value(preset_toml(preset))?;
+            deep_merge(&mut merged, preset_value);
+        }
         (
             parse_config_from_value(merged)?,
             PolicyVersionSource::Default,
@@ -533,6 +540,14 @@ fn default_config_value() -> toml::Value {
     toml::Value::try_from(Config::default()).expect("default config must serialize")
 }
 
+fn legacy_default_config_value() -> toml::Value {
+    parse_toml_value(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/policy.v1.legacy.toml"
+    )))
+    .expect("legacy default policy must be valid TOML")
+}
+
 fn preset_toml(preset: PolicyPreset) -> &'static str {
     match preset {
         PolicyPreset::Strict => {
@@ -844,6 +859,8 @@ mode = "warn"
             .compatibility_warnings
             .iter()
             .any(|w| w.contains("migrate")));
+        assert_eq!(loaded.config.output.fail_threshold, 70);
+        assert_eq!(loaded.config.weights.test_gap_max_penalty, 35);
 
         let _ = fs::remove_file(path);
     }

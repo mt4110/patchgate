@@ -99,7 +99,7 @@ Options:
 | enforce | true | any | failure |
 | any | false | none | success |
 | warn | false | criticalあり | action_required |
-| any | false | high/criticalあり | neutral |
+| any | false | highのみ（criticalなし） | neutral |
 | enforce | false | low/mediumのみ | success |
 | warn | false | low/mediumのみ | neutral |
 

@@ -279,7 +279,11 @@ fn backoff_delay_ms(policy: &RetryPolicy, attempt: u8) -> u64 {
 
 fn github_client(auth: &PublishAuth) -> Result<Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static("patchgate/0.3"));
+    let user_agent = format!("patchgate/{}", env!("CARGO_PKG_VERSION"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&user_agent).context("failed to build user-agent header")?,
+    );
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/vnd.github+json"),
@@ -323,13 +327,20 @@ fn upsert_pr_comment(
             "{}/repos/{}/issues/comments/{}",
             req.api_base_url, req.repo, target.id
         );
-        let updated: IssueComment = send_json(
+        let updated: std::result::Result<IssueComment, PublishOpError> = send_json(
             client
                 .patch(update_url)
                 .json(&serde_json::json!({ "body": body })),
             "update issue comment",
-        )?;
-        return Ok(updated.html_url);
+        );
+        match updated {
+            Ok(updated) => return Ok(updated.html_url),
+            Err(err) => {
+                if !is_comment_update_fallback_candidate(&err) {
+                    return Err(err);
+                }
+            }
+        }
     }
 
     let created: IssueComment = send_json(
@@ -504,7 +515,7 @@ fn send_json<T: DeserializeOwned>(
     let response = request.send().map_err(|err| {
         PublishOpError::new(
             format!("{operation}: request failed: {err}"),
-            err.is_timeout() || err.is_connect() || err.is_request(),
+            err.is_timeout() || err.is_connect(),
             false,
         )
     })?;
@@ -667,6 +678,10 @@ fn normalize_comment(input: &str) -> &str {
     input.trim()
 }
 
+fn is_comment_update_fallback_candidate(err: &PublishOpError) -> bool {
+    matches!(err.status_code, Some(403 | 404))
+}
+
 fn is_check_run_update_fallback_candidate(err: &PublishOpError) -> bool {
     matches!(err.status_code, Some(403 | 404))
 }
@@ -679,9 +694,9 @@ mod tests {
 
     use super::{
         backoff_delay_ms, check_run_conclusion, ensure_comment_marker,
-        is_check_run_update_fallback_candidate, is_same_comment_content,
-        merge_priority_label_names, priority_label_name, with_retry, LabelItem, PublishOpError,
-        RetryPolicy, MARKER,
+        is_check_run_update_fallback_candidate, is_comment_update_fallback_candidate,
+        is_same_comment_content, merge_priority_label_names, priority_label_name, with_retry,
+        LabelItem, PublishOpError, RetryPolicy, MARKER,
     };
 
     fn sample_report(mode: &str, penalty: u8, findings: Vec<Finding>) -> Report {
@@ -872,5 +887,17 @@ mod tests {
 
         let conflict = PublishOpError::new("conflict", false, false).with_status_code(409);
         assert!(!is_check_run_update_fallback_candidate(&conflict));
+    }
+
+    #[test]
+    fn comment_update_fallback_is_only_for_permission_or_missing_comment() {
+        let fallback = PublishOpError::new("forbidden", false, false).with_status_code(403);
+        assert!(is_comment_update_fallback_candidate(&fallback));
+
+        let missing = PublishOpError::new("missing", false, false).with_status_code(404);
+        assert!(is_comment_update_fallback_candidate(&missing));
+
+        let conflict = PublishOpError::new("conflict", false, false).with_status_code(409);
+        assert!(!is_comment_update_fallback_candidate(&conflict));
     }
 }
