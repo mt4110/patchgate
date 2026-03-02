@@ -610,7 +610,9 @@ fn detect_policy_version_from_toml(
     value: &toml::Value,
 ) -> std::result::Result<u32, PolicyMigrationError> {
     match value.get(POLICY_VERSION_FIELD) {
-        Some(toml::Value::Integer(v)) if *v > 0 => Ok(*v as u32),
+        Some(toml::Value::Integer(v)) if *v > 0 => {
+            u32::try_from(*v).map_err(|_| PolicyMigrationError::InvalidVersionField)
+        }
         Some(_) => Err(PolicyMigrationError::InvalidVersionField),
         None => Ok(POLICY_VERSION_LEGACY),
     }
@@ -730,8 +732,8 @@ mod tests {
 
     use super::{
         compatibility_warnings, load_effective_from_typed, load_from, load_from_typed,
-        migrate_policy_text, Config, ConfigError, PolicyPreset, PolicyVersionSource,
-        ValidationCategory, POLICY_VERSION_CURRENT, POLICY_VERSION_LEGACY,
+        migrate_policy_text, Config, ConfigError, PolicyMigrationError, PolicyPreset,
+        PolicyVersionSource, ValidationCategory, POLICY_VERSION_CURRENT, POLICY_VERSION_LEGACY,
     };
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -904,6 +906,17 @@ mode = "warn"
 "#;
         let err = migrate_policy_text(input, 1, 2).expect_err("must reject mismatch");
         assert!(format!("{err}").contains("version mismatch"));
+    }
+
+    #[test]
+    fn migration_rejects_out_of_range_policy_version() {
+        let input = r#"
+policy_version = 4294967297
+[output]
+mode = "warn"
+"#;
+        let err = migrate_policy_text(input, 1, 2).expect_err("must reject invalid version");
+        assert!(matches!(err, PolicyMigrationError::InvalidVersionField));
     }
 
     #[test]

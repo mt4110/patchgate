@@ -141,7 +141,7 @@ struct ScanArgs {
     #[arg(long)]
     github_apply_labels: bool,
 
-    /// Suppress comment when result is unchanged/cache-hit style run
+    /// Suppress comment when result is unchanged/cache-hit or has no findings
     #[arg(long)]
     github_suppress_comment_no_change: bool,
 
