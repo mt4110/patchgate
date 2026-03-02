@@ -330,10 +330,12 @@ fn evaluate_test_gap(
         });
     }
 
-    if !uncovered_files.is_empty()
-        && uncovered_churn >= policy.test_gap.large_change_lines
-        && test_files.len() <= 1
-    {
+    let uncovered_test_files = uncovered_packages
+        .iter()
+        .map(|pkg| tests_by_package.get(pkg).copied().unwrap_or_default())
+        .sum::<usize>();
+
+    if !uncovered_files.is_empty() && uncovered_churn >= policy.test_gap.large_change_lines {
         penalty = penalty.saturating_add(policy.test_gap.large_change_penalty);
         findings.push(Finding {
             id: "TG-002".to_string(),
@@ -345,9 +347,9 @@ fn evaluate_test_gap(
             check: CheckId::TestGap,
             title: "Large code change with limited test updates".to_string(),
             message: format!(
-                "Changed {} lines across production files with only {} test file(s) updated.",
+                "Changed {} lines across uncovered production files with only {} matching test file(s) updated.",
                 uncovered_churn,
-                test_files.len()
+                uncovered_test_files
             ),
             severity: Severity::Medium,
             penalty: policy.test_gap.large_change_penalty,
@@ -1047,16 +1049,7 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
         }
 
         if let Some(path) = parse_patch_file_header_path(line, "--- a/") {
-            current_path = Some(path.clone());
-            files.entry(path.clone()).or_insert_with(|| ChangedFile {
-                path,
-                status: ChangeStatus::Unknown,
-                old_path: None,
-                added: 0,
-                deleted: 0,
-                added_lines: Vec::new(),
-                removed_lines: Vec::new(),
-            });
+            current_path = Some(path);
             continue;
         }
 
@@ -1151,7 +1144,8 @@ fn is_test_related_file(policy: &Config, file: &ChangedFile, test_set: &GlobSet)
     if test_set.is_match(&file.path) {
         return true;
     }
-    let path = file.path.to_ascii_lowercase();
+    let raw_path = file.path.as_str();
+    let path = raw_path.to_ascii_lowercase();
 
     if policy.language_rules.rust
         && path.ends_with(".rs")
@@ -1189,10 +1183,12 @@ fn is_test_related_file(policy: &Config, file: &ChangedFile, test_set: &GlobSet)
 
     if policy.language_rules.python {
         let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-        if path.starts_with("tests/")
-            || path.contains("/tests/")
-            || file_name.starts_with("test_")
-            || file_name.ends_with("_test.py")
+        let is_python_file = path.ends_with(".py");
+        if (is_python_file
+            && (path.starts_with("tests/")
+                || path.contains("/tests/")
+                || file_name.starts_with("test_")
+                || file_name.ends_with("_test.py")))
             || file_name == "conftest.py"
         {
             return true;
@@ -1206,10 +1202,7 @@ fn is_test_related_file(policy: &Config, file: &ChangedFile, test_set: &GlobSet)
     if policy.language_rules.java_kotlin
         && (path.contains("/src/test/java/")
             || path.contains("/src/test/kotlin/")
-            || path.ends_with("test.java")
-            || path.ends_with("test.kt")
-            || path.ends_with("it.java")
-            || path.ends_with("it.kt"))
+            || is_java_or_kotlin_test_filename(raw_path))
     {
         return true;
     }
@@ -1221,6 +1214,38 @@ fn has_any_token(lines: &[String], tokens: &[&str]) -> bool {
     lines
         .iter()
         .any(|line| tokens.iter().any(|needle| line.contains(needle)))
+}
+
+fn is_java_or_kotlin_test_filename(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let canonical = file_name.to_ascii_lowercase();
+
+    let suffix_patterns = [
+        "_test.java",
+        "_test.kt",
+        ".test.java",
+        ".test.kt",
+        "-test.java",
+        "-test.kt",
+        "_it.java",
+        "_it.kt",
+        ".it.java",
+        ".it.kt",
+        "-it.java",
+        "-it.kt",
+    ];
+    if suffix_patterns
+        .iter()
+        .any(|suffix| canonical.ends_with(suffix))
+    {
+        return true;
+    }
+
+    // Camel-case conventions like FooTest.java / FooIT.kt
+    let exact_suffixes = ["Test.java", "Test.kt", "IT.java", "IT.kt"];
+    exact_suffixes
+        .iter()
+        .any(|suffix| file_name.ends_with(suffix))
 }
 
 fn parent_dir(path: &str) -> String {
@@ -1283,6 +1308,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_status_supports_rename_and_copy() {
+        let raw = ":100644 100644 abcdef1 abcdef2 R100\told.txt\tnew.txt\n:100644 100644 abcdef1 abcdef2 C100\ta.txt\tb.txt\n:100644 100644 abcdef1 abcdef2 M\tm.txt\n";
+        let parsed = parse_raw_status(raw);
+        let renamed = parsed.get("new.txt").expect("missing renamed path");
+        assert_eq!(renamed.status, ChangeStatus::Renamed);
+        assert_eq!(renamed.old_path.as_deref(), Some("old.txt"));
+        let copied = parsed.get("b.txt").expect("missing copied path");
+        assert_eq!(copied.status, ChangeStatus::Copied);
+        assert_eq!(copied.old_path.as_deref(), Some("a.txt"));
+        let modified = parsed.get("m.txt").expect("missing modified path");
+        assert_eq!(modified.status, ChangeStatus::Modified);
+    }
+
+    #[test]
     fn apply_patch_stats_counts_lines() {
         let mut files = parse_name_status("M\tsrc/lib.rs\n");
         let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n";
@@ -1312,6 +1351,21 @@ mod tests {
             file.removed_lines.first().map(String::as_str),
             Some("--old")
         );
+    }
+
+    #[test]
+    fn apply_patch_stats_does_not_create_old_rename_path_entry() {
+        let mut files = parse_raw_status(":100644 100644 abcdef1 abcdef2 R100\told.txt\tnew.txt\n");
+        let patch = "diff --git a/old.txt b/new.txt\nsimilarity index 80%\nrename from old.txt\nrename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        apply_patch_stats(&mut files, patch);
+        assert!(files.contains_key("new.txt"));
+        assert!(
+            !files.contains_key("old.txt"),
+            "old rename path must not be inserted as a changed file entry"
+        );
+        let new_file = files.get("new.txt").expect("new path");
+        assert_eq!(new_file.added, 1);
+        assert_eq!(new_file.deleted, 1);
     }
 
     #[test]
@@ -1468,6 +1522,58 @@ mod tests {
     }
 
     #[test]
+    fn test_gap_large_change_not_suppressed_by_unrelated_test_updates() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let mut added_lines = Vec::new();
+        let mut removed_lines = Vec::new();
+        for i in 0..260 {
+            added_lines.push(format!("add-{i}"));
+            removed_lines.push(format!("del-{i}"));
+        }
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "packages/a/src/lib.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 260,
+                    deleted: 260,
+                    added_lines,
+                    removed_lines,
+                },
+                ChangedFile {
+                    path: "packages/b/tests/b_test.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 3,
+                    deleted: 0,
+                    added_lines: vec!["assert".to_string()],
+                    removed_lines: vec![],
+                },
+                ChangedFile {
+                    path: "packages/c/tests/c_test.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 3,
+                    deleted: 0,
+                    added_lines: vec!["assert".to_string()],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
+        assert!(
+            eval.findings.iter().any(|f| f.id == "TG-002"),
+            "uncovered large change should still trigger TG-002 even with unrelated tests"
+        );
+    }
+
+    #[test]
     fn dangerous_change_classifies_non_critical_path() {
         let policy = Config::default();
         let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
@@ -1529,6 +1635,37 @@ mod tests {
             finding.tags.iter().any(|tag| tag == "critical"),
             "expected critical tag"
         );
+    }
+
+    #[test]
+    fn java_kotlin_heuristic_avoids_contest_false_positive() {
+        let mut policy = Config::default();
+        policy.language_rules.java_kotlin = true;
+        let test_set = compile_globs(&policy.test_gap.test_globs).expect("test globs");
+        let contest = ChangedFile {
+            path: "src/main/java/com/example/Contest.java".to_string(),
+            status: ChangeStatus::Modified,
+            old_path: None,
+            added: 3,
+            deleted: 1,
+            added_lines: vec!["line".to_string()],
+            removed_lines: vec!["line".to_string()],
+        };
+        assert!(
+            !is_test_related_file(&policy, &contest, &test_set),
+            "Contest.java must not be treated as a test file"
+        );
+
+        let test_file = ChangedFile {
+            path: "src/test/java/com/example/OrderServiceTest.java".to_string(),
+            status: ChangeStatus::Modified,
+            old_path: None,
+            added: 2,
+            deleted: 0,
+            added_lines: vec!["line".to_string()],
+            removed_lines: vec![],
+        };
+        assert!(is_test_related_file(&policy, &test_file, &test_set));
     }
 
     #[test]

@@ -719,29 +719,6 @@ fn execute_scan(
     let mut diff_for_eval = Some(diff);
 
     let cache_enabled = cfg.cache.enabled && !no_cache;
-    let policy_hash = if cache_enabled {
-        Some(config_hash(&cfg).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to hash effective config"),
-            )
-        })?)
-    } else {
-        None
-    };
-
-    let mut cache_conn = if cache_enabled {
-        match open_cache_connection(repo_root, &cfg.cache.db_path) {
-            Ok(conn) => Some(conn),
-            Err(err) => {
-                handle_cache_fault(repo_root, &cfg.cache.db_path, "open", &err);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let mut evaluate_report = || -> ScanResult<Report> {
         let eval_diff = diff_for_eval.take().ok_or_else(|| {
             ScanError::new(
@@ -790,15 +767,25 @@ fn execute_scan(
             }
         }
     } else if cache_enabled {
-        let policy_hash = policy_hash
-            .as_ref()
-            .expect("policy hash must exist when cache is enabled");
+        let policy_hash = config_hash(&cfg).map_err(|err| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                err.context("failed to hash effective config"),
+            )
+        })?;
+        let mut cache_conn = match open_cache_connection(repo_root, &cfg.cache.db_path) {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                handle_cache_fault(repo_root, &cfg.cache.db_path, "open", &err);
+                None
+            }
+        };
         if let Some(conn) = cache_conn.as_ref() {
             let cache_read_start = Instant::now();
             let cached = load_cache_from_conn(
                 conn,
                 &diff_fingerprint,
-                policy_hash,
+                &policy_hash,
                 &opts.mode,
                 opts.scope.as_str(),
             );
@@ -807,6 +794,7 @@ fn execute_scan(
                 Ok(Some(mut cached)) => {
                     cached.skipped_by_cache = true;
                     cached.duration_ms = run_start.elapsed().as_millis();
+                    profile.evaluate_ms = 0;
                     cached
                 }
                 Ok(None) => {
@@ -814,7 +802,7 @@ fn execute_scan(
                     profile.evaluate_ms = evaluated.duration_ms;
                     if let Some(conn) = cache_conn.as_ref() {
                         let cache_write_start = Instant::now();
-                        if let Err(err) = store_cache_to_conn(conn, &evaluated, policy_hash) {
+                        if let Err(err) = store_cache_to_conn(conn, &evaluated, &policy_hash) {
                             handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
                         }
                         profile.cache_write_ms = cache_write_start.elapsed().as_millis();
@@ -828,7 +816,7 @@ fn execute_scan(
                     profile.evaluate_ms = evaluated.duration_ms;
                     if let Some(conn) = cache_conn.as_ref() {
                         let cache_write_start = Instant::now();
-                        if let Err(err) = store_cache_to_conn(conn, &evaluated, policy_hash) {
+                        if let Err(err) = store_cache_to_conn(conn, &evaluated, &policy_hash) {
                             handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
                         }
                         profile.cache_write_ms = cache_write_start.elapsed().as_millis();
@@ -847,7 +835,11 @@ fn execute_scan(
         evaluated
     };
     profile.skipped_by_cache = report.skipped_by_cache;
-    profile.check_durations_ms = report.check_durations_ms.clone();
+    if report.skipped_by_cache {
+        profile.check_durations_ms.clear();
+    } else {
+        profile.check_durations_ms = report.check_durations_ms.clone();
+    }
 
     let markdown = render_github_comment(&report);
 
