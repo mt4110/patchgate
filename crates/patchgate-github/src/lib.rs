@@ -119,6 +119,7 @@ struct PublishOpError {
     message: String,
     retryable: bool,
     rate_limited: bool,
+    status_code: Option<u16>,
 }
 
 impl PublishOpError {
@@ -127,7 +128,13 @@ impl PublishOpError {
             message: message.into(),
             retryable,
             rate_limited,
+            status_code: None,
         }
+    }
+
+    fn with_status_code(mut self, status_code: u16) -> Self {
+        self.status_code = Some(status_code);
+        self
     }
 }
 
@@ -407,7 +414,7 @@ fn upsert_check_run(
     )?;
 
     if let Some(run) = existing.check_runs.iter().max_by_key(|r| r.id) {
-        let updated: CheckRunItem = send_json(
+        let updated: std::result::Result<CheckRunItem, PublishOpError> = send_json(
             client
                 .patch(format!(
                     "{}/repos/{}/check-runs/{}",
@@ -415,8 +422,15 @@ fn upsert_check_run(
                 ))
                 .json(payload),
             "update check run",
-        )?;
-        return Ok(updated.html_url);
+        );
+        match updated {
+            Ok(updated) => return Ok(updated.html_url),
+            Err(err) => {
+                if !is_check_run_update_fallback_candidate(&err) {
+                    return Err(err);
+                }
+            }
+        }
     }
 
     let created: CheckRunItem = send_json(
@@ -546,6 +560,7 @@ fn http_status_error(
         retryable,
         rate_limited,
     )
+    .with_status_code(status.as_u16())
 }
 
 fn is_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
@@ -652,6 +667,10 @@ fn normalize_comment(input: &str) -> &str {
     input.trim()
 }
 
+fn is_check_run_update_fallback_candidate(err: &PublishOpError) -> bool {
+    matches!(err.status_code, Some(403 | 404))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -659,7 +678,8 @@ mod tests {
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, ReviewPriority};
 
     use super::{
-        backoff_delay_ms, check_run_conclusion, ensure_comment_marker, is_same_comment_content,
+        backoff_delay_ms, check_run_conclusion, ensure_comment_marker,
+        is_check_run_update_fallback_candidate, is_same_comment_content,
         merge_priority_label_names, priority_label_name, with_retry, LabelItem, PublishOpError,
         RetryPolicy, MARKER,
     };
@@ -840,5 +860,17 @@ mod tests {
         assert!(merged.iter().any(|name| name == "patchgate:priority/p0"));
         assert!(!merged.iter().any(|name| name == "patchgate:priority/p3"));
         assert!(!merged.iter().any(|name| name == "patchgate:priority/p1"));
+    }
+
+    #[test]
+    fn check_run_update_fallback_is_only_for_permission_or_missing_run() {
+        let fallback = PublishOpError::new("forbidden", false, false).with_status_code(403);
+        assert!(is_check_run_update_fallback_candidate(&fallback));
+
+        let missing = PublishOpError::new("missing", false, false).with_status_code(404);
+        assert!(is_check_run_update_fallback_candidate(&missing));
+
+        let conflict = PublishOpError::new("conflict", false, false).with_status_code(409);
+        assert!(!is_check_run_update_fallback_candidate(&conflict));
     }
 }
