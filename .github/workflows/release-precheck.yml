@@ -54,4 +54,17 @@ jobs:
           nix develop --command cargo run -p xtask -- bench compare \
             --case ci-worktree \
             --output config/benchmarks/ci-worktree-baseline.jsonl \
-            --require-baseline
+            --require-baseline \
+            --report-output artifacts/bench-compare.json
+
+      - name: Capture scan profile
+        run: |
+          nix develop --command cargo run -p xtask -- bench profile \
+            --repo . \
+            --profile-output artifacts/scan-profile.json
+
+      - name: Upload performance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-precheck-performance
+          path: artifacts/

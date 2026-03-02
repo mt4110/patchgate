@@ -16,6 +16,10 @@ pub struct Config {
     #[serde(default)]
     pub exclude: ExcludeConfig,
     #[serde(default)]
+    pub generated_code: GeneratedCodeConfig,
+    #[serde(default)]
+    pub language_rules: LanguageRulesConfig,
+    #[serde(default)]
     pub weights: WeightsConfig,
     #[serde(default)]
     pub test_gap: TestGapConfig,
@@ -33,6 +37,8 @@ impl Default for Config {
             scope: ScopeConfig::default(),
             cache: CacheConfig::default(),
             exclude: ExcludeConfig::default(),
+            generated_code: GeneratedCodeConfig::default(),
+            language_rules: LanguageRulesConfig::default(),
             weights: WeightsConfig::default(),
             test_gap: TestGapConfig::default(),
             dangerous_change: DangerousChangeConfig::default(),
@@ -81,18 +87,32 @@ fn default_fail_threshold() -> u8 {
 pub struct ScopeConfig {
     #[serde(default = "default_scope_mode")]
     pub mode: String, // "staged" | "worktree" | "repo"
+    #[serde(default = "default_max_changed_files")]
+    pub max_changed_files: u32,
+    #[serde(default = "default_on_exceed")]
+    pub on_exceed: String, // "fail_open" | "fail_closed"
 }
 
 impl Default for ScopeConfig {
     fn default() -> Self {
         Self {
             mode: default_scope_mode(),
+            max_changed_files: default_max_changed_files(),
+            on_exceed: default_on_exceed(),
         }
     }
 }
 
 fn default_scope_mode() -> String {
     "staged".to_string()
+}
+
+fn default_max_changed_files() -> u32 {
+    10_000
+}
+
+fn default_on_exceed() -> String {
+    "fail_open".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,7 +155,78 @@ impl Default for ExcludeConfig {
 }
 
 fn default_exclude_globs() -> Vec<String> {
-    vec!["vendor/**".into(), "**/generated/**".into()]
+    vec!["vendor/**".into()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedCodeConfig {
+    #[serde(default = "default_generated_mode")]
+    pub mode: String, // "exclude" | "decay"
+    #[serde(default = "default_generated_globs")]
+    pub globs: Vec<String>,
+    #[serde(default = "default_generated_decay_percent")]
+    pub penalty_decay_percent: u8, // 0..=100
+}
+
+impl Default for GeneratedCodeConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_generated_mode(),
+            globs: default_generated_globs(),
+            penalty_decay_percent: default_generated_decay_percent(),
+        }
+    }
+}
+
+fn default_generated_mode() -> String {
+    "exclude".to_string()
+}
+
+fn default_generated_globs() -> Vec<String> {
+    vec![
+        "**/generated/**".into(),
+        "**/*.pb.go".into(),
+        "**/*_generated.*".into(),
+        "**/gen/**".into(),
+    ]
+}
+
+fn default_generated_decay_percent() -> u8 {
+    70
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguageRulesConfig {
+    #[serde(default = "default_true")]
+    pub rust: bool,
+    #[serde(default = "default_true")]
+    pub typescript: bool,
+    #[serde(default = "default_true")]
+    pub python: bool,
+    #[serde(default = "default_true")]
+    pub go: bool,
+    #[serde(default = "default_false")]
+    pub java_kotlin: bool,
+}
+
+impl Default for LanguageRulesConfig {
+    fn default() -> Self {
+        Self {
+            rust: default_true(),
+            typescript: default_true(),
+            python: default_true(),
+            go: default_true(),
+            java_kotlin: default_false(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +400,14 @@ pub struct DependencyUpdateConfig {
     pub large_lockfile_churn: u32,
     #[serde(default = "default_large_lockfile_penalty")]
     pub large_lockfile_penalty: u8,
+    #[serde(default = "default_lockfile_added_or_removed_penalty")]
+    pub lockfile_added_or_removed_penalty: u8,
+    #[serde(default = "default_lockfile_mass_update_lines")]
+    pub lockfile_mass_update_lines: u32,
+    #[serde(default = "default_lockfile_mass_update_penalty")]
+    pub lockfile_mass_update_penalty: u8,
+    #[serde(default)]
+    pub ecosystem_penalties: DependencyEcosystemPenaltyMatrix,
 }
 
 impl Default for DependencyUpdateConfig {
@@ -321,8 +420,48 @@ impl Default for DependencyUpdateConfig {
             lockfile_penalty: default_lockfile_penalty(),
             large_lockfile_churn: default_large_lockfile_churn(),
             large_lockfile_penalty: default_large_lockfile_penalty(),
+            lockfile_added_or_removed_penalty: default_lockfile_added_or_removed_penalty(),
+            lockfile_mass_update_lines: default_lockfile_mass_update_lines(),
+            lockfile_mass_update_penalty: default_lockfile_mass_update_penalty(),
+            ecosystem_penalties: DependencyEcosystemPenaltyMatrix::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyEcosystemPenaltyMatrix {
+    #[serde(default = "default_cargo_penalty")]
+    pub cargo: DependencyEcosystemPenalty,
+    #[serde(default = "default_npm_penalty")]
+    pub npm: DependencyEcosystemPenalty,
+    #[serde(default = "default_python_penalty")]
+    pub python: DependencyEcosystemPenalty,
+    #[serde(default = "default_go_penalty")]
+    pub go: DependencyEcosystemPenalty,
+    #[serde(default = "default_jvm_penalty")]
+    pub jvm: DependencyEcosystemPenalty,
+}
+
+impl Default for DependencyEcosystemPenaltyMatrix {
+    fn default() -> Self {
+        Self {
+            cargo: default_cargo_penalty(),
+            npm: default_npm_penalty(),
+            python: default_python_penalty(),
+            go: default_go_penalty(),
+            jvm: default_jvm_penalty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyEcosystemPenalty {
+    #[serde(default)]
+    pub manifest_bonus_penalty: u8,
+    #[serde(default)]
+    pub lockfile_bonus_penalty: u8,
+    #[serde(default)]
+    pub large_lockfile_bonus_penalty: u8,
 }
 
 fn default_manifest_globs() -> Vec<String> {
@@ -366,4 +505,56 @@ fn default_large_lockfile_churn() -> u32 {
 
 fn default_large_lockfile_penalty() -> u8 {
     10
+}
+
+fn default_lockfile_added_or_removed_penalty() -> u8 {
+    6
+}
+
+fn default_lockfile_mass_update_lines() -> u32 {
+    800
+}
+
+fn default_lockfile_mass_update_penalty() -> u8 {
+    6
+}
+
+fn default_cargo_penalty() -> DependencyEcosystemPenalty {
+    DependencyEcosystemPenalty {
+        manifest_bonus_penalty: 3,
+        lockfile_bonus_penalty: 2,
+        large_lockfile_bonus_penalty: 2,
+    }
+}
+
+fn default_npm_penalty() -> DependencyEcosystemPenalty {
+    DependencyEcosystemPenalty {
+        manifest_bonus_penalty: 3,
+        lockfile_bonus_penalty: 2,
+        large_lockfile_bonus_penalty: 3,
+    }
+}
+
+fn default_python_penalty() -> DependencyEcosystemPenalty {
+    DependencyEcosystemPenalty {
+        manifest_bonus_penalty: 2,
+        lockfile_bonus_penalty: 1,
+        large_lockfile_bonus_penalty: 2,
+    }
+}
+
+fn default_go_penalty() -> DependencyEcosystemPenalty {
+    DependencyEcosystemPenalty {
+        manifest_bonus_penalty: 2,
+        lockfile_bonus_penalty: 2,
+        large_lockfile_bonus_penalty: 1,
+    }
+}
+
+fn default_jvm_penalty() -> DependencyEcosystemPenalty {
+    DependencyEcosystemPenalty {
+        manifest_bonus_penalty: 2,
+        lockfile_bonus_penalty: 0,
+        large_lockfile_bonus_penalty: 0,
+    }
 }

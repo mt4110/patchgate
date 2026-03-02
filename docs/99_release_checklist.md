@@ -12,6 +12,8 @@ Purpose: Ensure reproducible patchgate releases.
 - `github publish dry-run` smoke test
 - `._*` 混入チェック
 - ベンチ基準値比較 (`cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline`)
+- 比較レポート生成 (`--report-output artifacts/bench-compare.json`)
+- scan profile 取得 (`cargo run -p xtask -- bench profile --profile-output artifacts/scan-profile.json`)
 
 以下は引き続き手動:
 
@@ -30,6 +32,8 @@ Purpose: Ensure reproducible patchgate releases.
 - [ ] **Policy Lint**: `nix develop --command cargo run -p patchgate-cli -- policy lint --path config/policy.toml.example --require-current-version` (CI自動化済み)
 - [ ] **Publish Dry-run**: `nix develop --command cargo run -p patchgate-cli -- scan --scope staged --mode warn --format json --github-publish --github-dry-run --github-repo example/repo --github-pr 1 --github-sha deadbeef --github-dry-run-output artifacts/github-payload.json` (CI自動化済み)
 - [ ] **Benchmark**: `nix develop --command cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline` (CI自動化済み)
+- [ ] **P95/SLO Evidence**: profile + benchmark report が release artifact として保存されていることを確認
+- [ ] **Scale Scenario**: `scale-benchmark.yml` の synthetic 10k 結果を確認
 - [ ] **Docs**: Sync docs with current CLI/config behavior.
 - [ ] **Version**: Bump version in:
   - `flake.nix`

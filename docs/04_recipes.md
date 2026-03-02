@@ -52,6 +52,36 @@ patchgate scan \
   --github-apply-labels
 ```
 
+### scan の処理内訳をプロファイル出力する
+
+```bash
+patchgate scan \
+  --scope worktree \
+  --mode warn \
+  --format json \
+  --no-cache \
+  --profile-output artifacts/scan-profile.json
+```
+
+### 10kファイル想定の synthetic ベンチを比較する
+
+```bash
+cargo run -p xtask -- bench compare \
+  --case ci-scale-10k \
+  --output config/benchmarks/ci-scale-10k-baseline.jsonl \
+  --synthetic-files 10000 \
+  --synthetic-lines 1 \
+  --max-regression-pct 40 \
+  --report-output artifacts/bench-scale-10k.json
+```
+
+### Java/Kotlin 検知を段階有効化する
+
+```toml
+[language_rules]
+java_kotlin = true
+```
+
 ## Policy distribution template
 
 ### 配布フロー

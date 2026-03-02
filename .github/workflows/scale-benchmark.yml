@@ -1,0 +1,35 @@
+name: Scale Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  synthetic-10k:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compare synthetic 10k benchmark
+        run: |
+          cargo run -p xtask -- bench compare \
+            --case ci-scale-10k \
+            --output config/benchmarks/ci-scale-10k-baseline.jsonl \
+            --max-regression-pct 40 \
+            --append-on-pass \
+            --synthetic-files 10000 \
+            --synthetic-lines 1 \
+            --report-output artifacts/bench-scale-10k.json
+
+      - name: Capture synthetic 10k profile
+        run: |
+          cargo run -p xtask -- bench profile \
+            --synthetic-files 10000 \
+            --synthetic-lines 1 \
+            --profile-output artifacts/scan-profile-10k.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scale-benchmark-artifacts
+          path: artifacts/

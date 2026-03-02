@@ -38,6 +38,14 @@ jobs:
             --github-sha deadbeef \
             --github-dry-run-output artifacts/github-payload.json
 
+      - name: Benchmark compare with regression report
+        run: |
+          nix develop --command cargo run -p xtask -- bench compare \
+            --case ci-worktree \
+            --output config/benchmarks/ci-worktree-baseline.jsonl \
+            --require-baseline \
+            --report-output artifacts/bench-compare.json
+
   cross-platform:
     strategy:
       fail-fast: false
@@ -50,3 +58,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: test
         run: cargo test --workspace
+      - name: scan profile (windows diagnostics)
+        if: matrix.os == 'windows-latest'
+        run: cargo run -p patchgate-cli -- scan --scope staged --mode warn --format json --no-cache --profile-output artifacts/scan-profile-windows.json
+      - name: upload windows profile artifact
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-scan-profile
+          path: artifacts/scan-profile-windows.json

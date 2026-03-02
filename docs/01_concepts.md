@@ -10,6 +10,8 @@
   - `warn`: 結果を返すのみ（exit code `0`）
   - `enforce`: `score < threshold` で失敗（exit code `1`）
 - Review priority: スコア帯を `P0..P3` にマップしてレビュー優先度を固定
+- Scale guardrail: `scope.max_changed_files` 超過時は `fail_open|fail_closed` で挙動を固定
+- Profiling: `scan --profile-output` で diff/check/cache/publish の時間内訳を機械可読出力
 
 ## Policy versioning (Phase21-30)
 
@@ -64,3 +66,21 @@
 - ローカル/CIで同じ判定ロジックを実行
 - SQLite cacheで同一差分の再評価を回避
 - 必要時のみ GitHub publish（PRコメント/Check Run）を実行
+
+## Language-aware test gap (Phase51-60)
+
+- Rust/TypeScript/Python/Go は既定で有効、Java/Kotlin は `language_rules.java_kotlin=true` で opt-in
+- `test_gap` は `test_globs` に加え、言語別ヒューリスティクス（例: Rust `mod tests`, TS `vitest/jest`, Python `pytest/unittest` 命名）を使う
+- モノレポでは package 境界を推定し、変更 package と無関係な test 更新で penalty を打ち消さない
+
+## Dependency severity expansion (Phase56-57)
+
+- 依存差分は base penalty に加えて ecosystem 別 bonus (`cargo/npm/python/go/jvm`) を加算
+- lockfile 追加/削除 (`DU-004`) と mass update (`DU-005`) を別 finding として扱う
+- severity は churn 量だけでなく変更タイプを反映する
+
+## Performance SLO (Phase49)
+
+- 主要ケースの `scan` 実行時間 P95 を release criterion として扱う
+- 基本ケース: `ci-worktree` baseline 比較 (`xtask bench compare`)
+- 大規模ケース: `ci-scale-10k` synthetic diff（別 workflow で再現）

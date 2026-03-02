@@ -66,6 +66,31 @@ patchgate policy lint --path policy.toml --require-current-version
 - GitHub App installation token を再発行
 - `--github-dry-run` で auth mode と payload を検証
 
+### changed file 上限で scan が失敗/スキップされる
+
+症状:
+
+- `changed file count ... exceeded configured max_changed_files ...`
+
+対処:
+
+- fail-closed 運用なら `scope.max_changed_files` を適切値に引き上げる
+- fail-open 運用にする場合は `scope.on_exceed = "fail_open"` を指定
+- 一時的に CLI override する場合は `--max-changed-files` / `--on-exceed` を使う
+
+### Windows で scan が遅い
+
+症状:
+
+- Linux/macOS と比較して `duration_ms` が大きく乖離する
+- CI の Windows ジョブのみ benchmark 回帰が出る
+
+対処:
+
+- `patchgate scan --profile-output artifacts/scan-profile.json` で内訳を確認
+- Defender/リアルタイムスキャン対象からワークスペース・`target/` を除外（組織ポリシー範囲で）
+- Git/NTFS I/O 負荷を下げるため、不要な worktree 差分を減らして計測を再実行
+
 ## Debugging
 
 - `patchgate doctor` で config path と `policy_version` を確認

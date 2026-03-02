@@ -347,8 +347,25 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         cfg.scope.mode.as_str(),
         &["staged", "worktree", "repo"],
     )?;
+    validate_enum(
+        "scope.on_exceed",
+        cfg.scope.on_exceed.as_str(),
+        &["fail_open", "fail_closed"],
+    )?;
+    validate_enum(
+        "generated_code.mode",
+        cfg.generated_code.mode.as_str(),
+        &["exclude", "decay"],
+    )?;
 
     validate_range_u8("output.fail_threshold", cfg.output.fail_threshold, 0, 100)?;
+    validate_positive_u32("scope.max_changed_files", cfg.scope.max_changed_files)?;
+    validate_range_u8(
+        "generated_code.penalty_decay_percent",
+        cfg.generated_code.penalty_decay_percent,
+        0,
+        100,
+    )?;
 
     validate_range_u8(
         "weights.test_gap_max_penalty",
@@ -430,12 +447,29 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         0,
         100,
     )?;
+    validate_range_u8(
+        "dependency_update.lockfile_added_or_removed_penalty",
+        cfg.dependency_update.lockfile_added_or_removed_penalty,
+        0,
+        100,
+    )?;
+    validate_range_u8(
+        "dependency_update.lockfile_mass_update_penalty",
+        cfg.dependency_update.lockfile_mass_update_penalty,
+        0,
+        100,
+    )?;
     validate_positive_u32(
         "dependency_update.large_lockfile_churn",
         cfg.dependency_update.large_lockfile_churn,
     )?;
+    validate_positive_u32(
+        "dependency_update.lockfile_mass_update_lines",
+        cfg.dependency_update.lockfile_mass_update_lines,
+    )?;
 
     validate_globs("exclude.globs", &cfg.exclude.globs)?;
+    validate_globs("generated_code.globs", &cfg.generated_code.globs)?;
     validate_globs("test_gap.test_globs", &cfg.test_gap.test_globs)?;
     validate_globs(
         "test_gap.production_ignore_globs",
@@ -516,6 +550,20 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         "weights.dependency_update_max_penalty",
         cfg.weights.dependency_update_max_penalty,
     )?;
+    validate_dependency_penalty(
+        "dependency_update.lockfile_added_or_removed_penalty",
+        cfg.dependency_update.lockfile_added_or_removed_penalty,
+        "weights.dependency_update_max_penalty",
+        cfg.weights.dependency_update_max_penalty,
+    )?;
+    validate_dependency_penalty(
+        "dependency_update.lockfile_mass_update_penalty",
+        cfg.dependency_update.lockfile_mass_update_penalty,
+        "weights.dependency_update_max_penalty",
+        cfg.weights.dependency_update_max_penalty,
+    )?;
+
+    validate_ecosystem_bonus_penalties(cfg)?;
 
     let dangerous_patterns: BTreeSet<&str> = cfg
         .dangerous_change
@@ -530,6 +578,95 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
                 "dangerous_change.critical_patterns",
                 format!(
                     "critical pattern `{critical}` must also be included in dangerous_change.patterns"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_ecosystem_bonus_penalties(cfg: &Config) -> Result<()> {
+    let max = cfg.weights.dependency_update_max_penalty;
+    let ecosystems = [
+        ("cargo", cfg.dependency_update.ecosystem_penalties.cargo),
+        ("npm", cfg.dependency_update.ecosystem_penalties.npm),
+        ("python", cfg.dependency_update.ecosystem_penalties.python),
+        ("go", cfg.dependency_update.ecosystem_penalties.go),
+        ("jvm", cfg.dependency_update.ecosystem_penalties.jvm),
+    ];
+
+    for (name, penalties) in ecosystems {
+        let (manifest_field, lock_field, large_field) = match name {
+            "cargo" => (
+                "dependency_update.ecosystem_penalties.cargo.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.cargo.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.cargo.large_lockfile_bonus_penalty",
+            ),
+            "npm" => (
+                "dependency_update.ecosystem_penalties.npm.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.npm.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.npm.large_lockfile_bonus_penalty",
+            ),
+            "python" => (
+                "dependency_update.ecosystem_penalties.python.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.python.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.python.large_lockfile_bonus_penalty",
+            ),
+            "go" => (
+                "dependency_update.ecosystem_penalties.go.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.go.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.go.large_lockfile_bonus_penalty",
+            ),
+            "jvm" => (
+                "dependency_update.ecosystem_penalties.jvm.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.jvm.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.jvm.large_lockfile_bonus_penalty",
+            ),
+            _ => unreachable!("unsupported ecosystem"),
+        };
+        validate_range_u8(manifest_field, penalties.manifest_bonus_penalty, 0, 100)?;
+        validate_range_u8(lock_field, penalties.lockfile_bonus_penalty, 0, 100)?;
+        validate_range_u8(large_field, penalties.large_lockfile_bonus_penalty, 0, 100)?;
+
+        let manifest_total = cfg
+            .dependency_update
+            .manifest_penalty
+            .saturating_add(penalties.manifest_bonus_penalty);
+        if manifest_total > max {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "dependency_update.ecosystem_penalties",
+                format!(
+                    "{name}: manifest total penalty ({manifest_total}) exceeds weights.dependency_update_max_penalty ({max})"
+                ),
+            ));
+        }
+
+        let lock_total = cfg
+            .dependency_update
+            .lockfile_penalty
+            .saturating_add(penalties.lockfile_bonus_penalty);
+        if lock_total > max {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "dependency_update.ecosystem_penalties",
+                format!(
+                    "{name}: lockfile total penalty ({lock_total}) exceeds weights.dependency_update_max_penalty ({max})"
+                ),
+            ));
+        }
+
+        let large_total = cfg
+            .dependency_update
+            .large_lockfile_penalty
+            .saturating_add(penalties.large_lockfile_bonus_penalty);
+        if large_total > max {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "dependency_update.ecosystem_penalties",
+                format!(
+                    "{name}: large lockfile total penalty ({large_total}) exceeds weights.dependency_update_max_penalty ({max})"
                 ),
             ));
         }
@@ -774,6 +911,44 @@ format = "markdown"
                 assert_eq!(category, ValidationCategory::Type);
                 assert_eq!(field, "output.format");
             }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_reports_type_category_for_invalid_scope_on_exceed() {
+        let path = write_temp_policy(
+            r#"
+[scope]
+on_exceed = "warn"
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must fail for invalid scope.on_exceed");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "scope.on_exceed"),
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_reports_type_category_for_invalid_generated_mode() {
+        let path = write_temp_policy(
+            r#"
+[generated_code]
+mode = "skip"
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must fail for invalid generated_code.mode");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "generated_code.mode"),
             other => panic!("unexpected error: {other}"),
         }
 

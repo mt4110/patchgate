@@ -16,11 +16,23 @@
   - `fail_threshold = 0..=100`
 - `[scope]`
   - `mode = "staged" | "worktree" | "repo"`
+  - `max_changed_files = <u32>` (default: `10000`)
+  - `on_exceed = "fail_open" | "fail_closed"`
 - `[cache]`
   - `enabled = true|false`
   - `db_path = ".patchgate/cache.db"`
 - `[exclude]`
-  - `globs = ["vendor/**", ...]`
+  - `globs = ["vendor/**", ...]` (`generated_code` とは別レイヤ)
+- `[generated_code]`
+  - `mode = "exclude" | "decay"`
+  - `globs = ["**/generated/**", ...]`
+  - `penalty_decay_percent = 0..=100`
+- `[language_rules]`
+  - `rust = true|false`
+  - `typescript = true|false`
+  - `python = true|false`
+  - `go = true|false`
+  - `java_kotlin = true|false` (`default: false`, opt-in)
 - `[weights]`
   - `test_gap_max_penalty`
   - `dangerous_change_max_penalty`
@@ -46,6 +58,13 @@
   - `lockfile_penalty`
   - `large_lockfile_churn`
   - `large_lockfile_penalty`
+  - `lockfile_added_or_removed_penalty`
+  - `lockfile_mass_update_lines`
+  - `lockfile_mass_update_penalty`
+  - `[dependency_update.ecosystem_penalties.<cargo|npm|python|go|jvm>]`
+    - `manifest_bonus_penalty`
+    - `lockfile_bonus_penalty`
+    - `large_lockfile_bonus_penalty`
 
 ## Presets
 
