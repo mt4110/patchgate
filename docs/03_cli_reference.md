@@ -12,6 +12,7 @@
 - `repo_root` / `config_path` / Rust version
 - `git`: repository判定、HEAD、dirty file数
 - `config`: 設定読込とバリデーション結果
+- `policy_version`: 実際に適用された version
 - `cache`: DB存在確認と読み取り診断（副作用なし）
 
 ### `patchgate scan`
@@ -19,6 +20,7 @@ PR差分に対して品質ゲートを実行します。
 
 Options:
 
+- `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
 - `--scope <staged|worktree|repo>`
 - `--mode <warn|enforce>`
@@ -32,11 +34,36 @@ Options:
 - `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
 - `--github-check-name <name>`
 
+Policy load order:
+
+- `default < preset < policy file < CLI override`
+
 Cache behavior:
 
 - `cache.enabled=true` かつ `--no-cache` 未指定時に SQLite cache を使用
 - cache DB 破損を検知した場合は、同一ディレクトリ内で `cache.db` を `cache.db.corrupt-<millis>-<pid>` にリネームして退避し、DBを再初期化
 - 復旧に失敗した場合も scan 本体は継続（cacheなしの劣化運転）
+
+### `patchgate policy lint`
+policy を読み込み、型/範囲/依存関係と version 互換性を検査します。
+
+Options:
+
+- `--path <file>` (default: auto-discover `policy.toml`)
+- `--policy-preset <strict|balanced|relaxed>`
+- `--require-current-version` (`policy_version` が current でない場合をエラー化)
+
+### `patchgate policy migrate`
+policy version 移行の雛形コマンドです。
+
+Options:
+
+- `--from <version>`
+- `--to <version>`
+- `--path <file>` (default: auto-discover `policy.toml`)
+- `--write`（未指定時は dry-run で migrated TOML を stdout 出力）
+
+現在の実装では `v1 -> v2` をサポートします。
 
 ## GitHub publish
 
@@ -92,7 +119,10 @@ GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SH
 
 `finding` 要素:
 
-- `id` (required): ルールID（例: `TG-001`）
+- `id` (required): finding識別子
+- `rule_id` (required): ルールID（例: `TG-001`）
+- `category` (required): ルールカテゴリ
+- `docs_url` (required): ルール説明URL
 - `check` (required): `test_gap` | `dangerous_change` | `dependency_update`
 - `title` (required): 短い要約
 - `message` (required): 詳細説明
@@ -109,17 +139,9 @@ GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SH
 - `max_penalty` (required): 上限減点
 - `triggered` (required): 該当有無
 
-### Compatibility policy (Phase1-20)
-
-- Additive:
-  - 新規キー追加は許可（既存キーの必須化はしない）
-  - enum値追加は許可（既存値の意味は不変）
-- Deprecation:
-  - 非推奨化は docs で明示し、最低2つのマイナーリリースは互換維持
-- Breaking:
-  - 既存キーの削除/改名/型変更、既存enum意味変更はメジャー更新時のみ許可
-
 ## Exit code
+
+### `scan`
 
 - `0`: 成功（`warn` での実行、または `enforce` で gate pass）
 - `1`: gate fail（`enforce` で `score < fail_threshold`）
@@ -128,3 +150,14 @@ GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SH
 - `4`: 実行エラー（差分収集・評価・キャッシュ処理）
 - `5`: 出力エラー（JSON/レポート書き込み）
 - `6`: GitHub publish エラー（publish入力解決・API実行）
+
+### `policy lint / migrate`
+
+- `0`: 成功
+- `10`: policy read/parse error
+- `11`: policy validation type error
+- `12`: policy validation range error
+- `13`: policy validation dependency error
+- `14`: current version requirement violation (`policy lint --require-current-version`)
+- `15`: migration failure（未対応パス、version不一致、移行後validation失敗）
+- `16`: I/O failure（migrated policy書き込み失敗など）

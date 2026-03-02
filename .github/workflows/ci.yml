@@ -14,6 +14,17 @@ jobs:
       - name: fmt/lint/test (shared just recipe)
         run: nix develop --command just ci-check
 
+      - name: Lint policy compatibility matrix
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- policy lint \
+            --path config/policy.toml.example \
+            --require-current-version
+          for preset in strict balanced relaxed; do
+            nix develop --command cargo run -p patchgate-cli -- policy lint \
+              --path "config/presets/${preset}.toml" \
+              --require-current-version
+          done
+
   cross-platform:
     strategy:
       fail-fast: false

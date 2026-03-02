@@ -8,6 +8,7 @@ Purpose: Ensure reproducible patchgate releases.
 
 - `fmt/lint/test` (`just ci-check`)
 - `doctor` 実行
+- `policy lint`（`config/policy.toml.example` + `config/presets/*`）
 - `._*` 混入チェック
 - ベンチ基準値比較 (`cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline`)
 
@@ -25,6 +26,7 @@ Purpose: Ensure reproducible patchgate releases.
   - `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`
   - `nix develop --command cargo test --workspace`
 - [ ] **Doctor**: `nix develop --command cargo run -p patchgate-cli -- doctor` (CI自動化済み)
+- [ ] **Policy Lint**: `nix develop --command cargo run -p patchgate-cli -- policy lint --path config/policy.toml.example --require-current-version` (CI自動化済み)
 - [ ] **Benchmark**: `nix develop --command cargo run -p xtask -- bench compare --case ci-worktree --output config/benchmarks/ci-worktree-baseline.jsonl --require-baseline` (CI自動化済み)
 - [ ] **Docs**: Sync docs with current CLI/config behavior.
 - [ ] **Version**: Bump version in:
@@ -35,6 +37,9 @@ Purpose: Ensure reproducible patchgate releases.
 - [ ] **Tag**: Create a signed tag.
   - `git tag -s vX.Y.Z -m "Release vX.Y.Z"`
   - `git verify-tag vX.Y.Z`
+- [ ] **Policy Distribution**: Create immutable policy tag and pin record.
+  - `git tag -s policy/<name>/vYYYY.MM.DD -m "policy release"`
+  - 記録: policy tag / commit SHA / lint結果
 - [ ] **Archive**: Build source archive via git.
   - `git archive --format=tar.gz --prefix=patchgate-vX.Y.Z/ -o patchgate-vX.Y.Z.tar.gz vX.Y.Z`
 - [ ] **Verify Archive**:
@@ -43,3 +48,4 @@ Purpose: Ensure reproducible patchgate releases.
 
 ## Post-Release
 - [ ] **Push**: `git push origin main --tags`
+- [ ] **Rollback readiness**: previous policy tag へ戻せることを確認

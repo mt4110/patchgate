@@ -10,7 +10,10 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use patchgate_config::Config;
+use patchgate_config::{
+    Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
+    POLICY_VERSION_CURRENT,
+};
 use patchgate_core::{Context, Finding, Report, Runner, ScopeMode, Severity};
 
 #[derive(Parser, Debug)]
@@ -39,10 +42,17 @@ enum Command {
 
     /// Print environment and config diagnostics
     Doctor,
+
+    /// Validate and migrate policy files
+    Policy(PolicyArgs),
 }
 
 #[derive(Args, Debug)]
 struct ScanArgs {
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
     /// Output format: text|json
     #[arg(long)]
     format: Option<String>,
@@ -90,6 +100,55 @@ struct ScanArgs {
     /// Check-run name (default: patchgate)
     #[arg(long)]
     github_check_name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    cmd: PolicyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// Lint policy config and report compatibility status
+    Lint(PolicyLintArgs),
+
+    /// Migrate policy config across policy versions
+    Migrate(PolicyMigrateArgs),
+}
+
+#[derive(Args, Debug)]
+struct PolicyLintArgs {
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
+    /// Fail if policy_version is not the current version
+    #[arg(long)]
+    require_current_version: bool,
+}
+
+#[derive(Args, Debug)]
+struct PolicyMigrateArgs {
+    /// Source policy version
+    #[arg(long)]
+    from: u32,
+
+    /// Target policy version
+    #[arg(long)]
+    to: u32,
+
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Overwrite input file. Without this flag, output is dry-run to stdout.
+    #[arg(long)]
+    write: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +215,33 @@ impl ScanError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyExitCode {
+    Ok,
+    ReadOrParse,
+    ValidationType,
+    ValidationRange,
+    ValidationDependency,
+    MigrationRequired,
+    MigrationFailed,
+    IoFailed,
+}
+
+impl PolicyExitCode {
+    fn as_i32(self) -> i32 {
+        match self {
+            PolicyExitCode::Ok => 0,
+            PolicyExitCode::ReadOrParse => 10,
+            PolicyExitCode::ValidationType => 11,
+            PolicyExitCode::ValidationRange => 12,
+            PolicyExitCode::ValidationDependency => 13,
+            PolicyExitCode::MigrationRequired => 14,
+            PolicyExitCode::MigrationFailed => 15,
+            PolicyExitCode::IoFailed => 16,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum OptionSource {
     Cli,
@@ -187,6 +273,10 @@ fn main() -> Result<()> {
             };
             std::process::exit(code);
         }
+        Command::Policy(policy) => {
+            let code = execute_policy(&repo_root, cli.config.as_deref(), policy);
+            std::process::exit(code);
+        }
     }
 }
 
@@ -212,7 +302,7 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
         }
     }
 
-    let effective_cfg = match load_config(config_path.as_deref()) {
+    let loaded_cfg = match load_policy_config(config_path.as_deref(), None) {
         Ok(cfg) => {
             println!("- config: ok");
             cfg
@@ -223,6 +313,12 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
             return Ok(());
         }
     };
+    println!("- policy_version: {}", loaded_cfg.config.policy_version);
+    for warning in &loaded_cfg.compatibility_warnings {
+        println!("- compatibility: warning ({warning})");
+    }
+
+    let effective_cfg = loaded_cfg.config;
 
     if !effective_cfg.cache.enabled {
         println!("- cache: disabled (cache.enabled=false)");
@@ -239,6 +335,143 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn execute_policy(repo_root: &Path, config_override: Option<&Path>, policy: PolicyArgs) -> i32 {
+    match policy.cmd {
+        PolicyCommand::Lint(args) => run_policy_lint(repo_root, config_override, args).as_i32(),
+        PolicyCommand::Migrate(args) => {
+            run_policy_migrate(repo_root, config_override, args).as_i32()
+        }
+    }
+}
+
+fn run_policy_lint(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyLintArgs,
+) -> PolicyExitCode {
+    let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
+    let preset = match parse_policy_preset(args.policy_preset.as_deref()) {
+        Ok(preset) => preset,
+        Err(err) => {
+            eprintln!("patchgate policy lint error: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+
+    let loaded = match load_policy_config(policy_path.as_deref(), preset) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("patchgate policy lint error: {err:#}");
+            return map_config_error_to_policy_exit(&err);
+        }
+    };
+
+    println!("patchgate policy lint");
+    println!(
+        "- config_path: {}",
+        policy_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<default only>".to_string())
+    );
+    println!(
+        "- preset: {}",
+        preset
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!("- policy_version: {}", loaded.config.policy_version);
+    for warning in &loaded.compatibility_warnings {
+        println!("- warning: {warning}");
+    }
+
+    if args.require_current_version && loaded.config.policy_version < POLICY_VERSION_CURRENT {
+        eprintln!(
+            "patchgate policy lint error: policy_version {} is legacy (current: {})",
+            loaded.config.policy_version, POLICY_VERSION_CURRENT
+        );
+        return PolicyExitCode::MigrationRequired;
+    }
+
+    PolicyExitCode::Ok
+}
+
+fn run_policy_migrate(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyMigrateArgs,
+) -> PolicyExitCode {
+    let Some(policy_path) = resolve_policy_path(repo_root, config_override, args.path.as_deref())
+    else {
+        eprintln!(
+            "patchgate policy migrate error: policy file was not found (pass --path or --config)"
+        );
+        return PolicyExitCode::ReadOrParse;
+    };
+
+    let input = match fs::read_to_string(&policy_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "patchgate policy migrate error: failed to read {}: {err}",
+                policy_path.display()
+            );
+            return PolicyExitCode::IoFailed;
+        }
+    };
+
+    let migrated = match patchgate_config::migrate_policy_text(&input, args.from, args.to) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("patchgate policy migrate error: {err}");
+            return map_migration_error_to_policy_exit(&err);
+        }
+    };
+
+    if args.write {
+        if let Err(err) = fs::write(&policy_path, &migrated.migrated_toml) {
+            eprintln!(
+                "patchgate policy migrate error: failed to write {}: {err}",
+                policy_path.display()
+            );
+            return PolicyExitCode::IoFailed;
+        }
+        println!(
+            "policy migration applied: {} -> {} ({})",
+            migrated.from,
+            migrated.to,
+            policy_path.display()
+        );
+    } else {
+        println!("{}", migrated.migrated_toml);
+    }
+
+    PolicyExitCode::Ok
+}
+
+fn map_config_error_to_policy_exit(err: &ConfigError) -> PolicyExitCode {
+    match err {
+        ConfigError::Read { .. } | ConfigError::Parse { .. } => PolicyExitCode::ReadOrParse,
+        ConfigError::Validation { category, .. } => match category {
+            ValidationCategory::Type => PolicyExitCode::ValidationType,
+            ValidationCategory::Range => PolicyExitCode::ValidationRange,
+            ValidationCategory::Dependency => PolicyExitCode::ValidationDependency,
+        },
+    }
+}
+
+fn map_migration_error_to_policy_exit(err: &PolicyMigrationError) -> PolicyExitCode {
+    match err {
+        PolicyMigrationError::Parse { .. } | PolicyMigrationError::InvalidVersionField => {
+            PolicyExitCode::ReadOrParse
+        }
+        PolicyMigrationError::UnsupportedPath { .. }
+        | PolicyMigrationError::VersionMismatch { .. }
+        | PolicyMigrationError::Validation { .. } => PolicyExitCode::MigrationFailed,
+        PolicyMigrationError::Render { .. } => PolicyExitCode::IoFailed,
+    }
 }
 
 fn diagnose_git(repo_root: &Path) -> Result<(String, usize)> {
@@ -304,6 +537,7 @@ fn execute_scan(
 ) -> ScanResult<i32> {
     let run_start = Instant::now();
     let ScanArgs {
+        policy_preset,
         format,
         scope,
         mode,
@@ -317,14 +551,24 @@ fn execute_scan(
         github_token_env,
         github_check_name,
     } = scan;
-
-    let config_path = resolve_config_path(repo_root, config_override);
-    let mut cfg = load_config(config_path.as_deref()).map_err(|err| {
+    let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
         ScanError::new(
-            ScanErrorKind::Config,
-            err.context("failed to load policy config"),
+            ScanErrorKind::Input,
+            anyhow!("invalid value for scan.policy_preset from cli: {err}"),
         )
     })?;
+
+    let config_path = resolve_config_path(repo_root, config_override);
+    let loaded_cfg = load_policy_config(config_path.as_deref(), preset).map_err(|err| {
+        ScanError::new(
+            ScanErrorKind::Config,
+            anyhow::Error::new(err).context("failed to load policy config"),
+        )
+    })?;
+    for warning in &loaded_cfg.compatibility_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let mut cfg = loaded_cfg.config;
 
     apply_threshold_override(&mut cfg, threshold)?;
 
@@ -613,6 +857,17 @@ fn resolve_config_path(repo_root: &Path, override_path: Option<&Path>) -> Option
     None
 }
 
+fn resolve_policy_path(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    policy_path_arg: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = policy_path_arg {
+        return resolve_config_path(repo_root, Some(path));
+    }
+    resolve_config_path(repo_root, config_override)
+}
+
 fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResult<()> {
     if let Some(t) = threshold {
         if t > 100 {
@@ -626,12 +881,24 @@ fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResu
     Ok(())
 }
 
-fn load_config(path: Option<&Path>) -> Result<Config> {
-    if let Some(path) = path {
-        Ok(patchgate_config::load_from(path)?)
-    } else {
-        Ok(Config::default())
+fn parse_policy_preset(raw: Option<&str>) -> std::result::Result<Option<PolicyPreset>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    match PolicyPreset::parse(value) {
+        Some(preset) => Ok(Some(preset)),
+        None => Err(format!(
+            "`{value}` (expected: {})",
+            PolicyPreset::allowed_values()
+        )),
     }
+}
+
+fn load_policy_config(
+    path: Option<&Path>,
+    preset: Option<PolicyPreset>,
+) -> std::result::Result<LoadedConfig, ConfigError> {
+    patchgate_config::load_effective_from_typed(path, preset)
 }
 
 fn resolve_scan_options(
@@ -1074,6 +1341,7 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1084,10 +1352,10 @@ mod tests {
     use super::{
         apply_threshold_override, build_cache_key, detect_head_sha_from_env,
         detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
-        parse_scope, pr_head_sha_from_event_payload, pr_number_from_event_payload,
-        pr_number_from_ref, recover_cache_db, render_github_comment, resolve_config_path,
-        resolve_publish_request, resolve_scan_options, sorted_findings_for_comment, OptionSource,
-        ScanErrorKind, ScopeMode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        sorted_findings_for_comment, OptionSource, PolicyExitCode, ScanErrorKind, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1407,6 +1675,9 @@ mod tests {
     fn finding(id: &str, severity: Severity, penalty: u8) -> Finding {
         Finding {
             id: id.to_string(),
+            rule_id: id.to_string(),
+            category: "test".to_string(),
+            docs_url: "https://example.com/docs".to_string(),
             check: CheckId::TestGap,
             title: id.to_string(),
             message: format!("message-{id}"),
@@ -1559,6 +1830,55 @@ mod tests {
         assert_eq!(resolved, policy_path);
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn parse_policy_preset_accepts_known_values() {
+        assert_eq!(
+            parse_policy_preset(Some("strict"))
+                .expect("strict")
+                .map(|p| p.as_str()),
+            Some("strict")
+        );
+        assert_eq!(
+            parse_policy_preset(Some("balanced"))
+                .expect("balanced")
+                .map(|p| p.as_str()),
+            Some("balanced")
+        );
+        assert_eq!(
+            parse_policy_preset(Some("relaxed"))
+                .expect("relaxed")
+                .map(|p| p.as_str()),
+            Some("relaxed")
+        );
+    }
+
+    #[test]
+    fn parse_policy_preset_rejects_unknown_value() {
+        let err = parse_policy_preset(Some("custom")).expect_err("must reject unknown preset");
+        assert!(err.contains("expected: strict|balanced|relaxed"));
+    }
+
+    #[test]
+    fn resolve_policy_path_prefers_subcommand_path_over_global_override() {
+        let repo_root = PathBuf::from("/tmp/patchgate");
+        let global = PathBuf::from("global.toml");
+        let subcmd = PathBuf::from("subcmd.toml");
+        let resolved =
+            resolve_policy_path(&repo_root, Some(&global), Some(&subcmd)).expect("resolved path");
+        assert_eq!(resolved, repo_root.join("subcmd.toml"));
+    }
+
+    #[test]
+    fn policy_exit_codes_are_stable() {
+        assert_eq!(PolicyExitCode::ReadOrParse.as_i32(), 10);
+        assert_eq!(PolicyExitCode::ValidationType.as_i32(), 11);
+        assert_eq!(PolicyExitCode::ValidationRange.as_i32(), 12);
+        assert_eq!(PolicyExitCode::ValidationDependency.as_i32(), 13);
+        assert_eq!(PolicyExitCode::MigrationRequired.as_i32(), 14);
+        assert_eq!(PolicyExitCode::MigrationFailed.as_i32(), 15);
+        assert_eq!(PolicyExitCode::IoFailed.as_i32(), 16);
     }
 
     #[test]

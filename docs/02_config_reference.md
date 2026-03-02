@@ -2,6 +2,12 @@
 
 `policy.toml` で patchgate の挙動を調整します。
 
+## Top-level fields
+
+- `policy_version`
+  - 現在の推奨値は `2`
+  - 未指定 policy は互換維持のため `v1` として解釈
+
 ## 主要セクション
 
 - `[output]`
@@ -40,6 +46,12 @@
   - `lockfile_penalty`
   - `large_lockfile_churn`
   - `large_lockfile_penalty`
+
+## Presets
+
+- `strict`, `balanced`, `relaxed` を利用可能
+- 参照ファイル: `config/presets/*.toml`
+- 適用順は `default < preset < policy file < CLI override`
 
 詳細例は `config/policy.toml.example` を参照してください。
 

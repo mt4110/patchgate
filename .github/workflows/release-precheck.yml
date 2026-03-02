@@ -25,6 +25,17 @@ jobs:
       - name: Run patchgate doctor
         run: nix develop --command cargo run -p patchgate-cli -- doctor
 
+      - name: Policy lint (example + presets)
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- policy lint \
+            --path config/policy.toml.example \
+            --require-current-version
+          for preset in strict balanced relaxed; do
+            nix develop --command cargo run -p patchgate-cli -- policy lint \
+              --path "config/presets/${preset}.toml" \
+              --require-current-version
+          done
+
       - name: Benchmark baseline compare
         run: |
           nix develop --command cargo run -p xtask -- bench compare \

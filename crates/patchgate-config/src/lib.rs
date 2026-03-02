@@ -12,6 +12,9 @@ use anyhow::Result as AnyResult;
 use globset::Glob;
 use thiserror::Error;
 
+const POLICY_VERSION_FIELD: &str = "policy_version";
+const SUPPORTED_POLICY_VERSIONS: [u32; 2] = [POLICY_VERSION_LEGACY, POLICY_VERSION_CURRENT];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationCategory {
     Type,
@@ -30,6 +33,62 @@ impl ValidationCategory {
 }
 
 impl fmt::Display for ValidationCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVersionSource {
+    Explicit,
+    LegacyImplicit,
+    Default,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub version_source: PolicyVersionSource,
+    pub compatibility_warnings: Vec<String>,
+}
+
+impl LoadedConfig {
+    pub fn migration_required(&self) -> bool {
+        self.config.policy_version < POLICY_VERSION_CURRENT
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyPreset {
+    Strict,
+    Balanced,
+    Relaxed,
+}
+
+impl PolicyPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyPreset::Strict => "strict",
+            PolicyPreset::Balanced => "balanced",
+            PolicyPreset::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "strict" => Some(PolicyPreset::Strict),
+            "balanced" => Some(PolicyPreset::Balanced),
+            "relaxed" => Some(PolicyPreset::Relaxed),
+            _ => None,
+        }
+    }
+
+    pub fn allowed_values() -> &'static str {
+        "strict|balanced|relaxed"
+    }
+}
+
+impl fmt::Display for PolicyPreset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -68,6 +127,41 @@ impl ConfigError {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum PolicyMigrationError {
+    #[error("policy parse error [type]: {source}")]
+    Parse {
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("unsupported migration path: {from} -> {to}")]
+    UnsupportedPath { from: u32, to: u32 },
+
+    #[error("policy version field must be a positive integer")]
+    InvalidVersionField,
+
+    #[error("policy version mismatch: expected {expected}, detected {detected}")]
+    VersionMismatch { expected: u32, detected: u32 },
+
+    #[error("policy validation error after migration: {message}")]
+    Validation { message: String },
+
+    #[error("failed to render migrated policy: {source}")]
+    Render {
+        #[source]
+        source: toml::ser::Error,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyMigrationOutcome {
+    pub from: u32,
+    pub to: u32,
+    pub changed: bool,
+    pub migrated_toml: String,
+}
+
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
 pub fn load_from(path: impl AsRef<Path>) -> AnyResult<Config> {
@@ -75,17 +169,160 @@ pub fn load_from(path: impl AsRef<Path>) -> AnyResult<Config> {
 }
 
 pub fn load_from_typed(path: impl AsRef<Path>) -> Result<Config> {
-    let path_ref = path.as_ref();
-    let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
-        path: path_ref.to_path_buf(),
-        source,
+    let loaded = load_effective_from_typed(Some(path.as_ref()), None)?;
+    Ok(loaded.config)
+}
+
+pub fn load_effective_from(
+    path: Option<&Path>,
+    preset: Option<PolicyPreset>,
+) -> AnyResult<LoadedConfig> {
+    load_effective_from_typed(path, preset).map_err(anyhow::Error::new)
+}
+
+pub fn load_effective_from_typed(
+    path: Option<&Path>,
+    preset: Option<PolicyPreset>,
+) -> Result<LoadedConfig> {
+    let mut merged = default_config_value();
+
+    if let Some(preset) = preset {
+        let preset_value = parse_toml_value(preset_toml(preset))?;
+        deep_merge(&mut merged, preset_value);
+    }
+
+    let (config, version_source) = if let Some(path_ref) = path {
+        let text = fs::read_to_string(path_ref).map_err(|source| ConfigError::Read {
+            path: path_ref.to_path_buf(),
+            source,
+        })?;
+        let policy_value = parse_toml_value(&text)?;
+        let has_explicit_version = has_explicit_policy_version(&policy_value);
+        deep_merge(&mut merged, policy_value);
+
+        let mut cfg = parse_config_from_value(merged)?;
+        let source = if has_explicit_version {
+            PolicyVersionSource::Explicit
+        } else {
+            cfg.policy_version = POLICY_VERSION_LEGACY;
+            PolicyVersionSource::LegacyImplicit
+        };
+        (cfg, source)
+    } else {
+        (
+            parse_config_from_value(merged)?,
+            PolicyVersionSource::Default,
+        )
+    };
+
+    validate_config(&config)?;
+
+    let compatibility_warnings = compatibility_warnings(&config, version_source);
+
+    Ok(LoadedConfig {
+        config,
+        version_source,
+        compatibility_warnings,
+    })
+}
+
+pub fn migrate_policy_text(
+    input: &str,
+    from: u32,
+    to: u32,
+) -> std::result::Result<PolicyMigrationOutcome, PolicyMigrationError> {
+    if from == to {
+        let cfg_value = parse_toml_value_for_migration(input)?;
+        let detected = detect_policy_version_from_toml(&cfg_value)?;
+        if detected != from {
+            return Err(PolicyMigrationError::VersionMismatch {
+                expected: from,
+                detected,
+            });
+        }
+        let mut cfg = parse_config_for_migration(cfg_value.clone())?;
+        cfg.policy_version = from;
+        validate_config(&cfg).map_err(|err| PolicyMigrationError::Validation {
+            message: err.to_string(),
+        })?;
+        return Ok(PolicyMigrationOutcome {
+            from,
+            to,
+            changed: false,
+            migrated_toml: toml::to_string_pretty(&cfg_value)
+                .map_err(|source| PolicyMigrationError::Render { source })?,
+        });
+    }
+
+    if !(from == POLICY_VERSION_LEGACY && to == POLICY_VERSION_CURRENT) {
+        return Err(PolicyMigrationError::UnsupportedPath { from, to });
+    }
+
+    let mut cfg_value = parse_toml_value_for_migration(input)?;
+    let detected = detect_policy_version_from_toml(&cfg_value)?;
+    if detected != from {
+        return Err(PolicyMigrationError::VersionMismatch {
+            expected: from,
+            detected,
+        });
+    }
+
+    set_policy_version(&mut cfg_value, to);
+
+    let mut cfg = parse_config_for_migration(cfg_value.clone())?;
+    cfg.policy_version = to;
+    validate_config(&cfg).map_err(|err| PolicyMigrationError::Validation {
+        message: err.to_string(),
     })?;
-    let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse { source })?;
-    validate_config(&cfg)?;
-    Ok(cfg)
+
+    let migrated_toml = toml::to_string_pretty(&cfg_value)
+        .map_err(|source| PolicyMigrationError::Render { source })?;
+
+    Ok(PolicyMigrationOutcome {
+        from,
+        to,
+        changed: true,
+        migrated_toml,
+    })
+}
+
+pub fn compatibility_warnings(cfg: &Config, source: PolicyVersionSource) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if source == PolicyVersionSource::LegacyImplicit {
+        warnings.push(format!(
+            "policy_version is not specified; interpreted as legacy v{} for compatibility",
+            POLICY_VERSION_LEGACY
+        ));
+    }
+
+    if cfg.policy_version < POLICY_VERSION_CURRENT {
+        warnings.push(format!(
+            "policy_version {} is legacy. run `patchgate policy migrate --from {} --to {} --write`",
+            cfg.policy_version, cfg.policy_version, POLICY_VERSION_CURRENT
+        ));
+    }
+
+    warnings
 }
 
 pub fn validate_config(cfg: &Config) -> Result<()> {
+    if !SUPPORTED_POLICY_VERSIONS.contains(&cfg.policy_version) {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            POLICY_VERSION_FIELD,
+            format!(
+                "invalid value `{}` (supported: {})",
+                cfg.policy_version,
+                SUPPORTED_POLICY_VERSIONS
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
+        ));
+    }
+
     validate_enum(
         "output.format",
         cfg.output.format.as_str(),
@@ -122,6 +359,19 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         0,
         100,
     )?;
+
+    let weight_sum = cfg
+        .weights
+        .test_gap_max_penalty
+        .saturating_add(cfg.weights.dangerous_change_max_penalty)
+        .saturating_add(cfg.weights.dependency_update_max_penalty);
+    if weight_sum == 0 {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "weights",
+            "all max penalties are 0; at least one check must contribute to score",
+        ));
+    }
 
     validate_range_u8(
         "test_gap.missing_tests_penalty",
@@ -279,6 +529,105 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+fn default_config_value() -> toml::Value {
+    toml::Value::try_from(Config::default()).expect("default config must serialize")
+}
+
+fn preset_toml(preset: PolicyPreset) -> &'static str {
+    match preset {
+        PolicyPreset::Strict => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../config/presets/strict.toml"
+            ))
+        }
+        PolicyPreset::Balanced => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../config/presets/balanced.toml"
+            ))
+        }
+        PolicyPreset::Relaxed => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../config/presets/relaxed.toml"
+            ))
+        }
+    }
+}
+
+fn parse_toml_value(input: &str) -> Result<toml::Value> {
+    input
+        .parse::<toml::Value>()
+        .map_err(|source| ConfigError::Parse { source })
+}
+
+fn parse_toml_value_for_migration(
+    input: &str,
+) -> std::result::Result<toml::Value, PolicyMigrationError> {
+    input
+        .parse::<toml::Value>()
+        .map_err(|source| PolicyMigrationError::Parse { source })
+}
+
+fn parse_config_from_value(value: toml::Value) -> Result<Config> {
+    value
+        .try_into::<Config>()
+        .map_err(|source| ConfigError::Parse { source })
+}
+
+fn parse_config_for_migration(
+    value: toml::Value,
+) -> std::result::Result<Config, PolicyMigrationError> {
+    value
+        .try_into::<Config>()
+        .map_err(|source| PolicyMigrationError::Parse { source })
+}
+
+fn has_explicit_policy_version(value: &toml::Value) -> bool {
+    matches!(
+        value.get(POLICY_VERSION_FIELD),
+        Some(toml::Value::Integer(_))
+    )
+}
+
+fn detect_policy_version_from_toml(
+    value: &toml::Value,
+) -> std::result::Result<u32, PolicyMigrationError> {
+    match value.get(POLICY_VERSION_FIELD) {
+        Some(toml::Value::Integer(v)) if *v > 0 => Ok(*v as u32),
+        Some(_) => Err(PolicyMigrationError::InvalidVersionField),
+        None => Ok(POLICY_VERSION_LEGACY),
+    }
+}
+
+fn set_policy_version(value: &mut toml::Value, version: u32) {
+    let root = value
+        .as_table_mut()
+        .expect("root of policy must be a TOML table");
+    root.insert(
+        POLICY_VERSION_FIELD.to_string(),
+        toml::Value::Integer(version as i64),
+    );
+}
+
+fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                if let Some(base_value) = base_table.get_mut(&key) {
+                    deep_merge(base_value, value);
+                } else {
+                    base_table.insert(key, value);
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value;
+        }
+    }
+}
+
 fn validate_enum(field: &'static str, value: &str, allowed: &[&str]) -> Result<()> {
     if allowed.contains(&value) {
         Ok(())
@@ -364,7 +713,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{load_from, load_from_typed, Config, ConfigError, ValidationCategory};
+    use super::{
+        compatibility_warnings, load_effective_from_typed, load_from, load_from_typed,
+        migrate_policy_text, Config, ConfigError, PolicyPreset, PolicyVersionSource,
+        ValidationCategory, POLICY_VERSION_CURRENT, POLICY_VERSION_LEGACY,
+    };
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -459,6 +812,7 @@ critical_patterns = [".github/workflows/**"]
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/policy.toml.example");
         let loaded = load_from(&example_path).expect("load policy example");
         assert_eq!(loaded, Config::default());
+        assert_eq!(loaded.policy_version, POLICY_VERSION_CURRENT);
     }
 
     #[test]
@@ -472,5 +826,74 @@ format = "invalid"
         let err = load_from_typed(&path).expect_err("must fail");
         assert_eq!(err.category(), Some(ValidationCategory::Type));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_policy_without_version_uses_legacy_version_and_warns() {
+        let path = write_temp_policy(
+            r#"
+[output]
+mode = "warn"
+"#,
+        );
+
+        let loaded = load_effective_from_typed(Some(&path), None).expect("load policy");
+        assert_eq!(loaded.config.policy_version, POLICY_VERSION_LEGACY);
+        assert_eq!(loaded.version_source, PolicyVersionSource::LegacyImplicit);
+        assert!(loaded
+            .compatibility_warnings
+            .iter()
+            .any(|w| w.contains("migrate")));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn policy_preset_can_be_layered_with_policy_file() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[output]
+mode = "warn"
+"#,
+        );
+
+        let loaded =
+            load_effective_from_typed(Some(&path), Some(PolicyPreset::Strict)).expect("load");
+        assert_eq!(loaded.config.output.mode, "warn");
+        assert!(loaded.config.output.fail_threshold >= 70);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrate_policy_from_v1_to_v2_adds_version() {
+        let input = r#"
+[output]
+mode = "warn"
+"#;
+        let migrated = migrate_policy_text(input, POLICY_VERSION_LEGACY, POLICY_VERSION_CURRENT)
+            .expect("migrate");
+        assert!(migrated.changed);
+        assert!(migrated.migrated_toml.contains("policy_version = 2"));
+    }
+
+    #[test]
+    fn migration_rejects_version_mismatch() {
+        let input = r#"
+policy_version = 2
+[output]
+mode = "warn"
+"#;
+        let err = migrate_policy_text(input, 1, 2).expect_err("must reject mismatch");
+        assert!(format!("{err}").contains("version mismatch"));
+    }
+
+    #[test]
+    fn compatibility_warning_is_empty_for_current_version() {
+        let mut cfg = Config::default();
+        cfg.policy_version = POLICY_VERSION_CURRENT;
+        let warnings = compatibility_warnings(&cfg, PolicyVersionSource::Explicit);
+        assert!(warnings.is_empty());
     }
 }

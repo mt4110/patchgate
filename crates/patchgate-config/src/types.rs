@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub const POLICY_VERSION_LEGACY: u32 = 1;
+pub const POLICY_VERSION_CURRENT: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
+    #[serde(default = "default_policy_version")]
+    pub policy_version: u32,
     #[serde(default)]
     pub output: OutputConfig,
     #[serde(default)]
@@ -18,6 +23,26 @@ pub struct Config {
     pub dangerous_change: DangerousChangeConfig,
     #[serde(default)]
     pub dependency_update: DependencyUpdateConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            policy_version: default_policy_version(),
+            output: OutputConfig::default(),
+            scope: ScopeConfig::default(),
+            cache: CacheConfig::default(),
+            exclude: ExcludeConfig::default(),
+            weights: WeightsConfig::default(),
+            test_gap: TestGapConfig::default(),
+            dangerous_change: DangerousChangeConfig::default(),
+            dependency_update: DependencyUpdateConfig::default(),
+        }
+    }
+}
+
+fn default_policy_version() -> u32 {
+    POLICY_VERSION_CURRENT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

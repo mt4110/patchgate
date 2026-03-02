@@ -190,6 +190,11 @@ fn evaluate_test_gap(
         penalty = penalty.saturating_add(policy.test_gap.missing_tests_penalty);
         findings.push(Finding {
             id: "TG-001".to_string(),
+            rule_id: "TG-001".to_string(),
+            category: "test_coverage".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::TestGap,
             title: "No test changes detected".to_string(),
             message: format!(
@@ -219,6 +224,11 @@ fn evaluate_test_gap(
         penalty = penalty.saturating_add(policy.test_gap.large_change_penalty);
         findings.push(Finding {
             id: "TG-002".to_string(),
+            rule_id: "TG-002".to_string(),
+            category: "test_coverage".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::TestGap,
             title: "Large code change with limited test updates".to_string(),
             message: format!(
@@ -298,6 +308,15 @@ fn evaluate_dangerous_change(
             } else {
                 "DC-001".to_string()
             },
+            rule_id: if is_critical {
+                "DC-002".to_string()
+            } else {
+                "DC-001".to_string()
+            },
+            category: "change_risk".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::DangerousChange,
             title: if is_critical {
                 "Critical infrastructure path changed".to_string()
@@ -400,6 +419,11 @@ fn evaluate_dependency_update(
         penalty = penalty.saturating_add(policy.dependency_update.manifest_penalty);
         findings.push(Finding {
             id: "DU-001".to_string(),
+            rule_id: "DU-001".to_string(),
+            category: "dependency".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::DependencyUpdate,
             title: "Dependency manifest updated".to_string(),
             message: format!(
@@ -425,6 +449,11 @@ fn evaluate_dependency_update(
         penalty = penalty.saturating_add(policy.dependency_update.lockfile_penalty);
         findings.push(Finding {
             id: "DU-002".to_string(),
+            rule_id: "DU-002".to_string(),
+            category: "dependency".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::DependencyUpdate,
             title: "Dependency lockfile updated".to_string(),
             message: format!(
@@ -452,6 +481,11 @@ fn evaluate_dependency_update(
         penalty = penalty.saturating_add(policy.dependency_update.large_lockfile_penalty);
         findings.push(Finding {
             id: "DU-003".to_string(),
+            rule_id: "DU-003".to_string(),
+            category: "dependency".to_string(),
+            docs_url:
+                "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                    .to_string(),
             check: CheckId::DependencyUpdate,
             title: "Large lockfile churn".to_string(),
             message: format!(

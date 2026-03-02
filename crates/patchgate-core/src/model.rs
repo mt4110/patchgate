@@ -44,6 +44,12 @@ pub struct Location {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
+    #[serde(default)]
+    pub rule_id: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub docs_url: String,
     pub check: CheckId,
     pub title: String,
     pub message: String,
