@@ -1,24 +1,17 @@
-# patchgate policy (MVP)
-policy_version = 2
-
 [output]
-format = "text"          # text | json
-mode = "warn"            # warn | enforce
-fail_threshold = 70       # 0..=100, score below this fails in enforce mode
+format = "text"
+mode = "warn"
+fail_threshold = 70
 
 [scope]
-mode = "staged"          # staged | worktree | repo
+mode = "staged"
 
 [cache]
 enabled = true
 db_path = ".patchgate/cache.db"
 
 [exclude]
-# Skip generated files or vendored code
-globs = [
-  "vendor/**",
-  "**/generated/**",
-]
+globs = ["vendor/**", "**/generated/**"]
 
 [weights]
 test_gap_max_penalty = 35
@@ -48,7 +41,6 @@ large_change_penalty = 8
 
 [dangerous_change]
 enabled = true
-# patterns: high-risk paths (base penalty)
 patterns = [
   ".github/workflows/**",
   "infra/**",
@@ -63,7 +55,6 @@ patterns = [
   "docker-compose*.yml",
   "docker-compose*.yaml",
 ]
-# critical_patterns: subset of patterns that receive extra critical bonus penalty
 critical_patterns = [
   ".github/workflows/**",
   "infra/**",
@@ -76,7 +67,6 @@ critical_bonus_penalty = 6
 
 [dependency_update]
 enabled = true
-# manifest_globs: direct dependency declarations
 manifest_globs = [
   "**/Cargo.toml",
   "**/package.json",
@@ -88,7 +78,6 @@ manifest_globs = [
   "**/build.gradle",
   "**/build.gradle.kts",
 ]
-# lockfile_globs: resolved dependency graph snapshots
 lockfile_globs = [
   "**/Cargo.lock",
   "**/package-lock.json",

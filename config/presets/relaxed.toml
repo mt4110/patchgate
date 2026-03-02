@@ -1,0 +1,25 @@
+policy_version = 2
+
+[output]
+mode = "warn"
+fail_threshold = 60
+
+[weights]
+test_gap_max_penalty = 25
+dangerous_change_max_penalty = 30
+dependency_update_max_penalty = 20
+
+[test_gap]
+missing_tests_penalty = 18
+large_change_lines = 300
+large_change_penalty = 5
+
+[dangerous_change]
+per_file_penalty = 7
+critical_bonus_penalty = 4
+
+[dependency_update]
+manifest_penalty = 12
+lockfile_penalty = 5
+large_lockfile_churn = 350
+large_lockfile_penalty = 6

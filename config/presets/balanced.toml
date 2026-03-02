@@ -1,0 +1,5 @@
+policy_version = 2
+
+[output]
+mode = "warn"
+fail_threshold = 70
