@@ -234,7 +234,7 @@ pub fn publish_report(
 
     if primary_attempted > 0 && primary_succeeded == 0 {
         return Err(anyhow!(
-            "failed to publish all requested GitHub outputs: comment_error=`{}` check_error=`{}`",
+            "failed to publish all requested GitHub outputs: comment_error=`{}` check_run_error=`{}`",
             result.comment_error.as_deref().unwrap_or("not requested"),
             result.check_run_error.as_deref().unwrap_or("not requested"),
         ));

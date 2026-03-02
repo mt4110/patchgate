@@ -61,10 +61,19 @@ pub struct Finding {
 
 impl Finding {
     pub fn pr_template_hint(&self) -> String {
-        format!(
-            "- [ ] `{}` ({}) {}",
-            self.rule_id, self.category, self.title
-        )
+        let rule_display = if self.rule_id.is_empty() {
+            self.id.as_str()
+        } else {
+            self.rule_id.as_str()
+        };
+        if self.category.is_empty() {
+            format!("- [ ] `{}` {}", rule_display, self.title)
+        } else {
+            format!(
+                "- [ ] `{}` ({}) {}",
+                rule_display, self.category, self.title
+            )
+        }
     }
 }
 
@@ -226,5 +235,44 @@ mod tests {
         );
         assert_eq!(report_below_threshold.score, 69);
         assert!(report_below_threshold.should_fail);
+    }
+
+    #[test]
+    fn pr_template_hint_uses_rule_id_when_available() {
+        let finding = Finding {
+            id: "TG-001".to_string(),
+            rule_id: "TG-RULE".to_string(),
+            category: "test_gap".to_string(),
+            docs_url: "https://example.com".to_string(),
+            check: CheckId::TestGap,
+            title: "Missing tests".to_string(),
+            message: "add tests".to_string(),
+            severity: Severity::Medium,
+            penalty: 10,
+            location: None,
+            tags: vec![],
+        };
+        assert_eq!(
+            finding.pr_template_hint(),
+            "- [ ] `TG-RULE` (test_gap) Missing tests"
+        );
+    }
+
+    #[test]
+    fn pr_template_hint_falls_back_for_legacy_fields() {
+        let finding = Finding {
+            id: "TG-001".to_string(),
+            rule_id: String::new(),
+            category: String::new(),
+            docs_url: String::new(),
+            check: CheckId::TestGap,
+            title: "Missing tests".to_string(),
+            message: "add tests".to_string(),
+            severity: Severity::Medium,
+            penalty: 10,
+            location: None,
+            tags: vec![],
+        };
+        assert_eq!(finding.pr_template_hint(), "- [ ] `TG-001` Missing tests");
     }
 }
