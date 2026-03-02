@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -7,6 +8,7 @@ use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use patchgate_github::{publish_report, PublishAuth, PublishRequest, RetryPolicy};
 use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -14,7 +16,10 @@ use patchgate_config::{
     Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
     POLICY_VERSION_CURRENT,
 };
-use patchgate_core::{Context, Finding, Report, ReviewPriority, Runner, ScopeMode, Severity};
+use patchgate_core::{
+    CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority, Runner, ScopeMode,
+    Severity,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,9 +74,21 @@ struct ScanArgs {
     #[arg(long)]
     threshold: Option<u8>,
 
+    /// Maximum number of changed files to process
+    #[arg(long)]
+    max_changed_files: Option<u32>,
+
+    /// Behavior when max changed files exceeded: fail_open|fail_closed
+    #[arg(long)]
+    on_exceed: Option<String>,
+
     /// Disable SQLite cache
     #[arg(long)]
     no_cache: bool,
+
+    /// Write machine-readable scan profile JSON
+    #[arg(long)]
+    profile_output: Option<PathBuf>,
 
     /// Write PR comment markdown to a file
     #[arg(long)]
@@ -320,6 +337,23 @@ struct ResolvedScanOptions {
     format: String,
     mode: String,
     scope: ScopeMode,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ScanProfile {
+    schema_version: u8,
+    mode: String,
+    scope: String,
+    changed_files: usize,
+    skipped_by_cache: bool,
+    total_ms: u128,
+    diff_ms: u128,
+    evaluate_ms: u128,
+    cache_read_ms: u128,
+    cache_write_ms: u128,
+    publish_ms: u128,
+    output_ms: u128,
+    check_durations_ms: BTreeMap<String, u128>,
 }
 
 type ScanResult<T> = std::result::Result<T, ScanError>;
@@ -610,7 +644,10 @@ fn execute_scan(
         scope,
         mode,
         threshold,
+        max_changed_files,
+        on_exceed,
         no_cache,
+        profile_output,
         github_comment,
         github_publish,
         github_repo,
@@ -652,8 +689,16 @@ fn execute_scan(
     let mut cfg = loaded_cfg.config;
 
     apply_threshold_override(&mut cfg, threshold)?;
+    apply_changed_file_overrides(&mut cfg, max_changed_files, on_exceed.as_deref())?;
 
     let opts = resolve_scan_options(&cfg, format.as_deref(), scope.as_deref(), mode.as_deref())?;
+
+    let mut profile = ScanProfile {
+        schema_version: 1,
+        mode: opts.mode.clone(),
+        scope: opts.scope.as_str().to_string(),
+        ..ScanProfile::default()
+    };
 
     let ctx = Context {
         repo_root: repo_root.to_path_buf(),
@@ -661,16 +706,42 @@ fn execute_scan(
     };
 
     let runner = Runner::new(cfg.clone());
+    let diff_collect_start = Instant::now();
     let diff = runner.collect_diff(&ctx).map_err(|err| {
         ScanError::new(
             ScanErrorKind::Runtime,
             err.context("failed to collect git diff"),
         )
     })?;
+    profile.diff_ms = diff_collect_start.elapsed().as_millis();
+    profile.changed_files = diff.files.len();
     let diff_fingerprint = diff.fingerprint.clone();
     let mut diff_for_eval = Some(diff);
 
     let cache_enabled = cfg.cache.enabled && !no_cache;
+    let policy_hash = if cache_enabled {
+        Some(config_hash(&cfg).map_err(|err| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                err.context("failed to hash effective config"),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let mut cache_conn = if cache_enabled {
+        match open_cache_connection(repo_root, &cfg.cache.db_path) {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                handle_cache_fault(repo_root, &cfg.cache.db_path, "open", &err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut evaluate_report = || -> ScanResult<Report> {
         let eval_diff = diff_for_eval.take().ok_or_else(|| {
             ScanError::new(
@@ -686,50 +757,97 @@ fn execute_scan(
         })
     };
 
-    let report = if cache_enabled {
-        let policy_hash = config_hash(&cfg).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to hash effective config"),
-            )
-        })?;
-
-        match load_cache(
-            repo_root,
-            &cfg.cache.db_path,
-            &diff_fingerprint,
-            &policy_hash,
-            &opts.mode,
-            opts.scope.as_str(),
-        ) {
-            Ok(Some(mut cached)) => {
-                cached.skipped_by_cache = true;
-                cached.duration_ms = run_start.elapsed().as_millis();
-                cached
+    let report = if profile.changed_files > cfg.scope.max_changed_files as usize {
+        match cfg.scope.on_exceed.as_str() {
+            "fail_open" => {
+                eprintln!(
+                    "warning: changed file count ({}) exceeded limit ({}). proceeding with fail-open behavior.",
+                    profile.changed_files, cfg.scope.max_changed_files
+                );
+                changed_file_limit_fail_open_report(
+                    &cfg,
+                    &opts,
+                    &diff_fingerprint,
+                    profile.changed_files,
+                    run_start.elapsed().as_millis(),
+                )
             }
-            Ok(None) => {
-                let evaluated = evaluate_report()?;
-                if let Err(err) =
-                    store_cache(repo_root, &cfg.cache.db_path, &evaluated, &policy_hash)
-                {
-                    handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
-                }
-                evaluated
+            "fail_closed" => {
+                return Err(ScanError::new(
+                    ScanErrorKind::Runtime,
+                    anyhow!(
+                        "changed file count ({}) exceeded configured max_changed_files ({}) with on_exceed=fail_closed",
+                        profile.changed_files,
+                        cfg.scope.max_changed_files
+                    ),
+                ));
             }
-            Err(err) => {
-                handle_cache_fault(repo_root, &cfg.cache.db_path, "read", &err);
-                let evaluated = evaluate_report()?;
-                if let Err(err) =
-                    store_cache(repo_root, &cfg.cache.db_path, &evaluated, &policy_hash)
-                {
-                    handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
-                }
-                evaluated
+            other => {
+                return Err(ScanError::new(
+                    ScanErrorKind::Config,
+                    anyhow!("invalid value for scope.on_exceed from config: `{other}` (expected: fail_open|fail_closed)"),
+                ));
             }
         }
+    } else if cache_enabled {
+        let policy_hash = policy_hash
+            .as_ref()
+            .expect("policy hash must exist when cache is enabled");
+        if let Some(conn) = cache_conn.as_ref() {
+            let cache_read_start = Instant::now();
+            let cached = load_cache_from_conn(
+                conn,
+                &diff_fingerprint,
+                policy_hash,
+                &opts.mode,
+                opts.scope.as_str(),
+            );
+            profile.cache_read_ms = cache_read_start.elapsed().as_millis();
+            match cached {
+                Ok(Some(mut cached)) => {
+                    cached.skipped_by_cache = true;
+                    cached.duration_ms = run_start.elapsed().as_millis();
+                    cached
+                }
+                Ok(None) => {
+                    let evaluated = evaluate_report()?;
+                    profile.evaluate_ms = evaluated.duration_ms;
+                    if let Some(conn) = cache_conn.as_ref() {
+                        let cache_write_start = Instant::now();
+                        if let Err(err) = store_cache_to_conn(conn, &evaluated, policy_hash) {
+                            handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
+                        }
+                        profile.cache_write_ms = cache_write_start.elapsed().as_millis();
+                    }
+                    evaluated
+                }
+                Err(err) => {
+                    handle_cache_fault(repo_root, &cfg.cache.db_path, "read", &err);
+                    cache_conn = open_cache_connection(repo_root, &cfg.cache.db_path).ok();
+                    let evaluated = evaluate_report()?;
+                    profile.evaluate_ms = evaluated.duration_ms;
+                    if let Some(conn) = cache_conn.as_ref() {
+                        let cache_write_start = Instant::now();
+                        if let Err(err) = store_cache_to_conn(conn, &evaluated, policy_hash) {
+                            handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
+                        }
+                        profile.cache_write_ms = cache_write_start.elapsed().as_millis();
+                    }
+                    evaluated
+                }
+            }
+        } else {
+            let evaluated = evaluate_report()?;
+            profile.evaluate_ms = evaluated.duration_ms;
+            evaluated
+        }
     } else {
-        evaluate_report()?
+        let evaluated = evaluate_report()?;
+        profile.evaluate_ms = evaluated.duration_ms;
+        evaluated
     };
+    profile.skipped_by_cache = report.skipped_by_cache;
+    profile.check_durations_ms = report.check_durations_ms.clone();
 
     let markdown = render_github_comment(&report);
 
@@ -760,6 +878,7 @@ fn execute_scan(
     }
 
     if github_publish {
+        let publish_start = Instant::now();
         let suppressed_comment_reason = resolve_comment_suppression_reason(
             &report,
             github_suppress_comment_no_change,
@@ -846,8 +965,10 @@ fn execute_scan(
         if let Some(url) = published.check_run_url {
             eprintln!("published check run: {url}");
         }
+        profile.publish_ms = publish_start.elapsed().as_millis();
     }
 
+    let output_start = Instant::now();
     match opts.format.as_str() {
         "json" => {
             let pretty = serde_json::to_string_pretty(&report).map_err(|err| {
@@ -859,6 +980,12 @@ fn execute_scan(
             println!("{pretty}");
         }
         _ => print_text(&report),
+    }
+    profile.output_ms = output_start.elapsed().as_millis();
+    profile.total_ms = run_start.elapsed().as_millis();
+
+    if let Some(path) = profile_output.as_ref() {
+        write_scan_profile(path, &profile)?;
     }
 
     Ok(gate_exit_code(&opts.mode, report.should_fail))
@@ -1103,6 +1230,126 @@ fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResu
     Ok(())
 }
 
+fn apply_changed_file_overrides(
+    cfg: &mut Config,
+    max_changed_files: Option<u32>,
+    on_exceed: Option<&str>,
+) -> ScanResult<()> {
+    if let Some(limit) = max_changed_files {
+        if limit == 0 {
+            return Err(ScanError::new(
+                ScanErrorKind::Input,
+                anyhow!("invalid value for scan.max_changed_files from cli: `0` (expected: > 0)"),
+            ));
+        }
+        cfg.scope.max_changed_files = limit;
+    }
+    if let Some(mode) = on_exceed {
+        match mode {
+            "fail_open" | "fail_closed" => {
+                cfg.scope.on_exceed = mode.to_string();
+            }
+            _ => {
+                return Err(ScanError::new(
+                    ScanErrorKind::Input,
+                    anyhow!(
+                        "invalid value for scan.on_exceed from cli: `{mode}` (expected: fail_open|fail_closed)"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn changed_file_limit_fail_open_report(
+    cfg: &Config,
+    opts: &ResolvedScanOptions,
+    fingerprint: &str,
+    changed_files: usize,
+    duration_ms: u128,
+) -> Report {
+    let checks = vec![
+        CheckScore {
+            check: CheckId::TestGap,
+            label: CheckId::TestGap.label().to_string(),
+            penalty: 0,
+            max_penalty: cfg.weights.test_gap_max_penalty,
+            triggered: false,
+        },
+        CheckScore {
+            check: CheckId::DangerousChange,
+            label: CheckId::DangerousChange.label().to_string(),
+            penalty: 0,
+            max_penalty: cfg.weights.dangerous_change_max_penalty,
+            triggered: false,
+        },
+        CheckScore {
+            check: CheckId::DependencyUpdate,
+            label: CheckId::DependencyUpdate.label().to_string(),
+            penalty: 0,
+            max_penalty: cfg.weights.dependency_update_max_penalty,
+            triggered: false,
+        },
+    ];
+    let findings = vec![Finding {
+        id: "SC-001".to_string(),
+        rule_id: "SC-001".to_string(),
+        category: "scale_guard".to_string(),
+        docs_url:
+            "https://github.com/mt4110/patchgate/blob/main/docs/03_cli_reference.md#patchgate-scan"
+                .to_string(),
+        check: CheckId::DangerousChange,
+        title: "Changed file limit exceeded (fail-open)".to_string(),
+        message: format!(
+            "changed files ({changed_files}) exceeded max_changed_files ({}). check evaluation skipped due to fail-open.",
+            cfg.scope.max_changed_files
+        ),
+        severity: Severity::Low,
+        penalty: 0,
+        location: None,
+        tags: vec!["scale".to_string(), "file-limit".to_string(), "fail-open".to_string()],
+    }];
+    let mut report = Report::new(
+        findings,
+        checks,
+        ReportMeta {
+            threshold: cfg.output.fail_threshold,
+            mode: opts.mode.clone(),
+            scope: opts.scope.as_str().to_string(),
+            fingerprint: fingerprint.to_string(),
+            duration_ms,
+            skipped_by_cache: false,
+        },
+    );
+    report.changed_files = changed_files;
+    report
+}
+
+fn write_scan_profile(path: &Path, profile: &ScanProfile) -> ScanResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            ScanError::new(
+                ScanErrorKind::Output,
+                anyhow!("failed to create profile directory: {parent:?}: {err}"),
+            )
+        })?;
+    }
+    let pretty = serde_json::to_string_pretty(profile).map_err(|err| {
+        ScanError::new(
+            ScanErrorKind::Output,
+            anyhow!("failed to encode scan profile json: {err}"),
+        )
+    })?;
+    fs::write(path, pretty).map_err(|err| {
+        ScanError::new(
+            ScanErrorKind::Output,
+            anyhow!("failed to write scan profile: {path:?}: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn parse_policy_preset(raw: Option<&str>) -> std::result::Result<Option<PolicyPreset>, String> {
     let Some(value) = raw else {
         return Ok(None);
@@ -1217,23 +1464,24 @@ fn build_cache_key(diff_fingerprint: &str, policy_hash: &str, mode: &str, scope:
     format!("{:x}", Sha256::digest(material.as_bytes()))
 }
 
-fn load_cache(
-    repo_root: &Path,
-    db_path: &str,
+fn open_cache_connection(repo_root: &Path, db_path: &str) -> Result<Connection> {
+    let db_full_path = repo_root.join(db_path);
+    if let Some(parent) = db_full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(db_full_path)?;
+    init_cache_table(&conn)?;
+    Ok(conn)
+}
+
+fn load_cache_from_conn(
+    conn: &Connection,
     diff_fingerprint: &str,
     policy_hash: &str,
     mode: &str,
     scope: &str,
 ) -> Result<Option<Report>> {
     let cache_key = build_cache_key(diff_fingerprint, policy_hash, mode, scope);
-    let db_full_path = repo_root.join(db_path);
-    if !db_full_path.exists() {
-        return Ok(None);
-    }
-
-    let conn = Connection::open(db_full_path)?;
-    init_cache_table(&conn)?;
-
     let mut stmt = conn.prepare(
         "SELECT report_json FROM runs
          WHERE fingerprint = ?1
@@ -1250,23 +1498,16 @@ fn load_cache(
     }
 }
 
-fn store_cache(repo_root: &Path, db_path: &str, report: &Report, policy_hash: &str) -> Result<()> {
+fn store_cache_to_conn(conn: &Connection, report: &Report, policy_hash: &str) -> Result<()> {
     let cache_key = build_cache_key(
         &report.fingerprint,
         policy_hash,
         &report.mode,
         &report.scope,
     );
-    let db_full_path = repo_root.join(db_path);
-    if let Some(parent) = db_full_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let conn = Connection::open(db_full_path)?;
-    init_cache_table(&conn)?;
-
     let report_json = serde_json::to_string(report)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO runs (fingerprint, policy_hash, mode, scope, report_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
          ON CONFLICT(fingerprint, policy_hash, mode, scope) DO UPDATE SET
@@ -1280,7 +1521,7 @@ fn store_cache(repo_root: &Path, db_path: &str, report: &Report, policy_hash: &s
             report_json
         ],
     )?;
-
+    tx.commit()?;
     Ok(())
 }
 
@@ -1376,6 +1617,16 @@ fn print_text(report: &Report) {
     println!("Mode: {} | Scope: {}", report.mode, report.scope);
     println!("Fingerprint: {}", report.fingerprint);
     println!("Duration: {}ms", report.duration_ms);
+    println!("Changed files: {}", report.changed_files);
+    if !report.check_durations_ms.is_empty() {
+        let mut entries: Vec<String> = report
+            .check_durations_ms
+            .iter()
+            .map(|(k, v)| format!("{k}={v}ms"))
+            .collect();
+        entries.sort();
+        println!("Check timings: {}", entries.join(", "));
+    }
 
     println!("\nCheck penalties:");
     for check in &report.checks {
@@ -1469,6 +1720,7 @@ fn render_github_comment(report: &Report) -> String {
     ));
     lines.push(format!("- Mode: `{}`", report.mode));
     lines.push(format!("- Scope: `{}`", report.scope));
+    lines.push(format!("- Changed files: `{}`", report.changed_files));
     lines.push(format!(
         "- Cache: {}",
         if report.skipped_by_cache {
@@ -1583,14 +1835,14 @@ mod tests {
     use patchgate_github::PublishAuth;
 
     use super::{
-        apply_threshold_override, build_cache_key, detect_head_sha_from_env,
-        detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
-        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, run_policy_lint,
-        sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
-        PublishRequestInput, RetryPolicy, ScanErrorKind, ScopeMode,
+        apply_changed_file_overrides, apply_threshold_override, build_cache_key,
+        changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
+        gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        recover_cache_db, render_github_comment, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        run_policy_lint, sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanErrorKind, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2206,6 +2458,33 @@ mod tests {
         let err = apply_threshold_override(&mut cfg, Some(101)).expect_err("must reject >100");
         assert_eq!(err.kind(), ScanErrorKind::Input);
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn changed_file_override_rejects_invalid_values() {
+        let mut cfg = Config::default();
+        let err =
+            apply_changed_file_overrides(&mut cfg, Some(0), None).expect_err("must reject zero");
+        assert_eq!(err.kind(), ScanErrorKind::Input);
+
+        let err = apply_changed_file_overrides(&mut cfg, None, Some("warn"))
+            .expect_err("must reject unknown on_exceed");
+        assert_eq!(err.kind(), ScanErrorKind::Input);
+    }
+
+    #[test]
+    fn fail_open_limit_report_is_non_failing_and_has_marker_finding() {
+        let cfg = Config::default();
+        let opts = ResolvedScanOptions {
+            format: "json".to_string(),
+            mode: "enforce".to_string(),
+            scope: ScopeMode::Worktree,
+        };
+        let report = changed_file_limit_fail_open_report(&cfg, &opts, "fp", 12345, 7);
+        assert_eq!(report.score, 100);
+        assert!(!report.should_fail);
+        assert_eq!(report.changed_files, 12345);
+        assert!(report.findings.iter().any(|f| f.id == "SC-001"));
     }
 
     #[test]

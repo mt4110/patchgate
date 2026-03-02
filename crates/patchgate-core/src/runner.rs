@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
@@ -9,6 +9,9 @@ use patchgate_config::Config;
 use sha2::{Digest, Sha256};
 
 use crate::model::{CheckId, CheckScore, Finding, Location, Report, ReportMeta, Severity};
+
+const MAX_STORED_LINE_SAMPLES: usize = 32;
+const MAX_STORED_LINE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ScopeMode {
@@ -85,23 +88,61 @@ impl Runner {
 
         let exclude_set =
             compile_globs(&self.policy.exclude.globs).context("failed to compile exclude globs")?;
+        let generated_set = compile_globs(&self.policy.generated_code.globs)
+            .context("failed to compile generated_code.globs")?;
+
+        let (
+            (test_gap, test_gap_ms),
+            (dangerous_change, dangerous_change_ms),
+            (dependency_update, dependency_update_ms),
+        ) = std::thread::scope(|scope| {
+            let test_gap_handle = scope.spawn(|| {
+                let check_start = Instant::now();
+                let result = evaluate_test_gap(&self.policy, &diff, &exclude_set, &generated_set);
+                (result, check_start.elapsed().as_millis())
+            });
+            let dangerous_change_handle = scope.spawn(|| {
+                let check_start = Instant::now();
+                let result =
+                    evaluate_dangerous_change(&self.policy, &diff, &exclude_set, &generated_set);
+                (result, check_start.elapsed().as_millis())
+            });
+            let dependency_update_handle = scope.spawn(|| {
+                let check_start = Instant::now();
+                let result =
+                    evaluate_dependency_update(&self.policy, &diff, &exclude_set, &generated_set);
+                (result, check_start.elapsed().as_millis())
+            });
+
+            let (test_gap_result, test_gap_ms) = test_gap_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("test_gap worker thread panicked"))?;
+            let (dangerous_change_result, dangerous_change_ms) = dangerous_change_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("dangerous_change worker thread panicked"))?;
+            let (dependency_update_result, dependency_update_ms) = dependency_update_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("dependency_update worker thread panicked"))?;
+
+            Ok::<_, anyhow::Error>((
+                (test_gap_result?, test_gap_ms),
+                (dangerous_change_result?, dangerous_change_ms),
+                (dependency_update_result?, dependency_update_ms),
+            ))
+        })?;
 
         let mut findings = Vec::new();
-        let mut checks = Vec::new();
-
-        let test_gap = evaluate_test_gap(&self.policy, &diff, &exclude_set)?;
         findings.extend(test_gap.findings);
-        checks.push(test_gap.score);
-
-        let dangerous_change = evaluate_dangerous_change(&self.policy, &diff, &exclude_set)?;
         findings.extend(dangerous_change.findings);
-        checks.push(dangerous_change.score);
-
-        let dependency_update = evaluate_dependency_update(&self.policy, &diff, &exclude_set)?;
         findings.extend(dependency_update.findings);
-        checks.push(dependency_update.score);
 
-        Ok(Report::new(
+        let checks = vec![
+            test_gap.score,
+            dangerous_change.score,
+            dependency_update.score,
+        ];
+
+        let mut report = Report::new(
             findings,
             checks,
             ReportMeta {
@@ -112,7 +153,20 @@ impl Runner {
                 duration_ms: start.elapsed().as_millis(),
                 skipped_by_cache: false,
             },
-        ))
+        );
+        report.changed_files = diff.files.len();
+        report
+            .check_durations_ms
+            .insert(CheckId::TestGap.as_str().to_string(), test_gap_ms);
+        report.check_durations_ms.insert(
+            CheckId::DangerousChange.as_str().to_string(),
+            dangerous_change_ms,
+        );
+        report.check_durations_ms.insert(
+            CheckId::DependencyUpdate.as_str().to_string(),
+            dependency_update_ms,
+        );
+        Ok(report)
     }
 
     pub fn run(&self, ctx: &Context, mode: &str) -> Result<Report> {
@@ -130,6 +184,7 @@ fn evaluate_test_gap(
     policy: &Config,
     diff: &DiffData,
     exclude_set: &GlobSet,
+    generated_set: &GlobSet,
 ) -> Result<CheckEvaluation> {
     let max_penalty = policy.weights.test_gap_max_penalty;
     if !policy.test_gap.enabled {
@@ -154,9 +209,18 @@ fn evaluate_test_gap(
     let lock_set = compile_globs(&policy.dependency_update.lockfile_globs)
         .context("failed to compile dependency_update.lockfile_globs")?;
 
+    let mut package_markers = BTreeSet::new();
+    for file in &diff.files {
+        if manifest_set.is_match(&file.path) {
+            package_markers.insert(parent_dir(&file.path));
+        }
+    }
+    let package_markers: Vec<String> = package_markers.into_iter().collect();
+
     let mut test_files = Vec::new();
-    let mut production_files = Vec::new();
-    let mut production_churn = 0u32;
+    let mut tests_by_package: BTreeMap<String, usize> = BTreeMap::new();
+    let mut production_files_by_package: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut production_churn_by_package: BTreeMap<String, u32> = BTreeMap::new();
 
     for file in &diff.files {
         if exclude_set.is_match(&file.path) {
@@ -166,11 +230,17 @@ fn evaluate_test_gap(
             continue;
         }
         // Skip metadata-only changes (e.g. pure rename/mode change) to reduce false positives.
-        if file.added == 0 && file.deleted == 0 {
+        if is_metadata_only_change(file) {
             continue;
         }
-        if test_set.is_match(&file.path) {
+        let generated_factor = generated_penalty_factor(policy, generated_set, &file.path);
+        if generated_factor == 0 {
+            continue;
+        }
+        if is_test_related_file(policy, file, &test_set) {
             test_files.push(file.path.clone());
+            let package = infer_package_root(&file.path, &package_markers);
+            *tests_by_package.entry(package).or_insert(0) += 1;
             continue;
         }
         if ignore_set.is_match(&file.path)
@@ -179,15 +249,57 @@ fn evaluate_test_gap(
         {
             continue;
         }
-        production_churn = production_churn.saturating_add(file.added + file.deleted);
-        production_files.push(file.path.clone());
+        let churn = scale_u32_by_factor(file.added.saturating_add(file.deleted), generated_factor);
+        let package = infer_package_root(&file.path, &package_markers);
+        *production_churn_by_package
+            .entry(package.clone())
+            .or_insert(0) = production_churn_by_package
+            .get(&package)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(churn);
+        production_files_by_package
+            .entry(package)
+            .or_default()
+            .push(file.path.clone());
     }
 
     let mut findings = Vec::new();
     let mut penalty = 0u8;
 
-    if !production_files.is_empty() && test_files.is_empty() {
+    let has_global_test_coverage = tests_by_package.contains_key(".");
+    let mut uncovered_packages = Vec::new();
+    let mut uncovered_files = Vec::new();
+    let mut uncovered_churn = 0u32;
+    for (package, files) in &production_files_by_package {
+        let covered = has_global_test_coverage || tests_by_package.contains_key(package);
+        if !covered {
+            uncovered_packages.push(package.clone());
+            uncovered_files.extend(files.iter().cloned());
+            uncovered_churn = uncovered_churn.saturating_add(
+                production_churn_by_package
+                    .get(package)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    if !uncovered_files.is_empty() {
         penalty = penalty.saturating_add(policy.test_gap.missing_tests_penalty);
+        let package_note = if !uncovered_packages.is_empty() {
+            format!(
+                " Uncovered package roots: {}.",
+                uncovered_packages
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
         findings.push(Finding {
             id: "TG-001".to_string(),
             rule_id: "TG-001".to_string(),
@@ -198,9 +310,10 @@ fn evaluate_test_gap(
             check: CheckId::TestGap,
             title: "No test changes detected".to_string(),
             message: format!(
-                "{} production file(s) changed but no test file changed. Example: {}",
-                production_files.len(),
-                production_files
+                "{} production file(s) changed without matching test coverage updates.{} Example: {}",
+                uncovered_files.len(),
+                package_note,
+                uncovered_files
                     .iter()
                     .take(3)
                     .cloned()
@@ -210,15 +323,15 @@ fn evaluate_test_gap(
             severity: Severity::High,
             penalty: policy.test_gap.missing_tests_penalty,
             location: Some(Location {
-                file: production_files[0].clone(),
+                file: uncovered_files[0].clone(),
                 line: None,
             }),
-            tags: vec!["test-gap".to_string()],
+            tags: vec!["test-gap".to_string(), "package-boundary".to_string()],
         });
     }
 
-    if !production_files.is_empty()
-        && production_churn >= policy.test_gap.large_change_lines
+    if !uncovered_files.is_empty()
+        && uncovered_churn >= policy.test_gap.large_change_lines
         && test_files.len() <= 1
     {
         penalty = penalty.saturating_add(policy.test_gap.large_change_penalty);
@@ -233,16 +346,20 @@ fn evaluate_test_gap(
             title: "Large code change with limited test updates".to_string(),
             message: format!(
                 "Changed {} lines across production files with only {} test file(s) updated.",
-                production_churn,
+                uncovered_churn,
                 test_files.len()
             ),
             severity: Severity::Medium,
             penalty: policy.test_gap.large_change_penalty,
             location: Some(Location {
-                file: production_files[0].clone(),
+                file: uncovered_files[0].clone(),
                 line: None,
             }),
-            tags: vec!["test-gap".to_string(), "large-change".to_string()],
+            tags: vec![
+                "test-gap".to_string(),
+                "large-change".to_string(),
+                "package-boundary".to_string(),
+            ],
         });
     }
 
@@ -263,6 +380,7 @@ fn evaluate_dangerous_change(
     policy: &Config,
     diff: &DiffData,
     exclude_set: &GlobSet,
+    generated_set: &GlobSet,
 ) -> Result<CheckEvaluation> {
     let max_penalty = policy.weights.dangerous_change_max_penalty;
     if !policy.dangerous_change.enabled {
@@ -290,6 +408,9 @@ fn evaluate_dangerous_change(
         if exclude_set.is_match(&file.path) {
             continue;
         }
+        if is_metadata_only_change(file) {
+            continue;
+        }
         if !pattern_set.is_match(&file.path) {
             continue;
         }
@@ -300,8 +421,23 @@ fn evaluate_dangerous_change(
             file_penalty =
                 file_penalty.saturating_add(policy.dangerous_change.critical_bonus_penalty);
         }
+        let generated_factor = generated_penalty_factor(policy, generated_set, &file.path);
+        if generated_factor == 0 {
+            continue;
+        }
+        file_penalty = scale_penalty(file_penalty, generated_factor);
 
         penalty = penalty.saturating_add(file_penalty);
+        let mut tags = vec!["dangerous-change".to_string()];
+        tags.push(if is_critical {
+            "critical".to_string()
+        } else {
+            "non-critical".to_string()
+        });
+        if generated_factor < 100 {
+            tags.push("generated-decay".to_string());
+        }
+
         findings.push(Finding {
             id: if is_critical {
                 "DC-002".to_string()
@@ -324,14 +460,15 @@ fn evaluate_dangerous_change(
                 "High-risk path changed".to_string()
             },
             message: format!(
-                "{} was changed (status: {:?}, classification: {}).",
+                "{} was changed (status: {:?}, classification:{}, generated_factor:{}%).",
                 file.path,
                 file.status,
                 if is_critical {
                     "critical (matched dangerous_change.critical_patterns)"
                 } else {
                     "non-critical (matched dangerous_change.patterns only)"
-                }
+                },
+                generated_factor
             ),
             severity: if is_critical {
                 Severity::Critical
@@ -343,14 +480,7 @@ fn evaluate_dangerous_change(
                 file: file.path.clone(),
                 line: None,
             }),
-            tags: vec![
-                "dangerous-change".to_string(),
-                if is_critical {
-                    "critical".to_string()
-                } else {
-                    "non-critical".to_string()
-                },
-            ],
+            tags,
         });
     }
 
@@ -371,6 +501,7 @@ fn evaluate_dependency_update(
     policy: &Config,
     diff: &DiffData,
     exclude_set: &GlobSet,
+    generated_set: &GlobSet,
 ) -> Result<CheckEvaluation> {
     let max_penalty = policy.weights.dependency_update_max_penalty;
     if !policy.dependency_update.enabled {
@@ -391,8 +522,8 @@ fn evaluate_dependency_update(
     let lock_set = compile_globs(&policy.dependency_update.lockfile_globs)
         .context("failed to compile dependency_update.lockfile_globs")?;
 
-    let mut manifests = Vec::new();
-    let mut lockfiles = Vec::new();
+    let mut manifests: Vec<(String, DependencyEcosystem, u8)> = Vec::new();
+    let mut lockfiles: Vec<(ChangedFile, DependencyEcosystem, u8)> = Vec::new();
     let mut total_lockfile_churn = 0u32;
 
     for file in &diff.files {
@@ -400,15 +531,30 @@ fn evaluate_dependency_update(
             continue;
         }
         // Ignore metadata-only diffs to avoid manifest/lock false positives.
-        if file.added == 0 && file.deleted == 0 {
+        if is_metadata_only_change(file) {
+            continue;
+        }
+        let generated_factor = generated_penalty_factor(policy, generated_set, &file.path);
+        if generated_factor == 0 {
             continue;
         }
         if manifest_set.is_match(&file.path) {
-            manifests.push(file.path.clone());
+            manifests.push((
+                file.path.clone(),
+                dependency_ecosystem_for_manifest(&file.path),
+                generated_factor,
+            ));
         }
         if lock_set.is_match(&file.path) {
-            total_lockfile_churn = total_lockfile_churn.saturating_add(file.added + file.deleted);
-            lockfiles.push(file.path.clone());
+            total_lockfile_churn = total_lockfile_churn.saturating_add(scale_u32_by_factor(
+                file.added.saturating_add(file.deleted),
+                generated_factor,
+            ));
+            lockfiles.push((
+                file.clone(),
+                dependency_ecosystem_for_lockfile(&file.path),
+                generated_factor,
+            ));
         }
     }
 
@@ -416,7 +562,26 @@ fn evaluate_dependency_update(
     let mut penalty = 0u8;
 
     if !manifests.is_empty() {
-        penalty = penalty.saturating_add(policy.dependency_update.manifest_penalty);
+        let manifest_bonus = manifests
+            .iter()
+            .map(|(_, ecosystem, _)| {
+                ecosystem_penalty_config(policy, *ecosystem).manifest_bonus_penalty
+            })
+            .max()
+            .unwrap_or(0);
+        let generated_factor = manifests
+            .iter()
+            .map(|(_, _, factor)| *factor)
+            .max()
+            .unwrap_or(100);
+        let manifest_penalty = scale_penalty(
+            policy
+                .dependency_update
+                .manifest_penalty
+                .saturating_add(manifest_bonus),
+            generated_factor,
+        );
+        penalty = penalty.saturating_add(manifest_penalty);
         findings.push(Finding {
             id: "DU-001".to_string(),
             rule_id: "DU-001".to_string(),
@@ -427,18 +592,20 @@ fn evaluate_dependency_update(
             check: CheckId::DependencyUpdate,
             title: "Dependency manifest updated".to_string(),
             message: format!(
-                "Dependency manifest changed: {}",
+                "Dependency manifest changed (ecosystem bonus +{}, generated_factor {}%): {}",
+                manifest_bonus,
+                generated_factor,
                 manifests
                     .iter()
                     .take(4)
-                    .cloned()
+                    .map(|(path, _, _)| path.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
             severity: Severity::Medium,
-            penalty: policy.dependency_update.manifest_penalty,
+            penalty: manifest_penalty,
             location: Some(Location {
-                file: manifests[0].clone(),
+                file: manifests[0].0.clone(),
                 line: None,
             }),
             tags: vec!["dependencies".to_string(), "manifest".to_string()],
@@ -446,7 +613,26 @@ fn evaluate_dependency_update(
     }
 
     if !lockfiles.is_empty() {
-        penalty = penalty.saturating_add(policy.dependency_update.lockfile_penalty);
+        let lockfile_bonus = lockfiles
+            .iter()
+            .map(|(_, ecosystem, _)| {
+                ecosystem_penalty_config(policy, *ecosystem).lockfile_bonus_penalty
+            })
+            .max()
+            .unwrap_or(0);
+        let generated_factor = lockfiles
+            .iter()
+            .map(|(_, _, factor)| *factor)
+            .max()
+            .unwrap_or(100);
+        let lockfile_penalty = scale_penalty(
+            policy
+                .dependency_update
+                .lockfile_penalty
+                .saturating_add(lockfile_bonus),
+            generated_factor,
+        );
+        penalty = penalty.saturating_add(lockfile_penalty);
         findings.push(Finding {
             id: "DU-002".to_string(),
             rule_id: "DU-002".to_string(),
@@ -457,18 +643,20 @@ fn evaluate_dependency_update(
             check: CheckId::DependencyUpdate,
             title: "Dependency lockfile updated".to_string(),
             message: format!(
-                "Dependency lockfile changed: {}",
+                "Dependency lockfile changed (ecosystem bonus +{}, generated_factor {}%): {}",
+                lockfile_bonus,
+                generated_factor,
                 lockfiles
                     .iter()
                     .take(4)
-                    .cloned()
+                    .map(|(file, _, _)| file.path.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
             severity: Severity::Low,
-            penalty: policy.dependency_update.lockfile_penalty,
+            penalty: lockfile_penalty,
             location: Some(Location {
-                file: lockfiles[0].clone(),
+                file: lockfiles[0].0.path.clone(),
                 line: None,
             }),
             tags: vec!["dependencies".to_string(), "lockfile".to_string()],
@@ -478,7 +666,26 @@ fn evaluate_dependency_update(
     if total_lockfile_churn >= policy.dependency_update.large_lockfile_churn
         && !lockfiles.is_empty()
     {
-        penalty = penalty.saturating_add(policy.dependency_update.large_lockfile_penalty);
+        let large_bonus = lockfiles
+            .iter()
+            .map(|(_, ecosystem, _)| {
+                ecosystem_penalty_config(policy, *ecosystem).large_lockfile_bonus_penalty
+            })
+            .max()
+            .unwrap_or(0);
+        let generated_factor = lockfiles
+            .iter()
+            .map(|(_, _, factor)| *factor)
+            .max()
+            .unwrap_or(100);
+        let large_lockfile_penalty = scale_penalty(
+            policy
+                .dependency_update
+                .large_lockfile_penalty
+                .saturating_add(large_bonus),
+            generated_factor,
+        );
+        penalty = penalty.saturating_add(large_lockfile_penalty);
         findings.push(Finding {
             id: "DU-003".to_string(),
             rule_id: "DU-003".to_string(),
@@ -493,13 +700,84 @@ fn evaluate_dependency_update(
                 total_lockfile_churn
             ),
             severity: Severity::High,
-            penalty: policy.dependency_update.large_lockfile_penalty,
+            penalty: large_lockfile_penalty,
             location: Some(Location {
-                file: lockfiles[0].clone(),
+                file: lockfiles[0].0.path.clone(),
                 line: None,
             }),
             tags: vec!["dependencies".to_string(), "large-churn".to_string()],
         });
+    }
+
+    for (lockfile, _ecosystem, generated_factor) in &lockfiles {
+        if matches!(lockfile.status, ChangeStatus::Added | ChangeStatus::Deleted) {
+            let add_remove_penalty = scale_penalty(
+                policy.dependency_update.lockfile_added_or_removed_penalty,
+                *generated_factor,
+            );
+            penalty = penalty.saturating_add(add_remove_penalty);
+            findings.push(Finding {
+                id: "DU-004".to_string(),
+                rule_id: "DU-004".to_string(),
+                category: "dependency".to_string(),
+                docs_url:
+                    "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                        .to_string(),
+                check: CheckId::DependencyUpdate,
+                title: "Lockfile was added or removed".to_string(),
+                message: format!(
+                    "{} was {:?}. Validate resolver/source integrity.",
+                    lockfile.path, lockfile.status
+                ),
+                severity: Severity::Critical,
+                penalty: add_remove_penalty,
+                location: Some(Location {
+                    file: lockfile.path.clone(),
+                    line: None,
+                }),
+                tags: vec![
+                    "dependencies".to_string(),
+                    "lockfile-change-type".to_string(),
+                    "added-removed".to_string(),
+                ],
+            });
+        }
+        let churn = lockfile.added.saturating_add(lockfile.deleted);
+        if lockfile.added > 0
+            && lockfile.deleted > 0
+            && churn >= policy.dependency_update.lockfile_mass_update_lines
+        {
+            let mass_update_penalty = scale_penalty(
+                policy.dependency_update.lockfile_mass_update_penalty,
+                *generated_factor,
+            );
+            penalty = penalty.saturating_add(mass_update_penalty);
+            findings.push(Finding {
+                id: "DU-005".to_string(),
+                rule_id: "DU-005".to_string(),
+                category: "dependency".to_string(),
+                docs_url:
+                    "https://github.com/mt4110/patchgate/blob/main/docs/01_concepts.md#core-concepts"
+                        .to_string(),
+                check: CheckId::DependencyUpdate,
+                title: "Lockfile mass update detected".to_string(),
+                message: format!(
+                    "{} changed by {} lines ({} additions / {} deletions).",
+                    lockfile.path, churn, lockfile.added, lockfile.deleted
+                ),
+                severity: Severity::High,
+                penalty: mass_update_penalty,
+                location: Some(Location {
+                    file: lockfile.path.clone(),
+                    line: None,
+                }),
+                tags: vec![
+                    "dependencies".to_string(),
+                    "lockfile-change-type".to_string(),
+                    "mass-update".to_string(),
+                ],
+            });
+        }
     }
 
     let penalty = penalty.min(max_penalty);
@@ -515,19 +793,88 @@ fn evaluate_dependency_update(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyEcosystem {
+    Cargo,
+    Npm,
+    Python,
+    Go,
+    Jvm,
+    Unknown,
+}
+
+fn dependency_ecosystem_for_manifest(path: &str) -> DependencyEcosystem {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("cargo.toml") {
+        DependencyEcosystem::Cargo
+    } else if lower.ends_with("package.json") {
+        DependencyEcosystem::Npm
+    } else if lower.ends_with("requirements.txt")
+        || lower.ends_with("requirements-dev.txt")
+        || lower.ends_with("pyproject.toml")
+        || lower.ends_with("pipfile")
+    {
+        DependencyEcosystem::Python
+    } else if lower.ends_with("go.mod") {
+        DependencyEcosystem::Go
+    } else if lower.ends_with("pom.xml")
+        || lower.ends_with("build.gradle")
+        || lower.ends_with("build.gradle.kts")
+    {
+        DependencyEcosystem::Jvm
+    } else {
+        DependencyEcosystem::Unknown
+    }
+}
+
+fn dependency_ecosystem_for_lockfile(path: &str) -> DependencyEcosystem {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("cargo.lock") {
+        DependencyEcosystem::Cargo
+    } else if lower.ends_with("package-lock.json")
+        || lower.ends_with("yarn.lock")
+        || lower.ends_with("pnpm-lock.yaml")
+    {
+        DependencyEcosystem::Npm
+    } else if lower.ends_with("poetry.lock")
+        || lower.ends_with("pipfile.lock")
+        || lower.ends_with("requirements.lock")
+    {
+        DependencyEcosystem::Python
+    } else if lower.ends_with("go.sum") {
+        DependencyEcosystem::Go
+    } else {
+        DependencyEcosystem::Unknown
+    }
+}
+
+fn ecosystem_penalty_config(
+    policy: &Config,
+    ecosystem: DependencyEcosystem,
+) -> patchgate_config::DependencyEcosystemPenalty {
+    match ecosystem {
+        DependencyEcosystem::Cargo => policy.dependency_update.ecosystem_penalties.cargo,
+        DependencyEcosystem::Npm => policy.dependency_update.ecosystem_penalties.npm,
+        DependencyEcosystem::Python => policy.dependency_update.ecosystem_penalties.python,
+        DependencyEcosystem::Go => policy.dependency_update.ecosystem_penalties.go,
+        DependencyEcosystem::Jvm => policy.dependency_update.ecosystem_penalties.jvm,
+        DependencyEcosystem::Unknown => patchgate_config::DependencyEcosystemPenalty {
+            manifest_bonus_penalty: 0,
+            lockfile_bonus_penalty: 0,
+            large_lockfile_bonus_penalty: 0,
+        },
+    }
+}
+
 fn collect_diff(ctx: &Context) -> Result<DiffData> {
-    let name_status_args = diff_args(ctx.scope, "--name-status");
-    let name_status = run_git(&ctx.repo_root, &name_status_args)
-        .with_context(|| format!("git {:?} failed", name_status_args))?;
+    let args = diff_args(ctx.scope);
+    let output =
+        run_git(&ctx.repo_root, &args).with_context(|| format!("git {:?} failed", args))?;
 
-    let patch_args = diff_args(ctx.scope, "--unified=0");
-    let patch = run_git(&ctx.repo_root, &patch_args)
-        .with_context(|| format!("git {:?} failed", patch_args))?;
+    let mut files = parse_raw_status(&output);
+    apply_patch_stats(&mut files, &output);
 
-    let mut files = parse_name_status(&name_status);
-    apply_patch_stats(&mut files, &patch);
-
-    let fingerprint = format!("{:x}", Sha256::digest(patch.as_bytes()));
+    let fingerprint = format!("{:x}", Sha256::digest(output.as_bytes()));
 
     Ok(DiffData {
         files: files.into_values().collect(),
@@ -535,27 +882,30 @@ fn collect_diff(ctx: &Context) -> Result<DiffData> {
     })
 }
 
-fn diff_args(scope: ScopeMode, terminal_flag: &str) -> Vec<String> {
+fn diff_args(scope: ScopeMode) -> Vec<String> {
     match scope {
         ScopeMode::Staged => vec![
             "diff".to_string(),
             "--cached".to_string(),
             "--find-renames".to_string(),
             "--no-color".to_string(),
-            terminal_flag.to_string(),
+            "--patch-with-raw".to_string(),
+            "--unified=0".to_string(),
         ],
         ScopeMode::Worktree => vec![
             "diff".to_string(),
             "--find-renames".to_string(),
             "--no-color".to_string(),
-            terminal_flag.to_string(),
+            "--patch-with-raw".to_string(),
+            "--unified=0".to_string(),
         ],
         ScopeMode::Repo => vec![
             "diff".to_string(),
             "HEAD".to_string(),
             "--find-renames".to_string(),
             "--no-color".to_string(),
-            terminal_flag.to_string(),
+            "--patch-with-raw".to_string(),
+            "--unified=0".to_string(),
         ],
     }
 }
@@ -574,6 +924,53 @@ fn run_git(repo_root: &PathBuf, args: &[String]) -> Result<String> {
     String::from_utf8(output.stdout).context("git output was not utf8")
 }
 
+fn parse_raw_status(input: &str) -> BTreeMap<String, ChangedFile> {
+    let mut files = BTreeMap::new();
+
+    for line in input.lines() {
+        if !line.starts_with(':') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let Some(prefix) = parts.next() else {
+            continue;
+        };
+        let Some(first_path) = parts.next() else {
+            continue;
+        };
+        let second_path = parts.next();
+
+        let status_token = prefix.split_whitespace().last().unwrap_or_default();
+        let status = parse_status(status_token);
+
+        let (old_path, path) = match status {
+            ChangeStatus::Renamed | ChangeStatus::Copied => {
+                let Some(new_path) = second_path else {
+                    continue;
+                };
+                (Some(first_path.to_string()), new_path.to_string())
+            }
+            _ => (None, first_path.to_string()),
+        };
+
+        files.insert(
+            path.clone(),
+            ChangedFile {
+                path,
+                status,
+                old_path,
+                added: 0,
+                deleted: 0,
+                added_lines: Vec::new(),
+                removed_lines: Vec::new(),
+            },
+        );
+    }
+
+    files
+}
+
+#[cfg(test)]
 fn parse_name_status(input: &str) -> BTreeMap<String, ChangedFile> {
     let mut files = BTreeMap::new();
 
@@ -680,16 +1077,28 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
 
         if let Some(stripped) = line.strip_prefix('+') {
             file.added = file.added.saturating_add(1);
-            if file.added_lines.len() < 200 {
-                file.added_lines.push(stripped.to_string());
+            if file.added_lines.len() < MAX_STORED_LINE_SAMPLES {
+                file.added_lines.push(truncate_line_sample(stripped));
             }
         } else if let Some(stripped) = line.strip_prefix('-') {
             file.deleted = file.deleted.saturating_add(1);
-            if file.removed_lines.len() < 200 {
-                file.removed_lines.push(stripped.to_string());
+            if file.removed_lines.len() < MAX_STORED_LINE_SAMPLES {
+                file.removed_lines.push(truncate_line_sample(stripped));
             }
         }
     }
+}
+
+fn truncate_line_sample(line: &str) -> String {
+    if line.chars().count() <= MAX_STORED_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut trimmed = String::new();
+    for ch in line.chars().take(MAX_STORED_LINE_CHARS) {
+        trimmed.push(ch);
+    }
+    trimmed.push_str("...");
+    trimmed
 }
 
 fn parse_patch_file_header_path(line: &str, prefix: &str) -> Option<String> {
@@ -700,6 +1109,154 @@ fn parse_patch_file_header_path(line: &str, prefix: &str) -> Option<String> {
         .unwrap_or(rest)
         .to_string();
     Some(path)
+}
+
+fn is_metadata_only_change(file: &ChangedFile) -> bool {
+    file.added == 0 && file.deleted == 0
+}
+
+fn generated_penalty_factor(policy: &Config, generated_set: &GlobSet, path: &str) -> u8 {
+    if !generated_set.is_match(path) {
+        return 100;
+    }
+    match policy.generated_code.mode.as_str() {
+        "exclude" => 0,
+        "decay" => 100u8.saturating_sub(policy.generated_code.penalty_decay_percent),
+        _ => 100,
+    }
+}
+
+fn scale_penalty(base: u8, factor_percent: u8) -> u8 {
+    if base == 0 || factor_percent == 0 {
+        return 0;
+    }
+    if factor_percent >= 100 {
+        return base;
+    }
+    let scaled = ((base as u16) * (factor_percent as u16)).div_ceil(100);
+    scaled.max(1).min(u8::MAX as u16) as u8
+}
+
+fn scale_u32_by_factor(base: u32, factor_percent: u8) -> u32 {
+    if base == 0 || factor_percent == 0 {
+        return 0;
+    }
+    if factor_percent >= 100 {
+        return base;
+    }
+    ((base as u64) * (factor_percent as u64)).div_ceil(100) as u32
+}
+
+fn is_test_related_file(policy: &Config, file: &ChangedFile, test_set: &GlobSet) -> bool {
+    if test_set.is_match(&file.path) {
+        return true;
+    }
+    let path = file.path.to_ascii_lowercase();
+
+    if policy.language_rules.rust
+        && path.ends_with(".rs")
+        && (path.starts_with("tests/")
+            || path.contains("/tests/")
+            || path.ends_with("_test.rs")
+            || has_any_token(
+                &file.added_lines,
+                &["#[cfg(test)]", "mod tests", "#[test]", "#[tokio::test]"],
+            )
+            || has_any_token(
+                &file.removed_lines,
+                &["#[cfg(test)]", "mod tests", "#[test]", "#[tokio::test]"],
+            ))
+    {
+        return true;
+    }
+
+    if policy.language_rules.typescript
+        && (path.contains("/__tests__/")
+            || path.starts_with("__tests__/")
+            || path.ends_with(".test.ts")
+            || path.ends_with(".test.tsx")
+            || path.ends_with(".spec.ts")
+            || path.ends_with(".spec.tsx")
+            || path.ends_with(".test.js")
+            || path.ends_with(".spec.js")
+            || path.ends_with("vitest.config.ts")
+            || path.ends_with("vitest.config.js")
+            || path.ends_with("jest.config.ts")
+            || path.ends_with("jest.config.js"))
+    {
+        return true;
+    }
+
+    if policy.language_rules.python {
+        let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+        if path.starts_with("tests/")
+            || path.contains("/tests/")
+            || file_name.starts_with("test_")
+            || file_name.ends_with("_test.py")
+            || file_name == "conftest.py"
+        {
+            return true;
+        }
+    }
+
+    if policy.language_rules.go && path.ends_with("_test.go") {
+        return true;
+    }
+
+    if policy.language_rules.java_kotlin
+        && (path.contains("/src/test/java/")
+            || path.contains("/src/test/kotlin/")
+            || path.ends_with("test.java")
+            || path.ends_with("test.kt")
+            || path.ends_with("it.java")
+            || path.ends_with("it.kt"))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn has_any_token(lines: &[String], tokens: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| tokens.iter().any(|needle| line.contains(needle)))
+}
+
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn infer_package_root(path: &str, package_markers: &[String]) -> String {
+    let mut markers: Vec<&String> = package_markers
+        .iter()
+        .filter(|m| m.as_str() != ".")
+        .collect();
+    markers.sort_by_key(|m| std::cmp::Reverse(m.len()));
+    for marker in markers {
+        if path == marker.as_str() || path.starts_with(&format!("{}/", marker)) {
+            return marker.clone();
+        }
+    }
+    let mut parts = path.split('/');
+    let first = parts.next().unwrap_or(".");
+    let second = parts.next();
+    if matches!(
+        first,
+        "src" | "tests" | "test" | "docs" | ".github" | "infra"
+    ) {
+        return ".".to_string();
+    }
+    if matches!(
+        first,
+        "packages" | "apps" | "services" | "modules" | "libs" | "crates"
+    ) && second.is_some()
+    {
+        return format!("{}/{}", first, second.unwrap_or_default());
+    }
+    first.to_string()
 }
 
 fn compile_globs(patterns: &[String]) -> Result<GlobSet> {
@@ -774,7 +1331,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_test_gap(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
         assert!(eval.score.triggered);
         assert!(
             eval.findings.iter().any(|f| f.id == "TG-001"),
@@ -810,7 +1369,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_test_gap(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
         assert!(
             !eval.findings.iter().any(|f| f.id == "TG-001"),
             "missing test finding should not be reported"
@@ -834,7 +1395,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_test_gap(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
         assert_eq!(eval.score.penalty, 0);
         assert!(
             eval.findings.is_empty(),
@@ -870,11 +1433,38 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_test_gap(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
         assert!(
             eval.findings.iter().any(|f| f.id == "TG-001"),
             "metadata-only test rename must not suppress missing test finding"
         );
+    }
+
+    #[test]
+    fn test_gap_ignores_generated_file_when_generated_mode_is_exclude() {
+        let mut policy = Config::default();
+        policy.generated_code.mode = "exclude".to_string();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated globs");
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/generated/client.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 120,
+                deleted: 20,
+                added_lines: vec!["new".to_string()],
+                removed_lines: vec!["old".to_string()],
+            }],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
+        assert_eq!(eval.score.penalty, 0);
+        assert!(eval.findings.is_empty());
     }
 
     #[test]
@@ -894,7 +1484,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set, &generated_set)
+            .expect("evaluate");
         assert_eq!(eval.score.penalty, policy.dangerous_change.per_file_penalty);
         let finding = eval.findings.first().expect("finding");
         assert_eq!(finding.id, "DC-001");
@@ -922,7 +1514,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval = evaluate_dangerous_change(&policy, &diff, &exclude_set, &generated_set)
+            .expect("evaluate");
         assert_eq!(
             eval.score.penalty,
             policy.dangerous_change.per_file_penalty
@@ -965,7 +1559,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set, &generated_set)
+            .expect("evaluate");
         assert!(eval.findings.iter().any(|f| f.id == "DU-001"));
         assert!(eval.findings.iter().any(|f| f.id == "DU-002"));
         assert!(eval.score.penalty >= policy.dependency_update.manifest_penalty);
@@ -1000,7 +1596,9 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set).expect("evaluate");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let eval = evaluate_dependency_update(&policy, &diff, &exclude_set, &generated_set)
+            .expect("evaluate");
         assert_eq!(eval.score.penalty, 0);
         assert!(eval.findings.is_empty());
     }
