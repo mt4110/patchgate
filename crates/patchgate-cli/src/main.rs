@@ -892,13 +892,16 @@ fn resolve_publish_request(input: PublishRequestInput) -> Result<PublishRequest>
         )?,
     };
 
-    let head_sha = match github_sha {
-        Some(sha) => sha,
-        None => detect_head_sha_from_env()?
-            .or_else(|| std::env::var("GITHUB_SHA").ok())
-            .context(
-                "head SHA was not provided (use --github-sha, pull_request.head.sha, or GITHUB_SHA)",
-            )?,
+    let detected_head_sha = match github_sha {
+        Some(sha) => Some(sha),
+        None => detect_head_sha_from_env()?.or_else(|| std::env::var("GITHUB_SHA").ok()),
+    };
+    let head_sha = if publish_check_run {
+        detected_head_sha.context(
+            "head SHA was not provided (use --github-sha, pull_request.head.sha, or GITHUB_SHA)",
+        )?
+    } else {
+        detected_head_sha.unwrap_or_default()
     };
 
     let auth_mode = GitHubAuthMode::parse(github_auth.as_deref())
@@ -1981,6 +1984,43 @@ mod tests {
             PublishAuth::Token { token } => assert_eq!(token, "<dry-run-token>"),
             _ => panic!("expected token auth"),
         }
+    }
+
+    #[test]
+    fn resolve_publish_request_allows_comment_only_without_head_sha() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_EVENT_PATH",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_REF", "refs/pull/7/merge");
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::remove_var("GITHUB_SHA");
+        env::set_var("GITHUB_TOKEN", "env-token");
+
+        let req = resolve_publish_request(PublishRequestInput {
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            retry_policy: RetryPolicy::default(),
+            github_dry_run: false,
+            publish_comment: true,
+            publish_check_run: false,
+            apply_priority_label: false,
+            suppressed_comment_reason: None,
+        })
+        .expect("comment-only publish should not require head sha");
+
+        assert_eq!(req.head_sha, "");
+        assert!(!req.publish_check_run);
     }
 
     #[test]

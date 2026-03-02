@@ -425,13 +425,14 @@ fn upsert_check_run(
     )?;
 
     if let Some(run) = existing.check_runs.iter().max_by_key(|r| r.id) {
+        let update_payload = check_run_update_payload(payload);
         let updated: std::result::Result<CheckRunItem, PublishOpError> = send_json(
             client
                 .patch(format!(
                     "{}/repos/{}/check-runs/{}",
                     req.api_base_url, req.repo, run.id
                 ))
-                .json(payload),
+                .json(&update_payload),
             "update check run",
         );
         match updated {
@@ -455,6 +456,14 @@ fn upsert_check_run(
     )?;
 
     Ok(created.html_url)
+}
+
+fn check_run_update_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut update_payload = payload.clone();
+    if let Some(obj) = update_payload.as_object_mut() {
+        obj.remove("head_sha");
+    }
+    update_payload
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,7 +730,7 @@ mod tests {
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, ReviewPriority};
 
     use super::{
-        backoff_delay_ms, check_run_conclusion, ensure_comment_marker,
+        backoff_delay_ms, check_run_conclusion, check_run_update_payload, ensure_comment_marker,
         is_check_run_update_fallback_candidate, is_comment_update_fallback_candidate,
         is_same_comment_content, merge_priority_label_names, priority_label_name, with_retry,
         LabelItem, PublishOpError, RetryPolicy, MARKER,
@@ -927,5 +936,24 @@ mod tests {
 
         let conflict = PublishOpError::new("conflict", false, false).with_status_code(409);
         assert!(!is_comment_update_fallback_candidate(&conflict));
+    }
+
+    #[test]
+    fn check_run_update_payload_omits_head_sha() {
+        let create_payload = serde_json::json!({
+            "name": "patchgate",
+            "head_sha": "abc123",
+            "status": "completed",
+            "conclusion": "neutral",
+        });
+
+        let update_payload = check_run_update_payload(&create_payload);
+        assert!(update_payload.get("head_sha").is_none());
+        assert_eq!(
+            update_payload
+                .get("name")
+                .and_then(serde_json::Value::as_str),
+            Some("patchgate")
+        );
     }
 }
