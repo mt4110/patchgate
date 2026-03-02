@@ -9,15 +9,17 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase11-20](08_pr_plan_phase11_20.md)
 - [PR Plan: Phase21-30](../phase21_30.md)
 - [PR Plan: Phase31-40](../phase31_40.md)
+- [PR Plan: Phase41-50](../phase41_50.md)
+- [PR Plan: Phase51-60](../phase51_60.md)
 - [PR Execution Checklist Template](09_pr_execution_checklist.md)
 
 ## Active planning horizon
 
-- Completed design: Phase1-20
-- New design scope in this update: Phase21-40
+- Completed design: Phase1-40
+- New design scope in this update: Phase41-60
 - Next execution unit:
-  - Phase21-30: policy compatibility and migration
-  - Phase31-40: production-grade GitHub integration
+  - Phase41-50: performance and scale hardening
+  - Phase51-60: language-aware detection quality
 
 ## v0.3.0 (MVP)
 - Diff-based quality gate with 3 checks
@@ -60,6 +62,26 @@ This roadmap tracks the patchgate pivot.
 - Auth abstraction supports `token|app` mode
 - Optional review-priority label integration and comment suppression rules
 - Dry-run payload generation is available via CLI and workflow
+
+## v0.3.5 (Phase41-50 target)
+- Large-diff performance and memory reduction
+- Profiling/benchmark workflow for scale scenarios
+- CI performance regression gate with baseline comparison
+
+### Phase41-50 design notes
+- Diff collection and check execution cost are optimized with deterministic outputs
+- Performance metrics (including P95 SLO) become release criteria
+- Cross-platform performance drift is explicitly tracked in CI
+
+## v0.3.6 (Phase51-60 target)
+- Language-aware test-gap detection for major ecosystems
+- Ecosystem-specific dependency risk/severity expansion
+- Monorepo and generated-code handling policy
+
+### Phase51-60 design notes
+- Rule behavior remains schema-compatible while language precision improves
+- False positive reduction is tracked per language and package boundary
+- Enablement strategy (default/opt-in) is standardized for safe rollout
 
 ## v0.4.0
 - Historical trend API (metadata only)
