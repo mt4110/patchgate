@@ -223,7 +223,7 @@ fn evaluate_test_gap(
         .collect();
     package_markers.sort_by_key(|marker| std::cmp::Reverse(marker.len()));
 
-    let mut tests_by_package: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tests_by_package: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut production_files_by_package: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut production_churn_by_package: BTreeMap<String, u32> = BTreeMap::new();
 
@@ -244,7 +244,10 @@ fn evaluate_test_gap(
         }
         if is_test_related_file(policy, file, &test_set) {
             let package = infer_package_root(&file.path, &package_markers);
-            *tests_by_package.entry(package).or_insert(0) += 1;
+            tests_by_package
+                .entry(package)
+                .or_default()
+                .insert(file.path.clone());
             continue;
         }
         if ignore_set.is_match(&file.path)
@@ -271,19 +274,20 @@ fn evaluate_test_gap(
     let mut findings = Vec::new();
     let mut penalty = 0u8;
 
-    let global_test_updates = tests_by_package.get(".").copied().unwrap_or_default();
+    let global_test_files = tests_by_package.get(".").cloned().unwrap_or_default();
+    let empty_test_files = BTreeSet::new();
     let mut uncovered_packages = Vec::new();
     let mut uncovered_files = Vec::new();
     let mut under_tested_packages = Vec::new();
     let mut under_tested_files = Vec::new();
     let mut under_tested_churn = 0u32;
-    let mut under_tested_matching_tests = 0usize;
+    let mut under_tested_matching_test_files = BTreeSet::new();
     for (package, files) in &production_files_by_package {
-        let package_test_updates = tests_by_package.get(package).copied().unwrap_or_default();
+        let package_test_files = tests_by_package.get(package).unwrap_or(&empty_test_files);
         let matching_test_updates = if package == "." {
-            package_test_updates
+            package_test_files.len()
         } else {
-            package_test_updates.saturating_add(global_test_updates)
+            package_test_files.union(&global_test_files).count()
         };
         if matching_test_updates == 0 {
             uncovered_packages.push(package.clone());
@@ -298,8 +302,10 @@ fn evaluate_test_gap(
                     .copied()
                     .unwrap_or_default(),
             );
-            under_tested_matching_tests =
-                under_tested_matching_tests.saturating_add(matching_test_updates);
+            under_tested_matching_test_files.extend(package_test_files.iter().cloned());
+            if package != "." {
+                under_tested_matching_test_files.extend(global_test_files.iter().cloned());
+            }
         }
     }
 
@@ -362,7 +368,7 @@ fn evaluate_test_gap(
             message: format!(
                 "Changed {} lines across under-tested production files with only {} matching test file(s) updated. Under-tested packages: {}",
                 under_tested_churn,
-                under_tested_matching_tests,
+                under_tested_matching_test_files.len(),
                 under_tested_packages
                     .iter()
                     .take(4)
@@ -1621,6 +1627,59 @@ mod tests {
         assert!(
             eval.findings.iter().any(|f| f.id == "TG-002"),
             "TG-002 should fire for large changes with only one matching test file"
+        );
+    }
+
+    #[test]
+    fn test_gap_tg002_message_uses_unique_matching_test_file_count() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "packages/a/src/service.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 120,
+                    deleted: 10,
+                    added_lines: vec!["line".to_string()],
+                    removed_lines: vec!["line".to_string()],
+                },
+                ChangedFile {
+                    path: "packages/b/src/service.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 120,
+                    deleted: 10,
+                    added_lines: vec!["line".to_string()],
+                    removed_lines: vec!["line".to_string()],
+                },
+                ChangedFile {
+                    path: "tests/global_test.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 2,
+                    deleted: 0,
+                    added_lines: vec!["assert".to_string()],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
+        let finding = eval
+            .findings
+            .iter()
+            .find(|f| f.id == "TG-002")
+            .expect("TG-002 finding");
+        assert!(
+            finding
+                .message
+                .contains("only 1 matching test file(s) updated"),
+            "global test file should not be counted once per under-tested package"
         );
     }
 
