@@ -28,7 +28,10 @@ Core options:
 - `--scope <staged|worktree|repo>`
 - `--mode <warn|enforce>`
 - `--threshold <0..=100>`
+- `--max-changed-files <u32>`
+- `--on-exceed <fail_open|fail_closed>`
 - `--no-cache`
+- `--profile-output <path>`
 
 GitHub publish options:
 
@@ -60,8 +63,15 @@ Policy load order:
 Cache behavior:
 
 - `cache.enabled=true` かつ `--no-cache` 未指定時に SQLite cache を使用
+- cache connection は scan 中に再利用され、read/write I/O 往復を削減
 - cache DB 破損を検知した場合は、同一ディレクトリ内で `cache.db` を `cache.db.corrupt-<millis>-<pid>` にリネームして退避し、DBを再初期化
 - 復旧に失敗した場合も scan 本体は継続（cacheなしの劣化運転）
+
+Changed file limit behavior:
+
+- `scope.max_changed_files` を超過した場合:
+  - `fail_open`: warning を出し、評価をスキップして score `100` を返す
+  - `fail_closed`: runtime error (exit code `4`) で終了
 
 ### `patchgate policy lint`
 policy を読み込み、型/範囲/依存関係と version 互換性を検査します。
@@ -149,6 +159,8 @@ Options:
 - `fingerprint` (required): diff fingerprint
 - `duration_ms` (required): 評価時間
 - `skipped_by_cache` (required): cache hit時 `true`
+- `changed_files` (required): 評価対象の変更ファイル数
+- `check_durations_ms` (required): check別処理時間（ms）
 
 `finding` 要素:
 

@@ -8,6 +8,8 @@ fail_threshold = 70       # 0..=100, score below this fails in enforce mode
 
 [scope]
 mode = "staged"          # staged | worktree | repo
+max_changed_files = 10000 # large-diff guardrail
+on_exceed = "fail_open"   # fail_open | fail_closed
 
 [cache]
 enabled = true
@@ -17,8 +19,24 @@ db_path = ".patchgate/cache.db"
 # Skip generated files or vendored code
 globs = [
   "vendor/**",
-  "**/generated/**",
 ]
+
+[generated_code]
+mode = "exclude" # exclude | decay
+globs = [
+  "**/generated/**",
+  "**/*.pb.go",
+  "**/*_generated.*",
+  "**/gen/**",
+]
+penalty_decay_percent = 70
+
+[language_rules]
+rust = true
+typescript = true
+python = true
+go = true
+java_kotlin = false # opt-in
 
 [weights]
 test_gap_max_penalty = 35
@@ -103,3 +121,31 @@ manifest_penalty = 18
 lockfile_penalty = 8
 large_lockfile_churn = 200
 large_lockfile_penalty = 10
+lockfile_added_or_removed_penalty = 6
+lockfile_mass_update_lines = 800
+lockfile_mass_update_penalty = 6
+
+[dependency_update.ecosystem_penalties.cargo]
+manifest_bonus_penalty = 3
+lockfile_bonus_penalty = 2
+large_lockfile_bonus_penalty = 2
+
+[dependency_update.ecosystem_penalties.npm]
+manifest_bonus_penalty = 3
+lockfile_bonus_penalty = 2
+large_lockfile_bonus_penalty = 3
+
+[dependency_update.ecosystem_penalties.python]
+manifest_bonus_penalty = 2
+lockfile_bonus_penalty = 1
+large_lockfile_bonus_penalty = 2
+
+[dependency_update.ecosystem_penalties.go]
+manifest_bonus_penalty = 2
+lockfile_bonus_penalty = 2
+large_lockfile_bonus_penalty = 1
+
+[dependency_update.ecosystem_penalties.jvm]
+manifest_bonus_penalty = 2
+lockfile_bonus_penalty = 0
+large_lockfile_bonus_penalty = 0

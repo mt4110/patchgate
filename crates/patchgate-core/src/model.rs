@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,6 +110,10 @@ pub struct Report {
     pub fingerprint: String,
     pub duration_ms: u128,
     pub skipped_by_cache: bool,
+    #[serde(default)]
+    pub changed_files: usize,
+    #[serde(default)]
+    pub check_durations_ms: BTreeMap<String, u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +146,8 @@ impl Report {
             fingerprint: meta.fingerprint,
             duration_ms: meta.duration_ms,
             skipped_by_cache: meta.skipped_by_cache,
+            changed_files: 0,
+            check_durations_ms: BTreeMap::new(),
         }
     }
 }
