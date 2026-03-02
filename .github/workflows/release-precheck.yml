@@ -1,0 +1,33 @@
+name: Release Precheck
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+
+      - name: Ensure macOS metadata files are not tracked
+        run: |
+          if git ls-files '._*' '**/._*' | grep .; then
+            echo "Found forbidden macOS metadata files in git index."
+            exit 1
+          fi
+
+      - name: Run fmt/lint/test
+        run: nix develop --command just ci-check
+
+      - name: Run patchgate doctor
+        run: nix develop --command cargo run -p patchgate-cli -- doctor
+
+      - name: Benchmark baseline compare
+        run: |
+          nix develop --command cargo run -p xtask -- bench compare \
+            --case ci-worktree \
+            --output config/benchmarks/ci-worktree-baseline.jsonl \
+            --require-baseline

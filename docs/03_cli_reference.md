@@ -7,6 +7,13 @@
 ### `patchgate doctor`
 環境情報と設定ファイル探索結果を表示します。
 
+診断項目:
+
+- `repo_root` / `config_path` / Rust version
+- `git`: repository判定、HEAD、dirty file数
+- `config`: 設定読込とバリデーション結果
+- `cache`: DB存在確認と読み取り診断（副作用なし）
+
 ### `patchgate scan`
 PR差分に対して品質ゲートを実行します。
 
@@ -25,12 +32,32 @@ Options:
 - `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
 - `--github-check-name <name>`
 
+Cache behavior:
+
+- `cache.enabled=true` かつ `--no-cache` 未指定時に SQLite cache を使用
+- cache DB 破損を検知した場合は、同一ディレクトリ内で `cache.db` を `cache.db.corrupt-<millis>-<pid>` にリネームして退避し、DBを再初期化
+- 復旧に失敗した場合も scan 本体は継続（cacheなしの劣化運転）
+
 ## GitHub publish
 
 `--github-publish` で以下を実行します。
 
 - PRコメントを upsert (`<!-- patchgate:report -->` マーカー)
 - Check Run を作成
+
+### 部分成功時の挙動
+
+- comment成功 / check失敗、またはその逆は「部分成功」として処理継続
+- comment と check の両方 API 呼び出しが失敗した場合は publish エラー（exit code `6`）
+- publish入力解決（例: `GITHUB_REPOSITORY` 不足）で失敗した場合も publish エラー（exit code `6`）
+- 部分成功時は標準エラー出力に失敗理由を個別表示
+
+### 入力解決の優先順
+
+- `repo`: `--github-repo` > `GITHUB_REPOSITORY`
+- `pr_number`: `--github-pr` > `GITHUB_EVENT_PATH` payload (`number`) > `GITHUB_REF`
+- `head_sha`: `--github-sha` > `GITHUB_EVENT_PATH` payload (`pull_request.head.sha`) > `GITHUB_SHA`
+- `token`: `--github-token-env`（未指定時 `GITHUB_TOKEN`）で環境変数を解決
 
 GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SHA` / `GITHUB_EVENT_PATH` から自動解決されます。
 
@@ -84,9 +111,13 @@ GitHub Actionsの `pull_request` では通常、`GITHUB_REPOSITORY` / `GITHUB_SH
 
 ### Compatibility policy (Phase1-20)
 
-- 既存キーの削除・改名・型変更は行わない
-- 新規キー追加は許可（追加時は defaults/optional を維持）
-- enum値追加は許可（既存値の意味は変更しない）
+- Additive:
+  - 新規キー追加は許可（既存キーの必須化はしない）
+  - enum値追加は許可（既存値の意味は不変）
+- Deprecation:
+  - 非推奨化は docs で明示し、最低2つのマイナーリリースは互換維持
+- Breaking:
+  - 既存キーの削除/改名/型変更、既存enum意味変更はメジャー更新時のみ許可
 
 ## Exit code
 

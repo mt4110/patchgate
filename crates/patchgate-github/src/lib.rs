@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use patchgate_core::Report;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -19,6 +19,8 @@ pub struct PublishRequest {
 pub struct PublishResult {
     pub comment_url: Option<String>,
     pub check_run_url: Option<String>,
+    pub comment_error: Option<String>,
+    pub check_run_error: Option<String>,
 }
 
 pub fn publish_report(
@@ -29,14 +31,28 @@ pub fn publish_report(
     let client = github_client(&req.token)?;
 
     let body = ensure_comment_marker(markdown);
-    let comment_url = upsert_pr_comment(&client, &req.repo, req.pr_number, &body)?;
+    let comment_result = upsert_pr_comment(&client, &req.repo, req.pr_number, &body);
+    let check_result = publish_check_run(&client, report, req, markdown);
 
-    let check_run_url = publish_check_run(&client, report, req, markdown)?;
+    let mut result = PublishResult::default();
+    match comment_result {
+        Ok(url) => result.comment_url = url,
+        Err(err) => result.comment_error = Some(format!("{:#}", err)),
+    }
+    match check_result {
+        Ok(url) => result.check_run_url = url,
+        Err(err) => result.check_run_error = Some(format!("{:#}", err)),
+    }
 
-    Ok(PublishResult {
-        comment_url,
-        check_run_url,
-    })
+    if result.comment_error.is_some() && result.check_run_error.is_some() {
+        return Err(anyhow!(
+            "failed to publish both PR comment and check-run: comment_error=`{}` check_error=`{}`",
+            result.comment_error.as_deref().unwrap_or("unknown"),
+            result.check_run_error.as_deref().unwrap_or("unknown")
+        ));
+    }
+
+    Ok(result)
 }
 
 fn github_client(token: &str) -> Result<Client> {

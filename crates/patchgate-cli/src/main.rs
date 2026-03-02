@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::Command as ProcessCommand;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use patchgate_github::{publish_report, PublishRequest};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -175,20 +176,7 @@ fn main() -> Result<()> {
     let repo_root = cli.repo.unwrap_or(std::env::current_dir()?);
 
     match cli.cmd {
-        Command::Doctor => {
-            let config_path = resolve_config_path(&repo_root, cli.config.as_deref());
-            println!("patchgate doctor");
-            println!("- repo_root: {}", repo_root.display());
-            println!(
-                "- config_path: {}",
-                config_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<default only>".to_string())
-            );
-            println!("- rust: {}", env!("CARGO_PKG_RUST_VERSION"));
-            Ok(())
-        }
+        Command::Doctor => run_doctor(&repo_root, cli.config.as_deref()),
         Command::Scan(scan) => {
             let code = match execute_scan(&repo_root, cli.config.as_deref(), *scan) {
                 Ok(code) => code,
@@ -200,6 +188,113 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
     }
+}
+
+fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
+    let config_path = resolve_config_path(repo_root, config_override);
+    println!("patchgate doctor");
+    println!("- repo_root: {}", repo_root.display());
+    println!(
+        "- config_path: {}",
+        config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<default only>".to_string())
+    );
+    println!("- rust: {}", env!("CARGO_PKG_RUST_VERSION"));
+
+    match diagnose_git(repo_root) {
+        Ok((head, dirty)) => {
+            println!("- git: ok (head: {}, dirty_files: {})", head, dirty);
+        }
+        Err(err) => {
+            println!("- git: error ({err})");
+        }
+    }
+
+    let effective_cfg = match load_config(config_path.as_deref()) {
+        Ok(cfg) => {
+            println!("- config: ok");
+            cfg
+        }
+        Err(err) => {
+            println!("- config: error ({err:#})");
+            println!("- cache: unknown (skipping cache diagnostics because config failed to load)");
+            return Ok(());
+        }
+    };
+
+    if !effective_cfg.cache.enabled {
+        println!("- cache: disabled (cache.enabled=false)");
+        return Ok(());
+    }
+
+    let db_full_path = repo_root.join(&effective_cfg.cache.db_path);
+    match diagnose_cache(repo_root, &effective_cfg.cache.db_path) {
+        Ok(CacheDoctorStatus::Ok) => println!("- cache: ok ({})", db_full_path.display()),
+        Ok(CacheDoctorStatus::Missing) => {
+            println!("- cache: missing ({})", db_full_path.display())
+        }
+        Err(err) => println!("- cache: error ({:#})", err),
+    }
+
+    Ok(())
+}
+
+fn diagnose_git(repo_root: &Path) -> Result<(String, usize)> {
+    let rev_parse = ProcessCommand::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to invoke git rev-parse")?;
+    if !rev_parse.status.success() {
+        return Err(anyhow!(
+            "not a git repository: {}",
+            String::from_utf8_lossy(&rev_parse.stderr).trim()
+        ));
+    }
+
+    let head = ProcessCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to resolve git HEAD")?;
+    let head_str = if head.status.success() {
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    } else {
+        "unborn".to_string()
+    };
+
+    let status = ProcessCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to read git status")?;
+    if !status.status.success() {
+        return Err(anyhow!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    let dirty = String::from_utf8_lossy(&status.stdout).lines().count();
+    Ok((head_str, dirty))
+}
+
+enum CacheDoctorStatus {
+    Ok,
+    Missing,
+}
+
+fn diagnose_cache(repo_root: &Path, db_path: &str) -> Result<CacheDoctorStatus> {
+    let db_full_path = repo_root.join(db_path);
+    if !db_full_path.exists() {
+        return Ok(CacheDoctorStatus::Missing);
+    }
+    let conn = Connection::open_with_flags(&db_full_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", db_full_path.display()))?;
+    conn.query_row("SELECT 1", [], |_row| Ok(()))
+        .context("cache db probe query failed")?;
+    Ok(CacheDoctorStatus::Ok)
 }
 
 fn execute_scan(
@@ -247,8 +342,25 @@ fn execute_scan(
             err.context("failed to collect git diff"),
         )
     })?;
+    let diff_fingerprint = diff.fingerprint.clone();
+    let mut diff_for_eval = Some(diff);
 
     let cache_enabled = cfg.cache.enabled && !no_cache;
+    let mut evaluate_report = || -> ScanResult<Report> {
+        let eval_diff = diff_for_eval.take().ok_or_else(|| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                anyhow!("internal error: diff already consumed before evaluation"),
+            )
+        })?;
+        runner.evaluate(&ctx, eval_diff, &opts.mode).map_err(|err| {
+            ScanError::new(
+                ScanErrorKind::Runtime,
+                err.context("failed to evaluate scan checks"),
+            )
+        })
+    };
+
     let report = if cache_enabled {
         let policy_hash = config_hash(&cfg).map_err(|err| {
             ScanError::new(
@@ -257,47 +369,41 @@ fn execute_scan(
             )
         })?;
 
-        if let Some(mut cached) = load_cache(
+        match load_cache(
             repo_root,
             &cfg.cache.db_path,
-            &diff.fingerprint,
+            &diff_fingerprint,
             &policy_hash,
             &opts.mode,
             opts.scope.as_str(),
-        )
-        .map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to read scan cache"),
-            )
-        })? {
-            cached.skipped_by_cache = true;
-            cached.duration_ms = run_start.elapsed().as_millis();
-            cached
-        } else {
-            let evaluated = runner.evaluate(&ctx, diff, &opts.mode).map_err(|err| {
-                ScanError::new(
-                    ScanErrorKind::Runtime,
-                    err.context("failed to evaluate scan checks"),
-                )
-            })?;
-            store_cache(repo_root, &cfg.cache.db_path, &evaluated, &policy_hash).map_err(
-                |err| {
-                    ScanError::new(
-                        ScanErrorKind::Runtime,
-                        err.context("failed to write scan cache"),
-                    )
-                },
-            )?;
-            evaluated
+        ) {
+            Ok(Some(mut cached)) => {
+                cached.skipped_by_cache = true;
+                cached.duration_ms = run_start.elapsed().as_millis();
+                cached
+            }
+            Ok(None) => {
+                let evaluated = evaluate_report()?;
+                if let Err(err) =
+                    store_cache(repo_root, &cfg.cache.db_path, &evaluated, &policy_hash)
+                {
+                    handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
+                }
+                evaluated
+            }
+            Err(err) => {
+                handle_cache_fault(repo_root, &cfg.cache.db_path, "read", &err);
+                let evaluated = evaluate_report()?;
+                if let Err(err) =
+                    store_cache(repo_root, &cfg.cache.db_path, &evaluated, &policy_hash)
+                {
+                    handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
+                }
+                evaluated
+            }
         }
     } else {
-        runner.evaluate(&ctx, diff, &opts.mode).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to evaluate scan checks"),
-            )
-        })?
+        evaluate_report()?
     };
 
     let markdown = render_github_comment(&report);
@@ -348,6 +454,12 @@ fn execute_scan(
                 err.context("failed to publish report to GitHub"),
             )
         })?;
+        if let Some(err) = published.comment_error.as_ref() {
+            eprintln!("warning: failed to publish PR comment: {err}");
+        }
+        if let Some(err) = published.check_run_error.as_ref() {
+            eprintln!("warning: failed to publish check run: {err}");
+        }
         if let Some(url) = published.comment_url {
             eprintln!("published PR comment: {url}");
         }
@@ -415,9 +527,7 @@ fn resolve_publish_request(
 }
 
 fn detect_pr_number_from_env() -> Result<Option<u64>> {
-    if let Ok(event_path) = std::env::var("GITHUB_EVENT_PATH") {
-        let payload = fs::read_to_string(event_path).context("failed to read GITHUB_EVENT_PATH")?;
-        let json: Value = serde_json::from_str(&payload).context("failed to parse github event")?;
+    if let Some(json) = load_github_event_payload() {
         if let Some(number) = pr_number_from_event_payload(&json) {
             return Ok(Some(number));
         }
@@ -433,9 +543,7 @@ fn detect_pr_number_from_env() -> Result<Option<u64>> {
 }
 
 fn detect_head_sha_from_env() -> Result<Option<String>> {
-    if let Ok(event_path) = std::env::var("GITHUB_EVENT_PATH") {
-        let payload = fs::read_to_string(event_path).context("failed to read GITHUB_EVENT_PATH")?;
-        let json: Value = serde_json::from_str(&payload).context("failed to parse github event")?;
+    if let Some(json) = load_github_event_payload() {
         if let Some(head_sha) = pr_head_sha_from_event_payload(&json) {
             return Ok(Some(head_sha));
         }
@@ -443,11 +551,31 @@ fn detect_head_sha_from_env() -> Result<Option<String>> {
     Ok(None)
 }
 
+fn load_github_event_payload() -> Option<Value> {
+    let event_path = std::env::var("GITHUB_EVENT_PATH").ok()?;
+    let payload = match fs::read_to_string(&event_path) {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("warning: failed to read GITHUB_EVENT_PATH ({event_path}): {err}");
+            return None;
+        }
+    };
+    match serde_json::from_str::<Value>(&payload) {
+        Ok(json) => Some(json),
+        Err(err) => {
+            eprintln!("warning: failed to parse github event json ({event_path}): {err}");
+            None
+        }
+    }
+}
+
 fn pr_number_from_event_payload(payload: &Value) -> Option<u64> {
-    payload
-        .get("pull_request")
-        .and_then(|pr| pr.get("number"))
-        .and_then(Value::as_u64)
+    payload.get("number").and_then(Value::as_u64).or_else(|| {
+        payload
+            .get("pull_request")
+            .and_then(|pr| pr.get("number"))
+            .and_then(Value::as_u64)
+    })
 }
 
 fn pr_head_sha_from_event_payload(payload: &Value) -> Option<String> {
@@ -683,6 +811,69 @@ fn init_cache_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn handle_cache_fault(repo_root: &Path, db_path: &str, stage: &str, err: &anyhow::Error) {
+    eprintln!("warning: cache {stage} failed: {err:#}");
+    if !is_likely_cache_corruption(err) {
+        return;
+    }
+    match recover_cache_db(repo_root, db_path) {
+        Ok(Some(backup)) => {
+            eprintln!(
+                "warning: cache DB was rotated due to corruption; backup: {}",
+                backup.display()
+            );
+        }
+        Ok(None) => {
+            eprintln!("warning: cache DB recovery skipped (cache file did not exist)");
+        }
+        Err(recover_err) => {
+            eprintln!("warning: cache DB recovery failed: {recover_err:#}");
+        }
+    }
+}
+
+fn is_likely_cache_corruption(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    msg.contains("malformed")
+        || msg.contains("not a database")
+        || msg.contains("database disk image is malformed")
+        || msg.contains("file is not a database")
+}
+
+fn recover_cache_db(repo_root: &Path, db_path: &str) -> Result<Option<PathBuf>> {
+    let db_full_path = repo_root.join(db_path);
+    if !db_full_path.exists() {
+        return Ok(None);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_millis();
+    let file_name = db_full_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cache.db");
+    let backup_path =
+        db_full_path.with_file_name(format!("{file_name}.corrupt-{now}-{}", std::process::id()));
+    fs::rename(&db_full_path, &backup_path).with_context(|| {
+        format!(
+            "failed to rotate broken cache db {} -> {}",
+            db_full_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    if let Some(parent) = db_full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let conn = Connection::open(&db_full_path)
+        .with_context(|| format!("failed to recreate cache db: {}", db_full_path.display()))?;
+    init_cache_table(&conn)?;
+    Ok(Some(backup_path))
+}
+
 fn print_text(report: &Report) {
     let cache_note = if report.skipped_by_cache {
         " (cache hit)"
@@ -880,18 +1071,73 @@ fn render_github_comment(report: &Report) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::ffi::OsString;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use patchgate_config::Config;
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
 
     use super::{
-        apply_threshold_override, build_cache_key, gate_exit_code, parse_mode, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        render_github_comment, resolve_config_path, resolve_scan_options,
-        sorted_findings_for_comment, OptionSource, ScanErrorKind, ScopeMode,
+        apply_threshold_override, build_cache_key, detect_head_sha_from_env,
+        detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
+        parse_scope, pr_head_sha_from_event_payload, pr_number_from_event_payload,
+        pr_number_from_ref, recover_cache_db, render_github_comment, resolve_config_path,
+        resolve_publish_request, resolve_scan_options, sorted_findings_for_comment, OptionSource,
+        ScanErrorKind, ScopeMode,
     };
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    struct EnvSnapshot(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvSnapshot {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(v) = value {
+                    env::set_var(key, v);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn write_temp_event(payload: &serde_json::Value) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "patchgate-cli-event-{}-{ts}-{seq}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(payload).expect("serialize event payload"),
+        )
+        .expect("write temp event");
+        path
+    }
 
     #[test]
     fn pr_number_parsed_from_ref() {
@@ -902,11 +1148,12 @@ mod tests {
     #[test]
     fn pr_number_parsed_from_event() {
         let payload = serde_json::json!({
+            "number": 777,
             "pull_request": {
                 "number": 123
             }
         });
-        assert_eq!(pr_number_from_event_payload(&payload), Some(123));
+        assert_eq!(pr_number_from_event_payload(&payload), Some(777));
     }
 
     #[test]
@@ -922,6 +1169,195 @@ mod tests {
             pr_head_sha_from_event_payload(&payload).as_deref(),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn env_pr_number_prefers_event_payload_over_github_ref() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
+        let event_path = write_temp_event(&serde_json::json!({
+            "number": 321,
+            "pull_request": { "head": { "sha": "eventsha" } }
+        }));
+        env::set_var("GITHUB_EVENT_PATH", &event_path);
+        env::set_var("GITHUB_REF", "refs/pull/999/merge");
+
+        let pr = detect_pr_number_from_env().expect("detect PR number");
+        assert_eq!(pr, Some(321));
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::remove_var("GITHUB_REF");
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn env_pr_number_falls_back_to_github_ref() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::set_var("GITHUB_REF", "refs/pull/456/merge");
+
+        let pr = detect_pr_number_from_env().expect("detect fallback PR number");
+        assert_eq!(pr, Some(456));
+
+        env::remove_var("GITHUB_REF");
+    }
+
+    #[test]
+    fn env_pr_number_falls_back_to_ref_when_event_payload_is_invalid() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH", "GITHUB_REF"]);
+        let mut bad_event = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        bad_event.push(format!("patchgate-cli-bad-event-{ts}.json"));
+        fs::write(&bad_event, "{invalid json").expect("write broken event");
+        env::set_var("GITHUB_EVENT_PATH", &bad_event);
+        env::set_var("GITHUB_REF", "refs/pull/654/merge");
+
+        let pr = detect_pr_number_from_env().expect("detect PR from ref fallback");
+        assert_eq!(pr, Some(654));
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::remove_var("GITHUB_REF");
+        let _ = fs::remove_file(bad_event);
+    }
+
+    #[test]
+    fn env_head_sha_detected_from_event() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH"]);
+        let event_path = write_temp_event(&serde_json::json!({
+            "number": 5,
+            "pull_request": { "head": { "sha": "event-sha-001" } }
+        }));
+        env::set_var("GITHUB_EVENT_PATH", &event_path);
+
+        let sha = detect_head_sha_from_env().expect("detect SHA from event");
+        assert_eq!(sha.as_deref(), Some("event-sha-001"));
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn env_head_sha_falls_back_when_event_payload_is_invalid() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_EVENT_PATH"]);
+        let mut bad_event = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        bad_event.push(format!("patchgate-cli-bad-sha-event-{ts}.json"));
+        fs::write(&bad_event, "{invalid json").expect("write broken event");
+        env::set_var("GITHUB_EVENT_PATH", &bad_event);
+
+        let sha = detect_head_sha_from_env().expect("detect SHA with invalid event");
+        assert!(sha.is_none());
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        let _ = fs::remove_file(bad_event);
+    }
+
+    #[test]
+    fn resolve_publish_request_prefers_cli_over_env() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_REF", "refs/pull/999/merge");
+        env::set_var("GITHUB_SHA", "env-sha");
+        env::set_var("GITHUB_TOKEN", "env-token");
+
+        let req = resolve_publish_request(
+            Some("cli/repo".to_string()),
+            Some(12),
+            Some("cli-sha".to_string()),
+            None,
+            Some("cli-check".to_string()),
+        )
+        .expect("resolve publish request");
+
+        assert_eq!(req.repo, "cli/repo");
+        assert_eq!(req.pr_number, 12);
+        assert_eq!(req.head_sha, "cli-sha");
+        assert_eq!(req.token, "env-token");
+        assert_eq!(req.check_name, "cli-check");
+
+        env::remove_var("GITHUB_REPOSITORY");
+        env::remove_var("GITHUB_REF");
+        env::remove_var("GITHUB_SHA");
+        env::remove_var("GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn resolve_publish_request_uses_event_then_fallback_sha() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_EVENT_PATH",
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
+        let event_path = write_temp_event(&serde_json::json!({
+            "number": 88,
+            "pull_request": { "head": { "sha": "event-sha-88" } }
+        }));
+        env::set_var("GITHUB_EVENT_PATH", &event_path);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_REF", "refs/pull/999/merge");
+        env::set_var("GITHUB_SHA", "fallback-sha");
+        env::set_var("GITHUB_TOKEN", "env-token");
+
+        let req = resolve_publish_request(None, None, None, None, None).expect("resolve from env");
+        assert_eq!(req.repo, "env/repo");
+        assert_eq!(req.pr_number, 88);
+        assert_eq!(req.head_sha, "event-sha-88");
+        assert_eq!(req.check_name, "patchgate");
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::remove_var("GITHUB_REPOSITORY");
+        env::remove_var("GITHUB_REF");
+        env::remove_var("GITHUB_SHA");
+        env::remove_var("GITHUB_TOKEN");
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn resolve_publish_request_uses_github_sha_when_event_has_no_head_sha() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&[
+            "GITHUB_EVENT_PATH",
+            "GITHUB_REPOSITORY",
+            "GITHUB_SHA",
+            "GITHUB_TOKEN",
+        ]);
+        let event_path = write_temp_event(&serde_json::json!({
+            "number": 42,
+            "pull_request": { "head": {} }
+        }));
+        env::set_var("GITHUB_EVENT_PATH", &event_path);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        env::set_var("GITHUB_SHA", "fallback-sha-42");
+        env::set_var("GITHUB_TOKEN", "env-token");
+
+        let req = resolve_publish_request(None, None, None, None, None).expect("resolve from env");
+        assert_eq!(req.pr_number, 42);
+        assert_eq!(req.head_sha, "fallback-sha-42");
+
+        env::remove_var("GITHUB_EVENT_PATH");
+        env::remove_var("GITHUB_REPOSITORY");
+        env::remove_var("GITHUB_SHA");
+        env::remove_var("GITHUB_TOKEN");
+        let _ = fs::remove_file(event_path);
     }
 
     #[test]
@@ -1065,6 +1501,37 @@ mod tests {
             build_cache_key("diff-a", "policy-a", "enforce", "staged")
         );
         assert_ne!(base, build_cache_key("diff-a", "policy-a", "warn", "repo"));
+    }
+
+    #[test]
+    fn cache_corruption_detector_matches_known_messages() {
+        let err = anyhow::anyhow!("SQLite error: file is not a database");
+        assert!(is_likely_cache_corruption(&err));
+        let err = anyhow::anyhow!("permission denied");
+        assert!(!is_likely_cache_corruption(&err));
+    }
+
+    #[test]
+    fn recover_cache_db_rotates_broken_file_and_reinitializes() {
+        let mut repo_root = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        repo_root.push(format!("patchgate-cli-cache-recover-{ts}"));
+        fs::create_dir_all(repo_root.join(".patchgate")).expect("create cache dir");
+
+        let db_relative = ".patchgate/cache.db";
+        let db_full = repo_root.join(db_relative);
+        fs::write(&db_full, "not a sqlite database").expect("write broken db");
+
+        let backup = recover_cache_db(&repo_root, db_relative)
+            .expect("recover cache db")
+            .expect("backup path should exist");
+        assert!(backup.exists(), "broken db should be moved to backup");
+        assert!(db_full.exists(), "new cache db should be recreated");
+
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]

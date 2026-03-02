@@ -11,3 +11,4 @@ anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+globset = "0.4"

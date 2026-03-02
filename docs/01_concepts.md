@@ -22,13 +22,17 @@
 ## Compatibility policy (Phase1-20)
 
 - 後方互換優先: 既存 CLI 引数と JSON キーの破壊的変更を避ける
-- 変更許容:
+- 変更許容（Additive）:
   - 追記（新規キー・新規タグ・新規 finding id）
   - 文言改善（`title` / `message`）
-- 非許容:
+  - enum値追加（既存値の意味を維持）
+- 非推奨（Deprecation）:
+  - docs で明示し、最低2マイナーリリースは既存仕様を維持
+- 破壊変更（Breaking）:
   - キー削除/改名
   - 既存キーの型変更
   - 既存 enum 値の意味変更
+  - これらはメジャー更新時のみ許可
 
 ## Operational model
 
