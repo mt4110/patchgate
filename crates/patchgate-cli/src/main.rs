@@ -419,7 +419,13 @@ fn run_policy_lint(
     config_override: Option<&Path>,
     args: PolicyLintArgs,
 ) -> PolicyExitCode {
-    let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
+    let Some(policy_path) = resolve_policy_path(repo_root, config_override, args.path.as_deref())
+    else {
+        eprintln!(
+            "patchgate policy lint error: policy file not found. tried: `policy.toml`, `.patchgate/policy.toml`"
+        );
+        return PolicyExitCode::ReadOrParse;
+    };
     let preset = match parse_policy_preset(args.policy_preset.as_deref()) {
         Ok(preset) => preset,
         Err(err) => {
@@ -428,7 +434,7 @@ fn run_policy_lint(
         }
     };
 
-    let loaded = match load_policy_config(policy_path.as_deref(), preset) {
+    let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
         Ok(loaded) => loaded,
         Err(err) => {
             eprintln!("patchgate policy lint error: {err:#}");
@@ -437,13 +443,7 @@ fn run_policy_lint(
     };
 
     println!("patchgate policy lint");
-    println!(
-        "- config_path: {}",
-        policy_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<default only>".to_string())
-    );
+    println!("- config_path: {}", policy_path.display());
     println!(
         "- preset: {}",
         preset
@@ -1585,8 +1585,9 @@ mod tests {
         parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
         pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
         resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, sorted_findings_for_comment, OptionSource,
-        PolicyExitCode, PublishRequestInput, RetryPolicy, ScanErrorKind, ScopeMode,
+        resolve_publish_request, resolve_scan_options, run_policy_lint,
+        sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
+        PublishRequestInput, RetryPolicy, ScanErrorKind, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2233,6 +2234,30 @@ mod tests {
         assert_eq!(PolicyExitCode::MigrationRequired.as_i32(), 14);
         assert_eq!(PolicyExitCode::MigrationFailed.as_i32(), 15);
         assert_eq!(PolicyExitCode::IoFailed.as_i32(), 16);
+    }
+
+    #[test]
+    fn policy_lint_requires_existing_policy_file() {
+        let mut repo_root = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        repo_root.push(format!("patchgate-cli-policy-lint-missing-{ts}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let code = run_policy_lint(
+            &repo_root,
+            None,
+            PolicyLintArgs {
+                path: None,
+                policy_preset: None,
+                require_current_version: false,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::ReadOrParse);
+
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]

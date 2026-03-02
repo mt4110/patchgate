@@ -154,9 +154,9 @@ pub fn publish_report(
             dry_run.skipped_comment_reason = Some(reason.clone());
         }
         dry_run.dry_run_payload = Some(serde_json::json!({
-            "repo": req.repo,
+            "repo": req.repo.as_str(),
             "pr_number": req.pr_number,
-            "head_sha": req.head_sha,
+            "head_sha": req.head_sha.as_str(),
             "auth_mode": req.auth.mode(),
             "publish_comment": req.publish_comment,
             "publish_check_run": req.publish_check_run,
@@ -167,8 +167,8 @@ pub fn publish_report(
             },
             "check_run_payload": check_payload,
             "priority_label": priority_label,
-            "suppressed_comment_reason": req.suppressed_comment_reason,
-            "retry_policy": req.retry_policy,
+            "suppressed_comment_reason": req.suppressed_comment_reason.as_deref(),
+            "retry_policy": &req.retry_policy,
         }));
         return Ok(dry_run);
     }
@@ -467,13 +467,7 @@ fn apply_pr_label(
     req: &PublishRequest,
     label: &str,
 ) -> std::result::Result<Vec<String>, PublishOpError> {
-    let current_labels: Vec<LabelItem> = send_json(
-        client.get(format!(
-            "{}/repos/{}/issues/{}/labels",
-            req.api_base_url, req.repo, req.pr_number
-        )),
-        "list issue labels",
-    )?;
+    let current_labels = list_all_issue_labels(client, req)?;
     let next_labels = merge_priority_label_names(&current_labels, label);
 
     let labels: Vec<LabelItem> = send_json(
@@ -487,6 +481,40 @@ fn apply_pr_label(
     )?;
 
     Ok(labels.into_iter().map(|l| l.name).collect())
+}
+
+fn list_all_issue_labels(
+    client: &Client,
+    req: &PublishRequest,
+) -> std::result::Result<Vec<LabelItem>, PublishOpError> {
+    let mut page = 1u32;
+    let mut labels = Vec::new();
+
+    loop {
+        let params = vec![
+            ("per_page".to_string(), "100".to_string()),
+            ("page".to_string(), page.to_string()),
+        ];
+        let page_labels: Vec<LabelItem> = send_json(
+            client
+                .get(format!(
+                    "{}/repos/{}/issues/{}/labels",
+                    req.api_base_url, req.repo, req.pr_number
+                ))
+                .query(&params),
+            "list issue labels",
+        )?;
+        let page_count = page_labels.len();
+        labels.extend(page_labels);
+
+        if page_count < 100 {
+            break;
+        }
+
+        page = page.saturating_add(1);
+    }
+
+    Ok(labels)
 }
 
 fn merge_priority_label_names(existing: &[LabelItem], target: &str) -> Vec<String> {
@@ -601,8 +629,8 @@ fn build_check_run_payload(
     );
 
     serde_json::json!({
-        "name": req.check_name,
-        "head_sha": req.head_sha,
+        "name": req.check_name.as_str(),
+        "head_sha": req.head_sha.as_str(),
         "status": "completed",
         "conclusion": conclusion,
         "output": {

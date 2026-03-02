@@ -191,10 +191,12 @@ pub fn load_effective_from_typed(
         })?;
         let policy_value = parse_toml_value(&text)?;
         let has_explicit_version = has_explicit_policy_version(&policy_value);
-        let mut merged = if has_explicit_version {
-            default_config_value()
-        } else {
+        let explicit_version = explicit_policy_version(&policy_value);
+        let mut merged = if !has_explicit_version || explicit_version == Some(POLICY_VERSION_LEGACY)
+        {
             legacy_default_config_value()
+        } else {
+            default_config_value()
         };
         if let Some(preset) = preset {
             let preset_value = parse_toml_value(preset_toml(preset))?;
@@ -600,10 +602,14 @@ fn parse_config_for_migration(
 }
 
 fn has_explicit_policy_version(value: &toml::Value) -> bool {
-    matches!(
-        value.get(POLICY_VERSION_FIELD),
-        Some(toml::Value::Integer(_))
-    )
+    value.get(POLICY_VERSION_FIELD).is_some()
+}
+
+fn explicit_policy_version(value: &toml::Value) -> Option<u32> {
+    match value.get(POLICY_VERSION_FIELD) {
+        Some(toml::Value::Integer(v)) if *v > 0 => u32::try_from(*v).ok(),
+        _ => None,
+    }
 }
 
 fn detect_policy_version_from_toml(
@@ -861,6 +867,25 @@ mode = "warn"
             .compatibility_warnings
             .iter()
             .any(|w| w.contains("migrate")));
+        assert_eq!(loaded.config.output.fail_threshold, 70);
+        assert_eq!(loaded.config.weights.test_gap_max_penalty, 35);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_legacy_policy_version_uses_legacy_defaults() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 1
+[output]
+mode = "warn"
+"#,
+        );
+
+        let loaded = load_effective_from_typed(Some(&path), None).expect("load policy");
+        assert_eq!(loaded.config.policy_version, POLICY_VERSION_LEGACY);
+        assert_eq!(loaded.version_source, PolicyVersionSource::Explicit);
         assert_eq!(loaded.config.output.fail_threshold, 70);
         assert_eq!(loaded.config.weights.test_gap_max_penalty, 35);
 
