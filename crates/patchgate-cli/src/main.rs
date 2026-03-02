@@ -794,6 +794,7 @@ fn execute_scan(
                 Ok(Some(mut cached)) => {
                     cached.skipped_by_cache = true;
                     cached.duration_ms = run_start.elapsed().as_millis();
+                    cached.check_durations_ms.clear();
                     profile.evaluate_ms = 0;
                     cached
                 }
@@ -1274,7 +1275,7 @@ fn changed_file_limit_fail_open_report(
             label: CheckId::DangerousChange.label().to_string(),
             penalty: 0,
             max_penalty: cfg.weights.dangerous_change_max_penalty,
-            triggered: false,
+            triggered: true,
         },
         CheckScore {
             check: CheckId::DependencyUpdate,
@@ -2477,6 +2478,12 @@ mod tests {
         assert!(!report.should_fail);
         assert_eq!(report.changed_files, 12345);
         assert!(report.findings.iter().any(|f| f.id == "SC-001"));
+        let dangerous = report
+            .checks
+            .iter()
+            .find(|c| c.check == CheckId::DangerousChange)
+            .expect("dangerous_change check exists");
+        assert!(dangerous.triggered);
     }
 
     #[test]

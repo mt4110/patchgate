@@ -112,7 +112,7 @@ pub enum ConfigError {
     #[error("policy validation error [{category}] for `{field}`: {message}")]
     Validation {
         category: ValidationCategory,
-        field: String,
+        field: &'static str,
         message: String,
     },
 }
@@ -597,24 +597,37 @@ fn validate_ecosystem_bonus_penalties(cfg: &Config) -> Result<()> {
     ];
 
     for (name, penalties) in ecosystems {
-        validate_range_u8(
-            &format!("dependency_update.ecosystem_penalties.{name}.manifest_bonus_penalty"),
-            penalties.manifest_bonus_penalty,
-            0,
-            100,
-        )?;
-        validate_range_u8(
-            &format!("dependency_update.ecosystem_penalties.{name}.lockfile_bonus_penalty"),
-            penalties.lockfile_bonus_penalty,
-            0,
-            100,
-        )?;
-        validate_range_u8(
-            &format!("dependency_update.ecosystem_penalties.{name}.large_lockfile_bonus_penalty"),
-            penalties.large_lockfile_bonus_penalty,
-            0,
-            100,
-        )?;
+        let (manifest_field, lock_field, large_field) = match name {
+            "cargo" => (
+                "dependency_update.ecosystem_penalties.cargo.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.cargo.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.cargo.large_lockfile_bonus_penalty",
+            ),
+            "npm" => (
+                "dependency_update.ecosystem_penalties.npm.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.npm.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.npm.large_lockfile_bonus_penalty",
+            ),
+            "python" => (
+                "dependency_update.ecosystem_penalties.python.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.python.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.python.large_lockfile_bonus_penalty",
+            ),
+            "go" => (
+                "dependency_update.ecosystem_penalties.go.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.go.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.go.large_lockfile_bonus_penalty",
+            ),
+            "jvm" => (
+                "dependency_update.ecosystem_penalties.jvm.manifest_bonus_penalty",
+                "dependency_update.ecosystem_penalties.jvm.lockfile_bonus_penalty",
+                "dependency_update.ecosystem_penalties.jvm.large_lockfile_bonus_penalty",
+            ),
+            _ => unreachable!("unsupported ecosystem"),
+        };
+        validate_range_u8(manifest_field, penalties.manifest_bonus_penalty, 0, 100)?;
+        validate_range_u8(lock_field, penalties.lockfile_bonus_penalty, 0, 100)?;
+        validate_range_u8(large_field, penalties.large_lockfile_bonus_penalty, 0, 100)?;
 
         let manifest_total = cfg
             .dependency_update
@@ -775,7 +788,7 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
-fn validate_enum(field: &str, value: &str, allowed: &[&str]) -> Result<()> {
+fn validate_enum(field: &'static str, value: &str, allowed: &[&str]) -> Result<()> {
     if allowed.contains(&value) {
         Ok(())
     } else {
@@ -787,7 +800,7 @@ fn validate_enum(field: &str, value: &str, allowed: &[&str]) -> Result<()> {
     }
 }
 
-fn validate_range_u8(field: &str, value: u8, min: u8, max: u8) -> Result<()> {
+fn validate_range_u8(field: &'static str, value: u8, min: u8, max: u8) -> Result<()> {
     if (min..=max).contains(&value) {
         Ok(())
     } else {
@@ -799,7 +812,7 @@ fn validate_range_u8(field: &str, value: u8, min: u8, max: u8) -> Result<()> {
     }
 }
 
-fn validate_positive_u32(field: &str, value: u32) -> Result<()> {
+fn validate_positive_u32(field: &'static str, value: u32) -> Result<()> {
     if value > 0 {
         Ok(())
     } else {
@@ -812,9 +825,9 @@ fn validate_positive_u32(field: &str, value: u32) -> Result<()> {
 }
 
 fn validate_dependency_penalty(
-    field: &str,
+    field: &'static str,
     value: u8,
-    max_field: &str,
+    max_field: &'static str,
     max_value: u8,
 ) -> Result<()> {
     if value <= max_value {
@@ -828,7 +841,7 @@ fn validate_dependency_penalty(
     }
 }
 
-fn validate_globs(field: &str, globs: &[String]) -> Result<()> {
+fn validate_globs(field: &'static str, globs: &[String]) -> Result<()> {
     for pattern in globs {
         Glob::new(pattern).map_err(|err| {
             validation_error(
@@ -843,12 +856,12 @@ fn validate_globs(field: &str, globs: &[String]) -> Result<()> {
 
 fn validation_error(
     category: ValidationCategory,
-    field: impl Into<String>,
+    field: &'static str,
     message: impl Into<String>,
 ) -> ConfigError {
     ConfigError::Validation {
         category,
-        field: field.into(),
+        field,
         message: message.into(),
     }
 }

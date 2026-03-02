@@ -215,7 +215,11 @@ fn evaluate_test_gap(
             package_markers.insert(parent_dir(&file.path));
         }
     }
-    let package_markers: Vec<String> = package_markers.into_iter().collect();
+    let mut package_markers: Vec<String> = package_markers
+        .into_iter()
+        .filter(|marker| marker.as_str() != ".")
+        .collect();
+    package_markers.sort_by_key(|marker| std::cmp::Reverse(marker.len()));
 
     let mut test_files = Vec::new();
     let mut tests_by_package: BTreeMap<String, usize> = BTreeMap::new();
@@ -1277,12 +1281,7 @@ fn parent_dir(path: &str) -> String {
 }
 
 fn infer_package_root(path: &str, package_markers: &[String]) -> String {
-    let mut markers: Vec<&String> = package_markers
-        .iter()
-        .filter(|m| m.as_str() != ".")
-        .collect();
-    markers.sort_by_key(|m| std::cmp::Reverse(m.len()));
-    for marker in markers {
+    for marker in package_markers {
         if path == marker.as_str() || path.starts_with(&format!("{}/", marker)) {
             return marker.clone();
         }
