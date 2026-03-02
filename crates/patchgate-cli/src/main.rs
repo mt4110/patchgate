@@ -1074,6 +1074,7 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1090,6 +1091,7 @@ mod tests {
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
@@ -1124,7 +1126,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        path.push(format!("patchgate-cli-event-{ts}.json"));
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "patchgate-cli-event-{}-{ts}-{seq}.json",
+            std::process::id()
+        ));
         fs::write(
             &path,
             serde_json::to_vec(payload).expect("serialize event payload"),

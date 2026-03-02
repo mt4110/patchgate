@@ -35,7 +35,7 @@ Options:
 Cache behavior:
 
 - `cache.enabled=true` かつ `--no-cache` 未指定時に SQLite cache を使用
-- cache DB 破損を検知した場合は、壊れたDBを `.corrupt-<timestamp>` に退避して再初期化
+- cache DB 破損を検知した場合は、同一ディレクトリ内で `cache.db` を `cache.db.corrupt-<millis>-<pid>` にリネームして退避し、DBを再初期化
 - 復旧に失敗した場合も scan 本体は継続（cacheなしの劣化運転）
 
 ## GitHub publish
