@@ -142,6 +142,8 @@ impl Runner {
             dependency_update.score,
         ];
 
+        let changed_files = diff.files.len();
+        let fingerprint = diff.fingerprint.clone();
         let mut report = Report::new(
             findings,
             checks,
@@ -149,12 +151,12 @@ impl Runner {
                 threshold: self.policy.output.fail_threshold,
                 mode: mode.to_string(),
                 scope: ctx.scope.as_str().to_string(),
-                fingerprint: diff.fingerprint,
+                fingerprint,
                 duration_ms: start.elapsed().as_millis(),
                 skipped_by_cache: false,
             },
         );
-        report.changed_files = diff.files.len();
+        report.changed_files = changed_files;
         report
             .check_durations_ms
             .insert(CheckId::TestGap.as_str().to_string(), test_gap_ms);
