@@ -267,13 +267,22 @@ fn evaluate_test_gap(
     let mut findings = Vec::new();
     let mut penalty = 0u8;
 
-    let has_global_test_coverage = tests_by_package.contains_key(".");
+    let global_test_updates = tests_by_package.get(".").copied().unwrap_or_default();
     let mut uncovered_packages = Vec::new();
     let mut uncovered_files = Vec::new();
     let mut uncovered_churn = 0u32;
+    let mut under_tested_packages = Vec::new();
+    let mut under_tested_files = Vec::new();
+    let mut under_tested_churn = 0u32;
+    let mut under_tested_matching_tests = 0usize;
     for (package, files) in &production_files_by_package {
-        let covered = has_global_test_coverage || tests_by_package.contains_key(package);
-        if !covered {
+        let package_test_updates = tests_by_package.get(package).copied().unwrap_or_default();
+        let matching_test_updates = if package == "." {
+            package_test_updates
+        } else {
+            package_test_updates.saturating_add(global_test_updates)
+        };
+        if matching_test_updates == 0 {
             uncovered_packages.push(package.clone());
             uncovered_files.extend(files.iter().cloned());
             uncovered_churn = uncovered_churn.saturating_add(
@@ -282,6 +291,18 @@ fn evaluate_test_gap(
                     .copied()
                     .unwrap_or_default(),
             );
+        }
+        if matching_test_updates <= 1 {
+            under_tested_packages.push(package.clone());
+            under_tested_files.extend(files.iter().cloned());
+            under_tested_churn = under_tested_churn.saturating_add(
+                production_churn_by_package
+                    .get(package)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+            under_tested_matching_tests =
+                under_tested_matching_tests.saturating_add(matching_test_updates);
         }
     }
 
@@ -330,12 +351,7 @@ fn evaluate_test_gap(
         });
     }
 
-    let uncovered_test_files = uncovered_packages
-        .iter()
-        .map(|pkg| tests_by_package.get(pkg).copied().unwrap_or_default())
-        .sum::<usize>();
-
-    if !uncovered_files.is_empty() && uncovered_churn >= policy.test_gap.large_change_lines {
+    if !under_tested_files.is_empty() && under_tested_churn >= policy.test_gap.large_change_lines {
         penalty = penalty.saturating_add(policy.test_gap.large_change_penalty);
         findings.push(Finding {
             id: "TG-002".to_string(),
@@ -347,14 +363,20 @@ fn evaluate_test_gap(
             check: CheckId::TestGap,
             title: "Large code change with limited test updates".to_string(),
             message: format!(
-                "Changed {} lines across uncovered production files with only {} matching test file(s) updated.",
-                uncovered_churn,
-                uncovered_test_files
+                "Changed {} lines across under-tested production files with only {} matching test file(s) updated. Under-tested packages: {}",
+                under_tested_churn,
+                under_tested_matching_tests,
+                under_tested_packages
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             severity: Severity::Medium,
             penalty: policy.test_gap.large_change_penalty,
             location: Some(Location {
-                file: uncovered_files[0].clone(),
+                file: under_tested_files[0].clone(),
                 line: None,
             }),
             tags: vec![
@@ -1570,6 +1592,46 @@ mod tests {
         assert!(
             eval.findings.iter().any(|f| f.id == "TG-002"),
             "uncovered large change should still trigger TG-002 even with unrelated tests"
+        );
+    }
+
+    #[test]
+    fn test_gap_large_change_with_single_matching_test_still_triggers_tg002() {
+        let policy = Config::default();
+        let exclude_set = compile_globs(&policy.exclude.globs).expect("exclude globs");
+        let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "packages/a/src/service.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 210,
+                    deleted: 10,
+                    added_lines: vec!["line".to_string()],
+                    removed_lines: vec!["line".to_string()],
+                },
+                ChangedFile {
+                    path: "packages/a/tests/service_test.rs".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 2,
+                    deleted: 0,
+                    added_lines: vec!["assert".to_string()],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+        let eval =
+            evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
+        assert!(
+            !eval.findings.iter().any(|f| f.id == "TG-001"),
+            "TG-001 should not fire when at least one matching test exists"
+        );
+        assert!(
+            eval.findings.iter().any(|f| f.id == "TG-002"),
+            "TG-002 should fire for large changes with only one matching test file"
         );
     }
 
