@@ -864,9 +864,7 @@ fn execute_scan(
     Ok(gate_exit_code(&opts.mode, report.should_fail))
 }
 
-fn resolve_publish_request(
-    input: PublishRequestInput,
-) -> Result<PublishRequest> {
+fn resolve_publish_request(input: PublishRequestInput) -> Result<PublishRequest> {
     let PublishRequestInput {
         github_repo,
         github_pr,

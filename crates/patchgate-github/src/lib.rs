@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 const MARKER: &str = "<!-- patchgate:report -->";
 const DEFAULT_API_BASE_URL: &str = "https://api.github.com";
+const PRIORITY_LABEL_PREFIX: &str = "patchgate:priority/";
 
 #[derive(Debug, Clone)]
 pub enum PublishAuth {
@@ -441,17 +442,45 @@ fn apply_pr_label(
     req: &PublishRequest,
     label: &str,
 ) -> std::result::Result<Vec<String>, PublishOpError> {
+    let current_labels: Vec<LabelItem> = send_json(
+        client.get(format!(
+            "{}/repos/{}/issues/{}/labels",
+            req.api_base_url, req.repo, req.pr_number
+        )),
+        "list issue labels",
+    )?;
+    let next_labels = merge_priority_label_names(&current_labels, label);
+
     let labels: Vec<LabelItem> = send_json(
         client
-            .post(format!(
+            .put(format!(
                 "{}/repos/{}/issues/{}/labels",
                 req.api_base_url, req.repo, req.pr_number
             ))
-            .json(&serde_json::json!({ "labels": [label] })),
-        "apply issue labels",
+            .json(&serde_json::json!({ "labels": next_labels })),
+        "set issue labels",
     )?;
 
     Ok(labels.into_iter().map(|l| l.name).collect())
+}
+
+fn merge_priority_label_names(existing: &[LabelItem], target: &str) -> Vec<String> {
+    let mut merged = Vec::new();
+    for label in existing {
+        if label.name.starts_with(PRIORITY_LABEL_PREFIX) {
+            continue;
+        }
+        if merged.iter().any(|current| current == &label.name) {
+            continue;
+        }
+        merged.push(label.name.clone());
+    }
+
+    if !merged.iter().any(|current| current == target) {
+        merged.push(target.to_string());
+    }
+
+    merged
 }
 
 fn send_json<T: DeserializeOwned>(
@@ -631,7 +660,8 @@ mod tests {
 
     use super::{
         backoff_delay_ms, check_run_conclusion, ensure_comment_marker, is_same_comment_content,
-        priority_label_name, with_retry, PublishOpError, RetryPolicy, MARKER,
+        merge_priority_label_names, priority_label_name, with_retry, LabelItem, PublishOpError,
+        RetryPolicy, MARKER,
     };
 
     fn sample_report(mode: &str, penalty: u8, findings: Vec<Finding>) -> Report {
@@ -785,5 +815,30 @@ mod tests {
             priority_label_name(ReviewPriority::P3),
             "patchgate:priority/p3"
         );
+    }
+
+    #[test]
+    fn merge_priority_label_names_removes_stale_priority_labels() {
+        let existing = vec![
+            LabelItem {
+                name: "bug".to_string(),
+            },
+            LabelItem {
+                name: "patchgate:priority/p3".to_string(),
+            },
+            LabelItem {
+                name: "patchgate:priority/p1".to_string(),
+            },
+            LabelItem {
+                name: "needs-review".to_string(),
+            },
+        ];
+
+        let merged = merge_priority_label_names(&existing, "patchgate:priority/p0");
+        assert!(merged.iter().any(|name| name == "bug"));
+        assert!(merged.iter().any(|name| name == "needs-review"));
+        assert!(merged.iter().any(|name| name == "patchgate:priority/p0"));
+        assert!(!merged.iter().any(|name| name == "patchgate:priority/p3"));
+        assert!(!merged.iter().any(|name| name == "patchgate:priority/p1"));
     }
 }
