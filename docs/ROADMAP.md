@@ -13,15 +13,17 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase51-60](../phase51_60.md)
 - [PR Plan: Phase61-70](../phase61_70.md)
 - [PR Plan: Phase71-80](../phase71_80.md)
+- [PR Plan: Phase81-90](../phase81_90.md)
+- [PR Plan: Phase91-100](../phase91_100.md)
 - [PR Execution Checklist Template](09_pr_execution_checklist.md)
 
 ## Active planning horizon
 
-- Completed design: Phase1-60
-- New design scope in this update: Phase61-80
+- Completed design: Phase1-80
+- New design scope in this update: Phase81-100
 - Next execution unit:
-  - Phase61-70: observability and operational diagnostics
-  - Phase71-80: security and governance hardening
+  - Phase81-90: extensibility and ecosystem enablement
+  - Phase91-100: productization and LTS readiness
 
 ## v0.3.0 (MVP)
 - Diff-based quality gate with 3 checks
@@ -105,10 +107,25 @@ This roadmap tracks the patchgate pivot.
 - Audit artifacts are versioned and reusable for compliance evidence
 - Security signals are integrated with existing risk checks and release flow
 
-## v0.4.0
-- Historical trend API (metadata only)
-- Team/repo policy presets
-- Review-priority analytics dashboard
+## v0.3.9 (Phase81-90 target)
+- Plugin extension API and sandbox execution policy
+- Multi-provider integration abstraction and webhook/notification adapters
+- Ecosystem onboarding assets (docs site, examples, community operations)
+
+### Phase81-90 design notes
+- Extension points are contract-first with compatibility/version guarantees
+- Integration differences are isolated behind provider/adapter boundaries
+- Ecosystem growth is backed by executable examples and contribution governance
+
+## v1.0.0 (Phase91-100 target)
+- v1.0 RC/GA specification freeze and migration assurance
+- LTS support model with SLA/SLO-backed operations
+- Signed release artifacts with SBOM and auditable release criteria
+
+### Phase91-100 design notes
+- v1.0 readiness is measured by compatibility and operability, not feature count
+- LTS and backport workflows are part of release quality gates
+- Post-GA roadmap is derived from operational evidence and adoption feedback
 
 ## Non-goals (current phase)
 - Full remote source scan as primary path
