@@ -746,15 +746,27 @@ fn build_history_summary(
         .filter(|r| r.should_fail.unwrap_or(false))
         .count();
     let execution_errors = records.iter().filter(|r| r.failure_code.is_some()).count();
+    let failed_runs = records
+        .iter()
+        .filter(|r| r.should_fail.unwrap_or(false) || r.failure_code.is_some())
+        .count();
     let failure_rate = if runs == 0 {
         0.0
     } else {
-        ((gate_failures + execution_errors) as f64 / runs as f64) * 100.0
+        (failed_runs as f64 / runs as f64) * 100.0
     };
-    let average_duration_ms = if runs == 0 {
+    let duration_samples: Vec<&ScanMetricRecord> = records
+        .iter()
+        .filter(|r| r.failure_code.is_none())
+        .collect();
+    let average_duration_ms = if duration_samples.is_empty() {
         0.0
     } else {
-        records.iter().map(|r| r.duration_ms as f64).sum::<f64>() / runs as f64
+        duration_samples
+            .iter()
+            .map(|r| r.duration_ms as f64)
+            .sum::<f64>()
+            / duration_samples.len() as f64
     };
     let scored: Vec<u8> = records.iter().filter_map(|r| r.score).collect();
     let avg_score = if scored.is_empty() {
@@ -838,7 +850,9 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
     struct TrendAgg {
         runs: usize,
         gate_failures: usize,
+        failures: usize,
         duration_sum: f64,
+        duration_runs: usize,
         score_sum: f64,
         scored_runs: usize,
     }
@@ -850,10 +864,16 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
             let key = format!("day:{day}|repo:{}|scope:{}|check:none", row.repo, row.scope);
             let agg = grouped.entry(key).or_default();
             agg.runs += 1;
+            if row.should_fail.unwrap_or(false) || row.failure_code.is_some() {
+                agg.failures += 1;
+            }
             if row.should_fail.unwrap_or(false) {
                 agg.gate_failures += 1;
             }
-            agg.duration_sum += row.duration_ms as f64;
+            if row.failure_code.is_none() {
+                agg.duration_sum += row.duration_ms as f64;
+                agg.duration_runs += 1;
+            }
             if let Some(score) = row.score {
                 agg.score_sum += score as f64;
                 agg.scored_runs += 1;
@@ -868,10 +888,16 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
             );
             let agg = grouped.entry(key).or_default();
             agg.runs += 1;
+            if row.should_fail.unwrap_or(false) || row.failure_code.is_some() {
+                agg.failures += 1;
+            }
             if row.should_fail.unwrap_or(false) {
                 agg.gate_failures += 1;
             }
-            agg.duration_sum += row.duration_ms as f64;
+            if row.failure_code.is_none() {
+                agg.duration_sum += row.duration_ms as f64;
+                agg.duration_runs += 1;
+            }
             if let Some(score) = row.score {
                 agg.score_sum += score as f64;
                 agg.scored_runs += 1;
@@ -888,12 +914,12 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
             failure_rate: if agg.runs == 0 {
                 0.0
             } else {
-                (agg.gate_failures as f64 / agg.runs as f64) * 100.0
+                (agg.failures as f64 / agg.runs as f64) * 100.0
             },
-            average_duration_ms: if agg.runs == 0 {
+            average_duration_ms: if agg.duration_runs == 0 {
                 0.0
             } else {
-                agg.duration_sum / agg.runs as f64
+                agg.duration_sum / agg.duration_runs as f64
             },
             average_score: if agg.scored_runs == 0 {
                 0.0
@@ -1150,6 +1176,7 @@ fn execute_scan(
         github_suppress_comment_low_priority,
         github_suppress_comment_rerun,
     } = scan;
+    let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
         ScanError::with_code(
             ScanErrorKind::Input,
@@ -1379,7 +1406,7 @@ fn execute_scan(
             github_suppress_comment_rerun,
         );
         let req = resolve_publish_request(PublishRequestInput {
-            github_repo,
+            github_repo: github_repo.clone(),
             github_pr,
             github_sha,
             github_token_env,
@@ -1510,7 +1537,7 @@ fn execute_scan(
                 .map(|p| resolve_repo_relative_path(repo_root, p))
         });
     append_scan_success_records(
-        repo_root,
+        telemetry_repo.as_str(),
         &report,
         metrics_path.as_deref(),
         audit_path.as_deref(),
@@ -1522,7 +1549,7 @@ fn execute_scan(
 }
 
 fn append_scan_success_records(
-    repo_root: &Path,
+    telemetry_repo: &str,
     report: &Report,
     metrics_path: Option<&Path>,
     audit_path: Option<&Path>,
@@ -1534,7 +1561,7 @@ fn append_scan_success_records(
         let metrics = ScanMetricRecord {
             schema_version: 1,
             unix_ts,
-            repo: repo_root.display().to_string(),
+            repo: telemetry_repo.to_string(),
             mode: report.mode.clone(),
             scope: report.scope.clone(),
             duration_ms: report.duration_ms,
@@ -1572,7 +1599,7 @@ fn append_scan_success_records(
             audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
             actor,
-            repo: repo_root.display().to_string(),
+            repo: telemetry_repo.to_string(),
             target: "scan".to_string(),
             mode: report.mode.clone(),
             scope: report.scope.clone(),
@@ -1626,11 +1653,12 @@ fn append_scan_failure_records(
     }
 
     let unix_ts = current_unix_ts();
+    let telemetry_repo = resolve_telemetry_repo(repo_root, scan.github_repo.as_deref());
     if let Some(path) = metrics_path.as_deref() {
         let metrics = ScanMetricRecord {
             schema_version: 1,
             unix_ts,
-            repo: repo_root.display().to_string(),
+            repo: telemetry_repo.clone(),
             mode: scan.mode.clone().unwrap_or_else(|| "unknown".to_string()),
             scope: scan.scope.clone().unwrap_or_else(|| "unknown".to_string()),
             duration_ms: 0,
@@ -1653,7 +1681,7 @@ fn append_scan_failure_records(
             audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
             actor: resolve_audit_actor(scan.audit_actor.as_deref()),
-            repo: repo_root.display().to_string(),
+            repo: telemetry_repo,
             target: "scan".to_string(),
             mode: scan.mode.clone().unwrap_or_else(|| "unknown".to_string()),
             scope: scan.scope.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -1714,6 +1742,20 @@ fn resolve_audit_actor(override_actor: Option<&str>) -> String {
         }
     }
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn resolve_telemetry_repo(repo_root: &Path, github_repo_override: Option<&str>) -> String {
+    if let Some(repo) = github_repo_override {
+        if !repo.trim().is_empty() {
+            return repo.to_string();
+        }
+    }
+    if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
+        if !repo.trim().is_empty() {
+            return repo;
+        }
+    }
+    repo_root.display().to_string()
 }
 
 fn current_unix_ts() -> u64 {
@@ -2652,15 +2694,15 @@ mod tests {
 
     use super::{
         apply_changed_file_overrides, apply_threshold_override, build_cache_key,
-        build_history_trend, changed_file_limit_fail_open_report, detect_head_sha_from_env,
-        detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
-        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, run_policy_lint,
-        sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanErrorKind, ScanMetricRecord,
-        ScopeMode,
+        build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
+        detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
+        is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        recover_cache_db, render_github_comment, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, run_policy_lint, sorted_findings_for_comment, OptionSource,
+        PolicyExitCode, PolicyLintArgs, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
+        ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2879,6 +2921,36 @@ mod tests {
         env::remove_var("GITHUB_REF");
         env::remove_var("GITHUB_SHA");
         env::remove_var("GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_prefers_cli_override() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+
+        let repo =
+            resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), Some("cli/repo"));
+        assert_eq!(repo, "cli/repo");
+
+        env::remove_var("GITHUB_REPOSITORY");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_falls_back_to_env_then_path() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        let from_env = resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), None);
+        assert_eq!(from_env, "env/repo");
+
+        env::remove_var("GITHUB_REPOSITORY");
+        let from_path = resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), None);
+        assert!(
+            from_path.ends_with("/tmp/local-repo"),
+            "expected fallback path, got {from_path}"
+        );
     }
 
     #[test]
@@ -3222,7 +3294,53 @@ mod tests {
             .find(|r| r.key.contains("check:test_gap"))
             .expect("test_gap row");
         assert_eq!(row.runs, 2);
+        assert_eq!(row.failure_rate, 50.0);
+        assert_eq!(row.average_duration_ms, 10.0);
         assert_eq!(row.average_score, 80.0);
+    }
+
+    #[test]
+    fn history_summary_excludes_execution_error_rows_from_duration_average() {
+        let records = vec![
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_400,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 12,
+                changed_files: 1,
+                skipped_by_cache: false,
+                score: Some(90),
+                threshold: Some(70),
+                should_fail: Some(false),
+                check_penalties: BTreeMap::new(),
+                failure_code: None,
+                failure_category: None,
+                diagnostic_hints: vec![],
+            },
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_401,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                changed_files: 0,
+                skipped_by_cache: false,
+                score: None,
+                threshold: None,
+                should_fail: None,
+                check_penalties: BTreeMap::new(),
+                failure_code: Some("PG-RT-001".to_string()),
+                failure_category: Some("runtime".to_string()),
+                diagnostic_hints: vec![],
+            },
+        ];
+
+        let summary = build_history_summary(&records, None, &Config::default().alerts);
+        assert_eq!(summary.failure_rate, 50.0);
+        assert_eq!(summary.average_duration_ms, 12.0);
     }
 
     #[test]

@@ -938,6 +938,11 @@ fn is_dependency_path(path: &str) -> bool {
         || lower.ends_with("pipfile")
         || lower.ends_with("pipfile.lock")
         || lower.ends_with("poetry.lock")
+        || lower.ends_with("pom.xml")
+        || lower.ends_with("build.gradle")
+        || lower.ends_with("build.gradle.kts")
+        || lower.ends_with("gemfile")
+        || lower.ends_with("gemfile.lock")
 }
 
 fn is_lockfile_path(path: &str) -> bool {
@@ -2072,5 +2077,83 @@ mod tests {
                 .any(|s| s.id == "SCM-002"),
             "lockfile add/remove with CI change should trigger SCM-002"
         );
+    }
+
+    #[test]
+    fn supply_chain_signal_detects_jvm_manifest_plus_infra_bundle() {
+        let policy = Config::default();
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "service/build.gradle.kts".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 1,
+                    added_lines: vec!["implementation(\"org.example:lib:1.0\")".to_string()],
+                    removed_lines: vec!["implementation(\"org.example:lib:0.9\")".to_string()],
+                },
+                ChangedFile {
+                    path: ".github/workflows/release.yml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 1,
+                    added_lines: vec!["permissions: write-all".to_string()],
+                    removed_lines: vec!["permissions: read-all".to_string()],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .supply_chain_signals
+            .iter()
+            .any(|s| s.id == "SCM-001"));
+    }
+
+    #[test]
+    fn supply_chain_signal_detects_ruby_manifest_plus_infra_bundle() {
+        let policy = Config::default();
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Gemfile".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 1,
+                    added_lines: vec!["gem \"rails\", \"7.2.0\"".to_string()],
+                    removed_lines: vec!["gem \"rails\", \"7.1.5\"".to_string()],
+                },
+                ChangedFile {
+                    path: "infra/main.tf".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 0,
+                    added_lines: vec!["resource \"aws_s3_bucket\" \"logs\" {}".to_string()],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .supply_chain_signals
+            .iter()
+            .any(|s| s.id == "SCM-001"));
     }
 }

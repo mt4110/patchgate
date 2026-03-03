@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -99,6 +99,15 @@ struct AuditLogRecord {
     scope: String,
     result: String,
     failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FailureEventKey {
+    code: String,
+    unix_ts: u64,
+    repo: String,
+    mode: String,
+    scope: String,
 }
 
 fn main() -> Result<()> {
@@ -412,11 +421,7 @@ fn run_weekly_summary(options: &OpsOptions) -> Result<()> {
         .filter(|m| m.should_fail.unwrap_or(false))
         .count();
     let execution_errors = metrics.iter().filter(|m| m.failure_code.is_some()).count();
-    let avg_duration = if runs == 0 {
-        0.0
-    } else {
-        metrics.iter().map(|m| m.duration_ms as f64).sum::<f64>() / runs as f64
-    };
+    let avg_duration = average_duration_for_summary(&metrics);
     let scored: Vec<u8> = metrics.iter().filter_map(|m| m.score).collect();
     let avg_score = if scored.is_empty() {
         0.0
@@ -424,30 +429,7 @@ fn run_weekly_summary(options: &OpsOptions) -> Result<()> {
         scored.iter().map(|s| *s as f64).sum::<f64>() / scored.len() as f64
     };
 
-    let mut failure_codes = BTreeMap::<String, usize>::new();
-    let mut failure_events = BTreeSet::<String>::new();
-    for row in &metrics {
-        if let Some(code) = row.failure_code.as_ref() {
-            let key = format!(
-                "{}|{}|{}|{}|{}",
-                code, row.unix_ts, row.repo, row.mode, row.scope
-            );
-            if failure_events.insert(key) {
-                *failure_codes.entry(code.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    for row in &audits {
-        if let Some(code) = row.failure_code.as_ref() {
-            let key = format!(
-                "{}|{}|{}|{}|{}",
-                code, row.unix_ts, row.repo, row.mode, row.scope
-            );
-            if failure_events.insert(key) {
-                *failure_codes.entry(code.clone()).or_insert(0) += 1;
-            }
-        }
-    }
+    let failure_codes = aggregate_failure_code_counts(&metrics, &audits);
 
     let mut md = String::new();
     md.push_str("# Weekly Operations Summary\n\n");
@@ -483,6 +465,74 @@ fn run_weekly_summary(options: &OpsOptions) -> Result<()> {
 
     println!("weekly summary written: {}", options.output.display());
     Ok(())
+}
+
+fn average_duration_for_summary(metrics: &[MetricLogRecord]) -> f64 {
+    let duration_samples: Vec<&MetricLogRecord> = metrics
+        .iter()
+        .filter(|m| m.failure_code.is_none())
+        .collect();
+    if duration_samples.is_empty() {
+        0.0
+    } else {
+        duration_samples
+            .iter()
+            .map(|m| m.duration_ms as f64)
+            .sum::<f64>()
+            / duration_samples.len() as f64
+    }
+}
+
+fn metric_failure_key(row: &MetricLogRecord) -> Option<FailureEventKey> {
+    row.failure_code.as_ref().map(|code| FailureEventKey {
+        code: code.clone(),
+        unix_ts: row.unix_ts,
+        repo: row.repo.clone(),
+        mode: row.mode.clone(),
+        scope: row.scope.clone(),
+    })
+}
+
+fn audit_failure_key(row: &AuditLogRecord) -> Option<FailureEventKey> {
+    row.failure_code.as_ref().map(|code| FailureEventKey {
+        code: code.clone(),
+        unix_ts: row.unix_ts,
+        repo: row.repo.clone(),
+        mode: row.mode.clone(),
+        scope: row.scope.clone(),
+    })
+}
+
+fn aggregate_failure_code_counts(
+    metrics: &[MetricLogRecord],
+    audits: &[AuditLogRecord],
+) -> BTreeMap<String, usize> {
+    let mut metric_counts = BTreeMap::<FailureEventKey, usize>::new();
+    for row in metrics {
+        if let Some(key) = metric_failure_key(row) {
+            *metric_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut audit_counts = BTreeMap::<FailureEventKey, usize>::new();
+    for row in audits {
+        if let Some(key) = audit_failure_key(row) {
+            *audit_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut failure_codes = BTreeMap::<String, usize>::new();
+    for (key, metric_count) in &metric_counts {
+        let audit_count = audit_counts.get(key).copied().unwrap_or(0);
+        *failure_codes.entry(key.code.clone()).or_insert(0) += (*metric_count).max(audit_count);
+    }
+    for (key, audit_count) in &audit_counts {
+        if !metric_counts.contains_key(key) {
+            *failure_codes.entry(key.code.clone()).or_insert(0) += *audit_count;
+        }
+    }
+
+    failure_codes
 }
 
 fn run_audit_report(options: &OpsOptions) -> Result<()> {
@@ -880,7 +930,10 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
-    use super::{canonical_repo_path, validate_workload_identity, BenchSample, TEMP_SEQ};
+    use super::{
+        aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
+        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, TEMP_SEQ,
+    };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
         BenchSample {
@@ -926,5 +979,92 @@ mod tests {
         assert_eq!(resolved, expected);
 
         std::fs::remove_dir_all(&abs).expect("cleanup temp repo dir");
+    }
+
+    #[test]
+    fn weekly_summary_duration_excludes_execution_errors() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 1,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 20,
+                score: Some(90),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+            MetricLogRecord {
+                unix_ts: 2,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+        ];
+
+        assert_eq!(average_duration_for_summary(&metrics), 20.0);
+    }
+
+    #[test]
+    fn failure_code_aggregation_deduplicates_stream_overlap_without_losing_multiplicity() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 10,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            MetricLogRecord {
+                unix_ts: 10,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+        ];
+        let audits = vec![
+            AuditLogRecord {
+                unix_ts: 10,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            AuditLogRecord {
+                unix_ts: 10,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            AuditLogRecord {
+                unix_ts: 11,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-CFG-001".to_string()),
+            },
+        ];
+
+        let counts = aggregate_failure_code_counts(&metrics, &audits);
+        assert_eq!(counts.get("PG-RT-001"), Some(&2usize));
+        assert_eq!(counts.get("PG-CFG-001"), Some(&1usize));
     }
 }

@@ -668,7 +668,15 @@ fn redact_bearer_tokens(mut input: String) -> String {
         let start = cursor + offset + marker.len();
         let mut end = start;
         while let Some(ch) = input[end..].chars().next() {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+            if ch.is_ascii_alphanumeric()
+                || ch == '_'
+                || ch == '-'
+                || ch == '.'
+                || ch == '+'
+                || ch == '/'
+                || ch == '='
+                || ch == '~'
+            {
                 end += ch.len_utf8();
             } else {
                 break;
@@ -1044,5 +1052,12 @@ mod tests {
     fn mask_secrets_redacts_bearer_values() {
         let masked = mask_secrets("Authorization: Bearer abcdefghijklmnopqrstuvwxyz");
         assert!(masked.contains("Bearer ***"));
+    }
+
+    #[test]
+    fn mask_secrets_redacts_bearer_values_with_base64_chars() {
+        let masked = mask_secrets("Authorization: Bearer a+b/c=d~ef");
+        assert!(masked.contains("Bearer ***"));
+        assert!(!masked.contains("a+b/c=d~ef"));
     }
 }
