@@ -1759,7 +1759,13 @@ fn resolve_telemetry_repo(repo_root: &Path, github_repo_override: Option<&str>) 
             return repo;
         }
     }
-    repo_root.display().to_string()
+    if let Some(name) = repo_root.file_name() {
+        let name = name.to_string_lossy();
+        if !name.trim().is_empty() {
+            return format!("local/{name}");
+        }
+    }
+    "local".to_string()
 }
 
 fn current_unix_ts() -> u64 {
@@ -2951,10 +2957,17 @@ mod tests {
 
         env::remove_var("GITHUB_REPOSITORY");
         let from_path = resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), None);
-        assert!(
-            from_path.ends_with("/tmp/local-repo"),
-            "expected fallback path, got {from_path}"
-        );
+        assert_eq!(from_path, "local/local-repo");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_uses_local_when_repo_name_unavailable() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::remove_var("GITHUB_REPOSITORY");
+
+        let from_root = resolve_telemetry_repo(PathBuf::from("/").as_path(), None);
+        assert_eq!(from_root, "local");
     }
 
     #[test]

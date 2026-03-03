@@ -639,8 +639,7 @@ pub fn mask_secrets(input: &str) -> String {
 
 fn redact_prefixed_secret(mut input: String, prefix: &str) -> String {
     let mut cursor = 0usize;
-    while let Some(offset) = input[cursor..].find(prefix) {
-        let start = cursor + offset;
+    while let Some(start) = find_ascii_substring(&input, cursor, prefix, false) {
         let mut end = start + prefix.len();
         while let Some(ch) = input[end..].chars().next() {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
@@ -665,9 +664,9 @@ fn redact_prefixed_secret(mut input: String, prefix: &str) -> String {
 fn redact_bearer_tokens(mut input: String) -> String {
     let marker = "bearer ";
     let mut cursor = 0usize;
-    while let Some(offset) = input[cursor..].to_ascii_lowercase().find(marker) {
-        let start = cursor + offset + marker.len();
-        let mut end = start;
+    while let Some(marker_start) = find_ascii_substring(&input, cursor, marker, true) {
+        let token_start = marker_start + marker.len();
+        let mut end = token_start;
         while let Some(ch) = input[end..].chars().next() {
             if ch.is_ascii_alphanumeric()
                 || ch == '_'
@@ -683,17 +682,40 @@ fn redact_bearer_tokens(mut input: String) -> String {
                 break;
             }
         }
-        if end > start {
-            input.replace_range(start..end, "***");
-            cursor = start + 3;
+        if end > token_start {
+            input.replace_range(token_start..end, "***");
+            cursor = token_start + 3;
         } else {
-            cursor = start;
+            cursor = token_start;
         }
         if cursor >= input.len() {
             break;
         }
     }
     input
+}
+
+fn find_ascii_substring(
+    input: &str,
+    cursor: usize,
+    needle: &str,
+    case_insensitive: bool,
+) -> Option<usize> {
+    if cursor >= input.len() || !input.is_char_boundary(cursor) || needle.is_empty() {
+        return None;
+    }
+
+    let hay = &input[cursor..];
+    hay.char_indices().find_map(|(offset, _)| {
+        let start = cursor + offset;
+        let end = start + needle.len();
+        let candidate = input.get(start..end)?;
+        if case_insensitive {
+            candidate.eq_ignore_ascii_case(needle).then_some(start)
+        } else {
+            (candidate == needle).then_some(start)
+        }
+    })
 }
 
 fn is_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
@@ -1068,6 +1090,13 @@ mod tests {
     #[test]
     fn mask_secrets_redacts_bearer_values_case_insensitively() {
         let masked = mask_secrets("Authorization: bearer abc.def");
+        assert!(masked.contains("bearer ***"));
+        assert!(!masked.contains("abc.def"));
+    }
+
+    #[test]
+    fn mask_secrets_handles_unicode_context_safely() {
+        let masked = mask_secrets("本文: 認証 bearer abc.def ghi");
         assert!(masked.contains("bearer ***"));
         assert!(!masked.contains("abc.def"));
     }
