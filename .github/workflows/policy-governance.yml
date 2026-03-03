@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
 
 jobs:
@@ -26,8 +27,14 @@ jobs:
 
       - name: Require `policy-approved` label for policy changes
         if: github.event_name == 'pull_request'
+        env:
+          API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels
+          GH_TOKEN: ${{ github.token }}
         run: |
-          labels=$(jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH")
+          labels=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL" | jq -r '.[].name')
           echo "labels: $labels"
           if ! echo "$labels" | grep -Fxq "policy-approved"; then
             echo "Missing required label: policy-approved"
