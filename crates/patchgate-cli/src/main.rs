@@ -947,12 +947,9 @@ fn print_history_trend_text(rows: &[HistoryTrendRow]) {
 }
 
 fn signed_delta(previous: f64, current: f64) -> f64 {
-    if previous == 0.0 {
-        if current == 0.0 {
-            0.0
-        } else {
-            100.0
-        }
+    if previous <= 0.0 {
+        // Treat zero/invalid baseline as non-comparable to avoid false-positive alerts.
+        0.0
     } else {
         ((current - previous) / previous) * 100.0
     }
@@ -3550,6 +3547,56 @@ mod tests {
         assert_eq!(trend.len(), 1);
         assert!(trend[0].key.contains("check:test_gap"));
         assert!(!trend[0].key.contains("dangerous_change"));
+    }
+
+    #[test]
+    fn history_summary_does_not_alert_duration_when_baseline_has_no_successful_runs() {
+        let baseline = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 0,
+            changed_files: 0,
+            skipped_by_cache: false,
+            score: None,
+            threshold: None,
+            should_fail: None,
+            check_penalties: BTreeMap::new(),
+            failure_code: Some("PG-RT-001".to_string()),
+            failure_category: Some("runtime".to_string()),
+            diagnostic_hints: vec![],
+        }];
+        let current = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_500,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 20,
+            changed_files: 2,
+            skipped_by_cache: false,
+            score: Some(95),
+            threshold: Some(70),
+            should_fail: Some(false),
+            check_penalties: BTreeMap::new(),
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+        let alerts_cfg = patchgate_config::AlertConfig {
+            score_drop_threshold: 99,
+            failure_rate_increase_pct: 99,
+            duration_increase_pct: 1,
+        };
+
+        let summary = build_history_summary(&current, Some(&baseline), &alerts_cfg);
+        assert!(
+            summary.alerts.is_empty(),
+            "unexpected alerts: {:?}",
+            summary.alerts
+        );
     }
 
     #[test]
