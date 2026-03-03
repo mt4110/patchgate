@@ -21,8 +21,8 @@ jobs:
 
       - name: Ensure CODEOWNERS includes policy paths
         run: |
-          rg -n "^config/policy.toml.example" .github/CODEOWNERS
-          rg -n "^config/presets/" .github/CODEOWNERS
+          grep -nE "^config/policy.toml.example" .github/CODEOWNERS
+          grep -nE "^config/presets/" .github/CODEOWNERS
 
       - name: Require `policy-approved` label for policy changes
         if: github.event_name == 'pull_request'
