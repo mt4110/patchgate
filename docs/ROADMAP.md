@@ -11,15 +11,17 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase31-40](../phase31_40.md)
 - [PR Plan: Phase41-50](../phase41_50.md)
 - [PR Plan: Phase51-60](../phase51_60.md)
+- [PR Plan: Phase61-70](../phase61_70.md)
+- [PR Plan: Phase71-80](../phase71_80.md)
 - [PR Execution Checklist Template](09_pr_execution_checklist.md)
 
 ## Active planning horizon
 
-- Completed design: Phase1-40
-- New design scope in this update: Phase41-60
+- Completed design: Phase1-60
+- New design scope in this update: Phase61-80
 - Next execution unit:
-  - Phase41-50: performance and scale hardening
-  - Phase51-60: language-aware detection quality
+  - Phase61-70: observability and operational diagnostics
+  - Phase71-80: security and governance hardening
 
 ## v0.3.0 (MVP)
 - Diff-based quality gate with 3 checks
@@ -82,6 +84,26 @@ This roadmap tracks the patchgate pivot.
 - Rule behavior remains schema-compatible while language precision improves
 - False positive reduction is tracked per language and package boundary
 - Enablement strategy (default/opt-in) is standardized for safe rollout
+
+## v0.3.7 (Phase61-70 target)
+- Execution telemetry, history aggregation, and trend signals
+- Failure taxonomy and audit-ready run records
+- MTTR-oriented diagnostic output and weekly operations summary
+
+### Phase61-70 design notes
+- Metrics and failure codes become machine-readable contracts for operations
+- Alert thresholds are policy-driven and validated in CI workflows
+- Runbook/recovery drills are treated as release-quality deliverables
+
+## v0.3.8 (Phase71-80 target)
+- Least-privilege token handling and stronger secret masking
+- Approval/expiry governance for policy changes and waivers
+- Automated audit reporting and security review cadence
+
+### Phase71-80 design notes
+- Governance controls are designed to be enforceable without blocking delivery
+- Audit artifacts are versioned and reusable for compliance evidence
+- Security signals are integrated with existing risk checks and release flow
 
 ## v0.4.0
 - Historical trend API (metadata only)

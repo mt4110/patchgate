@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -24,6 +25,12 @@ enum BenchSubcommand {
 }
 
 #[derive(Debug, Clone)]
+enum OpsSubcommand {
+    WeeklySummary,
+    AuditReport,
+}
+
+#[derive(Debug, Clone)]
 struct BenchOptions {
     subcommand: BenchSubcommand,
     case_name: String,
@@ -36,6 +43,15 @@ struct BenchOptions {
     append_on_pass: bool,
     synthetic_files: Option<usize>,
     synthetic_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+struct OpsOptions {
+    subcommand: OpsSubcommand,
+    metrics_input: PathBuf,
+    audit_input: PathBuf,
+    output: PathBuf,
+    trend_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +78,38 @@ struct BenchCompareReport {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct MetricLogRecord {
+    unix_ts: u64,
+    repo: String,
+    mode: String,
+    scope: String,
+    duration_ms: u128,
+    score: Option<u8>,
+    should_fail: Option<bool>,
+    failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuditLogRecord {
+    unix_ts: u64,
+    actor: String,
+    repo: String,
+    mode: String,
+    scope: String,
+    result: String,
+    failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FailureEventKey {
+    code: String,
+    unix_ts: u64,
+    repo: String,
+    mode: String,
+    scope: String,
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let Some(command) = args.next() else {
@@ -69,67 +117,73 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    if command != "bench" {
-        bail!("unsupported command `{}`", command.to_string_lossy());
-    }
-
-    let options = parse_bench_options(args.collect())?;
-    match options.subcommand {
-        BenchSubcommand::Record => {
-            let sample = run_bench_sample(&options)?;
-            append_sample(&options.output, &sample)?;
-            println!(
-                "recorded benchmark: case={} duration_ms={} changed_files={} output={}",
-                sample.case_name,
-                sample.duration_ms,
-                sample.changed_files,
-                options.output.display()
-            );
-        }
-        BenchSubcommand::Compare => {
-            let sample = run_bench_sample(&options)?;
-            let previous = load_latest_sample(&options.output, &sample.case_name)?;
-            if let Some(prev) = previous {
-                validate_workload_identity(&prev, &sample)?;
-                print_comparison(&prev, &sample);
-                let regressed = is_duration_regressed(&prev, &sample, options.max_regression_pct);
-                if let Some(path) = options.report_output.as_ref() {
-                    write_compare_report(
-                        path,
-                        &prev,
-                        &sample,
-                        options.max_regression_pct,
-                        regressed,
-                    )?;
-                }
-                if regressed {
-                    bail!(
-                        "benchmark regression: duration exceeded {:.1}% threshold",
-                        options.max_regression_pct
-                    );
-                }
-                if options.append_on_pass {
+    match command.to_string_lossy().as_ref() {
+        "bench" => {
+            let options = parse_bench_options(args.collect())?;
+            match options.subcommand {
+                BenchSubcommand::Record => {
+                    let sample = run_bench_sample(&options)?;
                     append_sample(&options.output, &sample)?;
-                }
-            } else {
-                if options.require_baseline {
-                    bail!(
-                        "no baseline found for case `{}` in {}",
+                    println!(
+                        "recorded benchmark: case={} duration_ms={} changed_files={} output={}",
                         sample.case_name,
+                        sample.duration_ms,
+                        sample.changed_files,
                         options.output.display()
                     );
                 }
-                println!(
-                    "no baseline found for case `{}` in {}. recording first sample.",
-                    sample.case_name,
-                    options.output.display()
-                );
-                append_sample(&options.output, &sample)?;
+                BenchSubcommand::Compare => {
+                    let sample = run_bench_sample(&options)?;
+                    let previous = load_latest_sample(&options.output, &sample.case_name)?;
+                    if let Some(prev) = previous {
+                        validate_workload_identity(&prev, &sample)?;
+                        print_comparison(&prev, &sample);
+                        let regressed =
+                            is_duration_regressed(&prev, &sample, options.max_regression_pct);
+                        if let Some(path) = options.report_output.as_ref() {
+                            write_compare_report(
+                                path,
+                                &prev,
+                                &sample,
+                                options.max_regression_pct,
+                                regressed,
+                            )?;
+                        }
+                        if regressed {
+                            bail!(
+                                "benchmark regression: duration exceeded {:.1}% threshold",
+                                options.max_regression_pct
+                            );
+                        }
+                        if options.append_on_pass {
+                            append_sample(&options.output, &sample)?;
+                        }
+                    } else {
+                        if options.require_baseline {
+                            bail!(
+                                "no baseline found for case `{}` in {}",
+                                sample.case_name,
+                                options.output.display()
+                            );
+                        }
+                        println!(
+                            "no baseline found for case `{}` in {}. recording first sample.",
+                            sample.case_name,
+                            options.output.display()
+                        );
+                        append_sample(&options.output, &sample)?;
+                    }
+                }
+                BenchSubcommand::Profile => {
+                    run_profile_sample(&options)?;
+                }
             }
         }
-        BenchSubcommand::Profile => {
-            run_profile_sample(&options)?;
+        "ops" => {
+            let options = parse_ops_options(args.collect())?;
+            run_ops(&options)?;
         }
+        other => bail!("unsupported command `{other}`"),
     }
 
     Ok(())
@@ -137,7 +191,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH"
     );
 }
 
@@ -250,6 +304,67 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
     })
 }
 
+fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
+    let mut iter = args.into_iter();
+    let Some(sub) = iter.next() else {
+        bail!("missing ops subcommand (`weekly-summary` or `audit-report`)");
+    };
+    let subcommand = match sub.to_string_lossy().as_ref() {
+        "weekly-summary" => OpsSubcommand::WeeklySummary,
+        "audit-report" => OpsSubcommand::AuditReport,
+        other => bail!("unsupported ops subcommand `{other}`"),
+    };
+    let mut metrics_input = PathBuf::from("artifacts/scan-metrics.jsonl");
+    let mut audit_input = PathBuf::from("artifacts/scan-audit.jsonl");
+    let mut output = PathBuf::from("artifacts/ops-report.md");
+    let mut trend_output = None;
+
+    while let Some(flag) = iter.next() {
+        match flag.to_string_lossy().as_ref() {
+            "--metrics-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --metrics-input"))?;
+                metrics_input = PathBuf::from(value);
+            }
+            "--audit-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --audit-input"))?;
+                audit_input = PathBuf::from(value);
+            }
+            "--output" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --output"))?;
+                output = PathBuf::from(value);
+            }
+            "--trend-output" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --trend-output"))?;
+                trend_output = Some(PathBuf::from(value));
+            }
+            other => bail!("unsupported flag `{other}`"),
+        }
+    }
+
+    Ok(OpsOptions {
+        subcommand,
+        metrics_input,
+        audit_input,
+        output,
+        trend_output,
+    })
+}
+
+fn run_ops(options: &OpsOptions) -> Result<()> {
+    match options.subcommand {
+        OpsSubcommand::WeeklySummary => run_weekly_summary(options),
+        OpsSubcommand::AuditReport => run_audit_report(options),
+    }
+}
+
 fn run_bench_sample(options: &BenchOptions) -> Result<BenchSample> {
     if let Some(files) = options.synthetic_files {
         return run_synthetic_bench_sample(&options.case_name, files, options.synthetic_lines);
@@ -293,6 +408,206 @@ fn run_profile_sample(options: &BenchOptions) -> Result<()> {
         run_patchgate_scan_with_profile(&options.repo, &options.profile_output)?;
     }
     println!("scan profile written: {}", options.profile_output.display());
+    Ok(())
+}
+
+fn run_weekly_summary(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+
+    let runs = metrics.len();
+    let gate_failures = metrics
+        .iter()
+        .filter(|m| m.should_fail.unwrap_or(false))
+        .count();
+    let execution_errors = metrics.iter().filter(|m| m.failure_code.is_some()).count();
+    let avg_duration = average_duration_for_summary(&metrics);
+    let scored: Vec<u8> = metrics.iter().filter_map(|m| m.score).collect();
+    let avg_score = if scored.is_empty() {
+        0.0
+    } else {
+        scored.iter().map(|s| *s as f64).sum::<f64>() / scored.len() as f64
+    };
+
+    let failure_codes = aggregate_failure_code_counts(&metrics, &audits);
+
+    let mut md = String::new();
+    md.push_str("# Weekly Operations Summary\n\n");
+    md.push_str(&format!("- runs: {runs}\n"));
+    md.push_str(&format!("- gate_failures: {gate_failures}\n"));
+    md.push_str(&format!("- execution_errors: {execution_errors}\n"));
+    md.push_str(&format!("- avg_duration_ms: {:.2}\n", avg_duration));
+    md.push_str(&format!("- avg_score: {:.2}\n", avg_score));
+    md.push_str(&format!("- audit_events: {}\n\n", audits.len()));
+    md.push_str("## Failure Codes\n");
+    if failure_codes.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for (code, count) in failure_codes {
+            md.push_str(&format!("- {code}: {count}\n"));
+        }
+    }
+
+    write_output(&options.output, md.as_str())?;
+
+    if let Some(path) = options.trend_output.as_ref() {
+        let mut by_key = BTreeMap::<String, usize>::new();
+        for row in &metrics {
+            let day = row.unix_ts / 86_400;
+            let key = format!(
+                "day:{day}|repo:{}|scope:{}|mode:{}",
+                row.repo, row.scope, row.mode
+            );
+            *by_key.entry(key).or_insert(0) += 1;
+        }
+        write_output(path, serde_json::to_string_pretty(&by_key)?.as_str())?;
+    }
+
+    println!("weekly summary written: {}", options.output.display());
+    Ok(())
+}
+
+fn average_duration_for_summary(metrics: &[MetricLogRecord]) -> f64 {
+    let duration_samples: Vec<&MetricLogRecord> = metrics
+        .iter()
+        .filter(|m| m.failure_code.is_none())
+        .collect();
+    if duration_samples.is_empty() {
+        0.0
+    } else {
+        duration_samples
+            .iter()
+            .map(|m| m.duration_ms as f64)
+            .sum::<f64>()
+            / duration_samples.len() as f64
+    }
+}
+
+fn metric_failure_key(row: &MetricLogRecord) -> Option<FailureEventKey> {
+    row.failure_code.as_ref().map(|code| FailureEventKey {
+        code: code.clone(),
+        unix_ts: row.unix_ts,
+        repo: row.repo.clone(),
+        mode: row.mode.clone(),
+        scope: row.scope.clone(),
+    })
+}
+
+fn audit_failure_key(row: &AuditLogRecord) -> Option<FailureEventKey> {
+    row.failure_code.as_ref().map(|code| FailureEventKey {
+        code: code.clone(),
+        unix_ts: row.unix_ts,
+        repo: row.repo.clone(),
+        mode: row.mode.clone(),
+        scope: row.scope.clone(),
+    })
+}
+
+fn aggregate_failure_code_counts(
+    metrics: &[MetricLogRecord],
+    audits: &[AuditLogRecord],
+) -> BTreeMap<String, usize> {
+    let mut metric_counts = BTreeMap::<FailureEventKey, usize>::new();
+    for row in metrics {
+        if let Some(key) = metric_failure_key(row) {
+            *metric_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut audit_counts = BTreeMap::<FailureEventKey, usize>::new();
+    for row in audits {
+        if let Some(key) = audit_failure_key(row) {
+            *audit_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut failure_codes = BTreeMap::<String, usize>::new();
+    for (key, metric_count) in &metric_counts {
+        let audit_count = audit_counts.get(key).copied().unwrap_or(0);
+        *failure_codes.entry(key.code.clone()).or_insert(0) += (*metric_count).max(audit_count);
+    }
+    for (key, audit_count) in &audit_counts {
+        if !metric_counts.contains_key(key) {
+            *failure_codes.entry(key.code.clone()).or_insert(0) += *audit_count;
+        }
+    }
+
+    failure_codes
+}
+
+fn run_audit_report(options: &OpsOptions) -> Result<()> {
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let mut by_result = BTreeMap::<String, usize>::new();
+    let mut by_actor = BTreeMap::<String, usize>::new();
+    let mut by_failure = BTreeMap::<String, usize>::new();
+
+    for row in &audits {
+        *by_result.entry(row.result.clone()).or_insert(0) += 1;
+        *by_actor.entry(row.actor.clone()).or_insert(0) += 1;
+        if let Some(code) = row.failure_code.as_ref() {
+            *by_failure.entry(code.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut md = String::new();
+    md.push_str("# Audit Report\n\n");
+    md.push_str(&format!("- total_events: {}\n", audits.len()));
+    md.push_str("## Result Counts\n");
+    if by_result.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for (result, count) in by_result {
+            md.push_str(&format!("- {result}: {count}\n"));
+        }
+    }
+    md.push_str("\n## Failure Codes\n");
+    if by_failure.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for (code, count) in by_failure {
+            md.push_str(&format!("- {code}: {count}\n"));
+        }
+    }
+    md.push_str("\n## Actors\n");
+    if by_actor.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for (actor, count) in by_actor {
+            md.push_str(&format!("- {actor}: {count}\n"));
+        }
+    }
+
+    write_output(&options.output, md.as_str())?;
+    println!("audit report written: {}", options.output.display());
+    Ok(())
+}
+
+fn load_jsonl_records<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    if !path.exists() {
+        bail!("input JSONL file does not exist: {}", path.display());
+    }
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(
+            serde_json::from_str::<T>(&line)
+                .with_context(|| format!("decode line {} from {}", idx + 1, path.display()))?,
+        );
+    }
+    Ok(out)
+}
+
+fn write_output(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -615,7 +930,11 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
-    use super::{canonical_repo_path, validate_workload_identity, BenchSample, TEMP_SEQ};
+    use super::{
+        aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
+        load_jsonl_records, validate_workload_identity, AuditLogRecord, BenchSample,
+        MetricLogRecord, TEMP_SEQ,
+    };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
         BenchSample {
@@ -661,5 +980,100 @@ mod tests {
         assert_eq!(resolved, expected);
 
         std::fs::remove_dir_all(&abs).expect("cleanup temp repo dir");
+    }
+
+    #[test]
+    fn weekly_summary_duration_excludes_execution_errors() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 1,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 20,
+                score: Some(90),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+            MetricLogRecord {
+                unix_ts: 2,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+        ];
+
+        assert_eq!(average_duration_for_summary(&metrics), 20.0);
+    }
+
+    #[test]
+    fn failure_code_aggregation_deduplicates_stream_overlap_without_losing_multiplicity() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 10,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            MetricLogRecord {
+                unix_ts: 10,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                score: None,
+                should_fail: None,
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+        ];
+        let audits = vec![
+            AuditLogRecord {
+                unix_ts: 10,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            AuditLogRecord {
+                unix_ts: 10,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-RT-001".to_string()),
+            },
+            AuditLogRecord {
+                unix_ts: 11,
+                actor: "bot".to_string(),
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "error".to_string(),
+                failure_code: Some("PG-CFG-001".to_string()),
+            },
+        ];
+
+        let counts = aggregate_failure_code_counts(&metrics, &audits);
+        assert_eq!(counts.get("PG-RT-001"), Some(&2usize));
+        assert_eq!(counts.get("PG-CFG-001"), Some(&1usize));
+    }
+
+    #[test]
+    fn load_jsonl_records_errors_when_file_is_missing() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let missing = std::env::temp_dir().join(format!("xtask-missing-{seq}.jsonl"));
+        let err = load_jsonl_records::<MetricLogRecord>(&missing).expect_err("must error");
+        assert!(err.to_string().contains("does not exist"));
     }
 }

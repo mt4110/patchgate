@@ -28,6 +28,8 @@ Phase1-20 で先に固める対象:
 - [PR Plan: Phase31-40](../phase31_40.md)
 - [PR Plan: Phase41-50](../phase41_50.md)
 - [PR Plan: Phase51-60](../phase51_60.md)
+- [PR Plan: Phase61-70](../phase61_70.md)
+- [PR Plan: Phase71-80](../phase71_80.md)
 
 ## Phase 1-10 (MVP基盤固定)
 

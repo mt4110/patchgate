@@ -12,3 +12,4 @@ serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 globset = "0.4"
+chrono.workspace = true

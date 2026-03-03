@@ -1,0 +1,8 @@
+# Policy and governance surfaces
+config/policy.toml.example @mt4110
+config/presets/ @mt4110
+config/policy.v1.legacy.toml @mt4110
+
+# Workflow and release governance
+.github/workflows/ @mt4110
+docs/99_release_checklist.md @mt4110

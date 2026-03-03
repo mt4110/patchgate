@@ -1,0 +1,74 @@
+name: Policy Governance
+
+on:
+  pull_request:
+    paths:
+      - "config/policy.toml.example"
+      - "config/presets/**"
+      - "config/policy.v1.legacy.toml"
+      - ".github/CODEOWNERS"
+      - ".github/workflows/policy-governance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure CODEOWNERS includes policy paths
+        run: |
+          grep -nE "^config/policy.toml.example" .github/CODEOWNERS
+          grep -nE "^config/presets/" .github/CODEOWNERS
+          grep -nE "^config/policy.v1.legacy.toml" .github/CODEOWNERS
+
+      - name: Detect policy-scope changes
+        if: github.event_name == 'pull_request'
+        id: policy_scope
+        env:
+          FILES_API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files_file="$(mktemp)"
+          page=1
+          while :; do
+            response=$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${FILES_API_URL}&page=${page}")
+            echo "$response" | jq -r '.[].filename' >> "$files_file"
+            count=$(echo "$response" | jq 'length')
+            if [ "$count" -lt 100 ]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+          files=$(cat "$files_file")
+          echo "changed files:"
+          echo "$files"
+          if echo "$files" | grep -Eq '^(config/policy.toml.example|config/presets/.+|config/policy.v1.legacy.toml|\.github/CODEOWNERS)$'; then
+            echo "needs_policy_label=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_policy_label=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require `policy-approved` label for policy changes
+        if: github.event_name == 'pull_request' && steps.policy_scope.outputs.needs_policy_label == 'true'
+        env:
+          API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          labels=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL" | jq -r '.[].name')
+          echo "labels: $labels"
+          if ! echo "$labels" | grep -Fxq "policy-approved"; then
+            echo "Missing required label: policy-approved"
+            exit 1
+          fi

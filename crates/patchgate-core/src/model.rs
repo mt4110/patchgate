@@ -114,6 +114,20 @@ pub struct Report {
     pub changed_files: usize,
     #[serde(default)]
     pub check_durations_ms: BTreeMap<String, u128>,
+    #[serde(default)]
+    pub diagnostic_hints: Vec<String>,
+    #[serde(default)]
+    pub supply_chain_signals: Vec<SupplyChainSignal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupplyChainSignal {
+    pub id: String,
+    pub title: String,
+    pub severity: Severity,
+    pub message: String,
+    pub related_files: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,8 +162,29 @@ impl Report {
             skipped_by_cache: meta.skipped_by_cache,
             changed_files: 0,
             check_durations_ms: BTreeMap::new(),
+            diagnostic_hints: diagnostic_hints_from_score(score, should_fail),
+            supply_chain_signals: Vec::new(),
         }
     }
+}
+
+fn diagnostic_hints_from_score(score: u8, should_fail: bool) -> Vec<String> {
+    let mut hints = Vec::new();
+    if should_fail {
+        hints.push("Gate failed: prioritize critical/high findings first.".to_string());
+    }
+    if score <= 40 {
+        hints.push(
+            "Score is in P0 band (<=40): split PR or add mitigation notes before merge."
+                .to_string(),
+        );
+    } else if score <= 65 {
+        hints.push(
+            "Score is in P1 band (41-65): assign focused reviewers for risk-heavy files."
+                .to_string(),
+        );
+    }
+    hints
 }
 
 pub fn review_priority_from_score(score: u8) -> ReviewPriority {

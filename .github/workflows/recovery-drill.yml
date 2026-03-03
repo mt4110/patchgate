@@ -1,0 +1,65 @@
+name: Recovery Drill
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Scenario 1 - invalid CLI option
+        run: |
+          set +e
+          cargo run -p patchgate-cli -- scan --scope invalid --mode warn --format json
+          code=$?
+          set -e
+          test "$code" -eq 2
+
+      - name: Scenario 2 - publish input failure
+        run: |
+          unset GITHUB_REPOSITORY GITHUB_EVENT_PATH GITHUB_REF GITHUB_SHA GITHUB_TOKEN
+          set +e
+          cargo run -p patchgate-cli -- scan --scope staged --mode warn --format json --github-publish
+          code=$?
+          set -e
+          test "$code" -eq 6
+
+      - name: Scenario 3 - expired waiver policy
+        run: |
+          cat > /tmp/policy-expired-waiver.toml <<'EOF'
+          policy_version = 2
+          [waiver]
+          entries = [
+            { check_id = "dependency_update", reason = "drill", approver = "sec-team", expires_at = "2000-01-01T00:00:00Z" }
+          ]
+          EOF
+          set +e
+          cargo run -p patchgate-cli -- policy lint --path /tmp/policy-expired-waiver.toml
+          code=$?
+          set -e
+          test "$code" -eq 13
+
+      - name: Publish drill report
+        run: |
+          mkdir -p artifacts
+          cat > artifacts/recovery-drill.md <<'EOF'
+          # Recovery Drill Report
+
+          - Scenario 1: invalid CLI option -> exit 2
+          - Scenario 2: publish input failure -> exit 6
+          - Scenario 3: expired waiver -> exit 13
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovery-drill
+          path: artifacts/recovery-drill.md

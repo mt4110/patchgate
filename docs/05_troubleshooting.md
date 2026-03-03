@@ -1,99 +1,87 @@
 # 05 Troubleshooting
 
-Purpose: エラーの原因と対処法。
+## Common errors
 
-## Common Errors
-
-### `patchgate policy lint` が `10` で失敗する
+### `PG-IN-001` (入力不正)
 
 原因:
 
-- policy ファイルが見つからない
-- TOML の構文エラー
+- `--scope` / `--mode` / `--format` などの値が不正
 
 対処:
 
-- `--path` を明示する
-- TOML 構文を修正する
+- `docs/03_cli_reference.md` の許可値へ修正
 
-### `patchgate policy lint` が `11/12/13` で失敗する
+### `PG-CFG-001` / `PG-GOV-001` (設定・waiver)
 
 原因:
 
-- `11`: 型エラー（enum値や型不一致）
-- `12`: 範囲エラー（例: `large_change_lines = 0`）
-- `13`: 依存関係エラー（例: `critical_patterns` が `patterns` の部分集合でない）
+- policy 読み込み失敗
+- `waiver.entries[].expires_at` が期限切れ
 
 対処:
 
-- `docs/02_config_reference.md` と `config/policy.toml.example` を基準に値を修正
+- `patchgate policy lint --path <policy>`
+- 期限切れwaiverを更新または削除
 
-### `patchgate policy lint --require-current-version` が `14` で失敗する
+### `PG-GIT-001` (Git差分収集失敗)
 
 原因:
 
-- `policy_version` が current ではない（または未指定で legacy 扱い）
+- Git管理外ディレクトリ
+- 壊れたworktree/権限不備
 
 対処:
 
-```bash
-patchgate policy migrate --from 1 --to 2 --path policy.toml --write
-patchgate policy lint --path policy.toml --require-current-version
-```
+- `patchgate doctor` で git診断
+- `--scope worktree` で再試行
 
-### GitHub publish が rate limit で不安定
+### `PG-RT-001` (評価実行失敗)
+
+原因:
+
+- 評価途中エラー、cache破損、実行環境不整合
+
+対処:
+
+- `patchgate scan --no-cache` で再試行
+- cache再生成（`doctor` で確認）
+
+### `PG-PUB-SSO-001` / `PG-PUB-ORG-001`
+
+原因:
+
+- SSO未承認
+- organization policy により comment/check/label 操作が禁止
+
+対処:
+
+- トークンのSSO承認を実施
+- GitHub App token へ切替
+- Org policy で必要権限（checks/issues/pull_requests）を確認
+
+### publishログの秘匿情報漏えい懸念
 
 症状:
 
-- `403` + `x-ratelimit-remaining: 0`
-- `429 Too Many Requests`
-- `degraded mode activated` が表示される
+- APIエラーメッセージにtoken類似文字列が含まれる
 
 対処:
 
-- retry設定を増やす (`--github-retry-max-attempts`, `--github-retry-backoff-ms`)
-- `--github-suppress-comment-rerun` で連続投稿ノイズを減らす
-- まず `--github-dry-run` で payload 妥当性を確認する
+- patchgateは `ghp_` / `github_pat_` / `Bearer ...` を自動マスク
+- 追加で `--github-dry-run` を使いpayloadのみ検証
 
-### `github_auth=app` で publish 失敗
+## Operational diagnostics
 
-原因:
+- metrics: `--metrics-output artifacts/scan-metrics.jsonl`
+- audit: `--audit-log-output artifacts/scan-audit.jsonl`
+- summary: `patchgate history summary --input ...`
+- trend: `patchgate history trend --input ...`
 
-- `--github-app-token-env` で指定した installation token が不足/期限切れ
+## Recovery drill
 
-対処:
-
-- GitHub App installation token を再発行
-- `--github-dry-run` で auth mode と payload を検証
-
-### changed file 上限で scan が失敗/スキップされる
-
-症状:
-
-- `changed file count ... exceeded configured max_changed_files ...`
-
-対処:
-
-- fail-closed 運用なら `scope.max_changed_files` を適切値に引き上げる
-- fail-open 運用にする場合は `scope.on_exceed = "fail_open"` を指定
-- 一時的に CLI override する場合は `--max-changed-files` / `--on-exceed` を使う
-
-### Windows で scan が遅い
-
-症状:
-
-- Linux/macOS と比較して `duration_ms` が大きく乖離する
-- CI の Windows ジョブのみ benchmark 回帰が出る
-
-対処:
-
-- `patchgate scan --profile-output artifacts/scan-profile.json` で内訳を確認
-- Defender/リアルタイムスキャン対象からワークスペース・`target/` を除外（組織ポリシー範囲で）
-- Git/NTFS I/O 負荷を下げるため、不要な worktree 差分を減らして計測を再実行
-
-## Debugging
-
-- `patchgate doctor` で config path と `policy_version` を確認
-- `patchgate scan --policy-preset <preset> --format json` で effective 挙動を確認
-- publish前に `--github-dry-run --github-dry-run-output` で送信内容を保存して確認
-- cache影響を排除する場合は `--no-cache` を使う
+- `.github/workflows/recovery-drill.yml` で定期演習
+- 想定シナリオ:
+  - 不正CLI入力
+  - publish入力不足
+  - 期限切れwaiver

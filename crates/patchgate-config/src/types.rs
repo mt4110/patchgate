@@ -27,6 +27,12 @@ pub struct Config {
     pub dangerous_change: DangerousChangeConfig,
     #[serde(default)]
     pub dependency_update: DependencyUpdateConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub alerts: AlertConfig,
+    #[serde(default)]
+    pub waiver: WaiverConfig,
 }
 
 impl Default for Config {
@@ -43,6 +49,9 @@ impl Default for Config {
             test_gap: TestGapConfig::default(),
             dangerous_change: DangerousChangeConfig::default(),
             dependency_update: DependencyUpdateConfig::default(),
+            observability: ObservabilityConfig::default(),
+            alerts: AlertConfig::default(),
+            waiver: WaiverConfig::default(),
         }
     }
 }
@@ -557,4 +566,78 @@ fn default_jvm_penalty() -> DependencyEcosystemPenalty {
         lockfile_bonus_penalty: 0,
         large_lockfile_bonus_penalty: 0,
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub metrics_jsonl_path: String,
+    #[serde(default)]
+    pub audit_jsonl_path: String,
+    #[serde(default = "default_audit_schema_version")]
+    pub audit_schema_version: u8,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_jsonl_path: default_empty_string(),
+            audit_jsonl_path: default_empty_string(),
+            audit_schema_version: default_audit_schema_version(),
+        }
+    }
+}
+
+fn default_empty_string() -> String {
+    String::new()
+}
+
+fn default_audit_schema_version() -> u8 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertConfig {
+    #[serde(default = "default_score_drop_threshold")]
+    pub score_drop_threshold: u8,
+    #[serde(default = "default_failure_rate_increase_pct")]
+    pub failure_rate_increase_pct: u8,
+    #[serde(default = "default_duration_increase_pct")]
+    pub duration_increase_pct: u8,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            score_drop_threshold: default_score_drop_threshold(),
+            failure_rate_increase_pct: default_failure_rate_increase_pct(),
+            duration_increase_pct: default_duration_increase_pct(),
+        }
+    }
+}
+
+fn default_score_drop_threshold() -> u8 {
+    15
+}
+
+fn default_failure_rate_increase_pct() -> u8 {
+    25
+}
+
+fn default_duration_increase_pct() -> u8 {
+    40
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaiverConfig {
+    #[serde(default)]
+    pub entries: Vec<WaiverEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaiverEntry {
+    pub check_id: String,
+    pub reason: String,
+    pub approver: String,
+    pub expires_at: String,
 }

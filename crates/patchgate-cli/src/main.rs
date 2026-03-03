@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
-use patchgate_github::{publish_report, PublishAuth, PublishRequest, RetryPolicy};
+use patchgate_github::{
+    mask_secrets as mask_sensitive, publish_report, PublishAuth, PublishRequest, RetryPolicy,
+};
 use rusqlite::{params, Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -48,11 +51,14 @@ enum Command {
     /// Print environment and config diagnostics
     Doctor,
 
+    /// Aggregate scan history from JSONL records
+    History(HistoryArgs),
+
     /// Validate and migrate policy files
     Policy(PolicyArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct ScanArgs {
     /// Apply policy preset before loading policy file: strict|balanced|relaxed
     #[arg(long)]
@@ -89,6 +95,18 @@ struct ScanArgs {
     /// Write machine-readable scan profile JSON
     #[arg(long)]
     profile_output: Option<PathBuf>,
+
+    /// Append scan metrics JSONL record
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
+
+    /// Append audit log JSONL record
+    #[arg(long)]
+    audit_log_output: Option<PathBuf>,
+
+    /// Override actor for audit logs (default: GITHUB_ACTOR or $USER)
+    #[arg(long)]
+    audit_actor: Option<String>,
 
     /// Write PR comment markdown to a file
     #[arg(long)]
@@ -172,6 +190,47 @@ struct ScanArgs {
 }
 
 #[derive(Args, Debug)]
+struct HistoryArgs {
+    #[command(subcommand)]
+    cmd: HistoryCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryCommand {
+    /// Summarize scan history metrics JSONL
+    Summary(HistorySummaryArgs),
+
+    /// Build per-repo/scope/check trend aggregates
+    Trend(HistoryTrendArgs),
+}
+
+#[derive(Args, Debug)]
+struct HistorySummaryArgs {
+    /// Input metrics JSONL path
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Optional baseline metrics JSONL path for alert threshold comparison
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Args, Debug)]
+struct HistoryTrendArgs {
+    /// Input metrics JSONL path
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "json")]
+    format: String,
+}
+
+#[derive(Args, Debug)]
 struct PolicyArgs {
     #[command(subcommand)]
     cmd: PolicyCommand,
@@ -251,27 +310,107 @@ impl ScanErrorKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureCode {
+    InputInvalidOption,
+    ConfigLoadFailed,
+    GitDiffFailed,
+    RuntimeEvaluationFailed,
+    OutputWriteFailed,
+    PublishInputFailed,
+    PublishApiFailed,
+    PublishSsoRequired,
+    PublishOrgPolicyBlocked,
+    WaiverExpired,
+}
+
+impl FailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            FailureCode::InputInvalidOption => "PG-IN-001",
+            FailureCode::ConfigLoadFailed => "PG-CFG-001",
+            FailureCode::GitDiffFailed => "PG-GIT-001",
+            FailureCode::RuntimeEvaluationFailed => "PG-RT-001",
+            FailureCode::OutputWriteFailed => "PG-OUT-001",
+            FailureCode::PublishInputFailed => "PG-PUB-001",
+            FailureCode::PublishApiFailed => "PG-PUB-002",
+            FailureCode::PublishSsoRequired => "PG-PUB-SSO-001",
+            FailureCode::PublishOrgPolicyBlocked => "PG-PUB-ORG-001",
+            FailureCode::WaiverExpired => "PG-GOV-001",
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            FailureCode::InputInvalidOption => "input",
+            FailureCode::ConfigLoadFailed | FailureCode::WaiverExpired => "config",
+            FailureCode::GitDiffFailed => "git",
+            FailureCode::RuntimeEvaluationFailed => "runtime",
+            FailureCode::OutputWriteFailed => "output",
+            FailureCode::PublishInputFailed
+            | FailureCode::PublishApiFailed
+            | FailureCode::PublishSsoRequired
+            | FailureCode::PublishOrgPolicyBlocked => "publish",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ScanError {
     kind: ScanErrorKind,
+    code: FailureCode,
+    hint: Option<String>,
     source: anyhow::Error,
 }
 
 impl ScanError {
     fn new(kind: ScanErrorKind, source: anyhow::Error) -> Self {
-        Self { kind, source }
+        Self {
+            kind,
+            code: default_failure_code(kind),
+            hint: None,
+            source,
+        }
+    }
+
+    fn with_code(kind: ScanErrorKind, code: FailureCode, source: anyhow::Error) -> Self {
+        Self {
+            kind,
+            code,
+            hint: None,
+            source,
+        }
+    }
+
+    fn with_hint(
+        kind: ScanErrorKind,
+        code: FailureCode,
+        hint: impl Into<String>,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            kind,
+            code,
+            hint: Some(hint.into()),
+            source,
+        }
     }
 
     fn render(&self) -> String {
         format!(
-            "patchgate scan error [{}]: {:#}",
+            "patchgate scan error [{}:{}]: {:#}",
             self.kind.as_str(),
+            self.code.as_str(),
             self.source
         )
     }
 
     fn print(&self) {
-        eprintln!("{}", self.render());
+        eprintln!("{}", mask_sensitive(self.render().as_str()));
+        if let Some(hint) = self.hint.as_ref() {
+            eprintln!("hint: {}", hint);
+        }
     }
 
     fn exit_code(&self) -> i32 {
@@ -281,6 +420,24 @@ impl ScanError {
     #[cfg(test)]
     fn kind(&self) -> ScanErrorKind {
         self.kind
+    }
+
+    fn code(&self) -> FailureCode {
+        self.code
+    }
+
+    fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+}
+
+fn default_failure_code(kind: ScanErrorKind) -> FailureCode {
+    match kind {
+        ScanErrorKind::Input => FailureCode::InputInvalidOption,
+        ScanErrorKind::Config => FailureCode::ConfigLoadFailed,
+        ScanErrorKind::Runtime => FailureCode::RuntimeEvaluationFailed,
+        ScanErrorKind::Output => FailureCode::OutputWriteFailed,
+        ScanErrorKind::Publish => FailureCode::PublishApiFailed,
     }
 }
 
@@ -356,6 +513,66 @@ struct ScanProfile {
     check_durations_ms: BTreeMap<String, u128>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanMetricRecord {
+    schema_version: u8,
+    unix_ts: u64,
+    repo: String,
+    mode: String,
+    scope: String,
+    duration_ms: u128,
+    changed_files: usize,
+    skipped_by_cache: bool,
+    score: Option<u8>,
+    threshold: Option<u8>,
+    should_fail: Option<bool>,
+    check_penalties: BTreeMap<String, u8>,
+    failure_code: Option<String>,
+    failure_category: Option<String>,
+    diagnostic_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditLogRecord {
+    schema_version: u8,
+    audit_format: String,
+    unix_ts: u64,
+    actor: String,
+    repo: String,
+    target: String,
+    mode: String,
+    scope: String,
+    result: String,
+    failure_code: Option<String>,
+    failure_category: Option<String>,
+    score: Option<u8>,
+    threshold: Option<u8>,
+    changed_files: Option<usize>,
+    diagnostic_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistorySummary {
+    runs: usize,
+    gate_failures: usize,
+    execution_errors: usize,
+    failure_rate: f64,
+    average_duration_ms: f64,
+    avg_score: f64,
+    failure_code_counts: BTreeMap<String, usize>,
+    alerts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoryTrendRow {
+    key: String,
+    runs: usize,
+    gate_failures: usize,
+    failure_rate: f64,
+    average_duration_ms: f64,
+    average_score: f64,
+}
+
 type ScanResult<T> = std::result::Result<T, ScanError>;
 const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
 
@@ -365,11 +582,22 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Command::Doctor => run_doctor(&repo_root, cli.config.as_deref()),
+        Command::History(history) => run_history(&repo_root, cli.config.as_deref(), history),
         Command::Scan(scan) => {
-            let code = match execute_scan(&repo_root, cli.config.as_deref(), *scan) {
+            let scan_args = *scan;
+            let failure_log_args = scan_args.clone();
+            let code = match execute_scan(&repo_root, cli.config.as_deref(), scan_args) {
                 Ok(code) => code,
                 Err(err) => {
                     err.print();
+                    if let Err(write_err) = append_scan_failure_records(
+                        &repo_root,
+                        cli.config.as_deref(),
+                        &failure_log_args,
+                        &err,
+                    ) {
+                        eprintln!("warning: failed to append failure telemetry: {write_err:#}");
+                    }
                     err.exit_code()
                 }
             };
@@ -445,6 +673,285 @@ fn execute_policy(repo_root: &Path, config_override: Option<&Path>, policy: Poli
         PolicyCommand::Migrate(args) => {
             run_policy_migrate(repo_root, config_override, args).as_i32()
         }
+    }
+}
+
+fn run_history(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    history: HistoryArgs,
+) -> Result<()> {
+    match history.cmd {
+        HistoryCommand::Summary(args) => {
+            let records = load_metrics_jsonl(&args.input)?;
+            let baseline_records = match args.baseline.as_ref() {
+                Some(path) => Some(load_metrics_jsonl(path)?),
+                None => None,
+            };
+            let config_path = resolve_config_path(repo_root, config_override);
+            let alerts = load_policy_config(config_path.as_deref(), None)
+                .map(|loaded| loaded.config.alerts)
+                .unwrap_or_default();
+            let summary = build_history_summary(&records, baseline_records.as_deref(), &alerts);
+            match args.format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&summary)?),
+                "text" => print_history_summary_text(&summary),
+                other => anyhow::bail!("unsupported --format `{other}` (expected: text|json)"),
+            }
+        }
+        HistoryCommand::Trend(args) => {
+            let records = load_metrics_jsonl(&args.input)?;
+            let trend = build_history_trend(&records);
+            match args.format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&trend)?),
+                "text" => print_history_trend_text(&trend),
+                other => anyhow::bail!("unsupported --format `{other}` (expected: text|json)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_metrics_jsonl(path: &Path) -> Result<Vec<ScanMetricRecord>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("open metrics jsonl: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<ScanMetricRecord>(&line).with_context(|| {
+            format!(
+                "decode metrics jsonl line {} from {}",
+                idx + 1,
+                path.display()
+            )
+        })?;
+        records.push(row);
+    }
+    Ok(records)
+}
+
+fn build_history_summary(
+    records: &[ScanMetricRecord],
+    baseline: Option<&[ScanMetricRecord]>,
+    alerts_cfg: &patchgate_config::AlertConfig,
+) -> HistorySummary {
+    let runs = records.len();
+    let gate_failures = records
+        .iter()
+        .filter(|r| r.should_fail.unwrap_or(false))
+        .count();
+    let execution_errors = records.iter().filter(|r| r.failure_code.is_some()).count();
+    let failed_runs = records
+        .iter()
+        .filter(|r| r.should_fail.unwrap_or(false) || r.failure_code.is_some())
+        .count();
+    let failure_rate = if runs == 0 {
+        0.0
+    } else {
+        (failed_runs as f64 / runs as f64) * 100.0
+    };
+    let duration_samples: Vec<&ScanMetricRecord> = records
+        .iter()
+        .filter(|r| r.failure_code.is_none())
+        .collect();
+    let average_duration_ms = if duration_samples.is_empty() {
+        0.0
+    } else {
+        duration_samples
+            .iter()
+            .map(|r| r.duration_ms as f64)
+            .sum::<f64>()
+            / duration_samples.len() as f64
+    };
+    let scored: Vec<u8> = records.iter().filter_map(|r| r.score).collect();
+    let avg_score = if scored.is_empty() {
+        0.0
+    } else {
+        scored.iter().map(|v| *v as f64).sum::<f64>() / scored.len() as f64
+    };
+
+    let mut failure_code_counts = BTreeMap::new();
+    for code in records.iter().filter_map(|r| r.failure_code.as_ref()) {
+        *failure_code_counts.entry(code.clone()).or_insert(0) += 1;
+    }
+
+    let mut alerts = Vec::new();
+    if let Some(base) = baseline {
+        let base_summary = build_history_summary(base, None, alerts_cfg);
+        let score_drop = base_summary.avg_score - avg_score;
+        if score_drop >= alerts_cfg.score_drop_threshold as f64 {
+            alerts.push(format!(
+                "score drop alert: {:.2} (threshold {})",
+                score_drop, alerts_cfg.score_drop_threshold
+            ));
+        }
+        let failure_rate_increase = failure_rate - base_summary.failure_rate;
+        if failure_rate_increase >= alerts_cfg.failure_rate_increase_pct as f64 {
+            alerts.push(format!(
+                "failure rate alert: +{:.2}% (threshold {}%)",
+                failure_rate_increase, alerts_cfg.failure_rate_increase_pct
+            ));
+        }
+        let duration_increase_pct =
+            signed_delta(base_summary.average_duration_ms, average_duration_ms);
+        if duration_increase_pct >= alerts_cfg.duration_increase_pct as f64 {
+            alerts.push(format!(
+                "duration alert: +{:.2}% (threshold {}%)",
+                duration_increase_pct, alerts_cfg.duration_increase_pct
+            ));
+        }
+    }
+
+    HistorySummary {
+        runs,
+        gate_failures,
+        execution_errors,
+        failure_rate,
+        average_duration_ms,
+        avg_score,
+        failure_code_counts,
+        alerts,
+    }
+}
+
+fn print_history_summary_text(summary: &HistorySummary) {
+    println!("history summary");
+    println!("- runs: {}", summary.runs);
+    println!("- gate_failures: {}", summary.gate_failures);
+    println!("- execution_errors: {}", summary.execution_errors);
+    println!("- failure_rate: {:.2}%", summary.failure_rate);
+    println!("- avg_duration_ms: {:.2}", summary.average_duration_ms);
+    println!("- avg_score: {:.2}", summary.avg_score);
+    if summary.failure_code_counts.is_empty() {
+        println!("- failure_codes: none");
+    } else {
+        println!("- failure_codes:");
+        for (code, count) in &summary.failure_code_counts {
+            println!("  - {code}: {count}");
+        }
+    }
+    if summary.alerts.is_empty() {
+        println!("- alerts: none");
+    } else {
+        println!("- alerts:");
+        for alert in &summary.alerts {
+            println!("  - {alert}");
+        }
+    }
+}
+
+fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
+    #[derive(Default)]
+    struct TrendAgg {
+        runs: usize,
+        gate_failures: usize,
+        failures: usize,
+        duration_sum: f64,
+        duration_runs: usize,
+        score_sum: f64,
+        scored_runs: usize,
+    }
+
+    let mut grouped: BTreeMap<String, TrendAgg> = BTreeMap::new();
+    for row in records {
+        let day = row.unix_ts / 86_400;
+        let triggered_checks: Vec<&str> = row
+            .check_penalties
+            .iter()
+            .filter_map(|(check, penalty)| (*penalty > 0).then_some(check.as_str()))
+            .collect();
+
+        if triggered_checks.is_empty() {
+            let key = format!("day:{day}|repo:{}|scope:{}|check:none", row.repo, row.scope);
+            let agg = grouped.entry(key).or_default();
+            agg.runs += 1;
+            if row.should_fail.unwrap_or(false) || row.failure_code.is_some() {
+                agg.failures += 1;
+            }
+            if row.should_fail.unwrap_or(false) {
+                agg.gate_failures += 1;
+            }
+            if row.failure_code.is_none() {
+                agg.duration_sum += row.duration_ms as f64;
+                agg.duration_runs += 1;
+            }
+            if let Some(score) = row.score {
+                agg.score_sum += score as f64;
+                agg.scored_runs += 1;
+            }
+            continue;
+        }
+
+        for check in triggered_checks {
+            let key = format!(
+                "day:{day}|repo:{}|scope:{}|check:{}",
+                row.repo, row.scope, check
+            );
+            let agg = grouped.entry(key).or_default();
+            agg.runs += 1;
+            if row.should_fail.unwrap_or(false) || row.failure_code.is_some() {
+                agg.failures += 1;
+            }
+            if row.should_fail.unwrap_or(false) {
+                agg.gate_failures += 1;
+            }
+            if row.failure_code.is_none() {
+                agg.duration_sum += row.duration_ms as f64;
+                agg.duration_runs += 1;
+            }
+            if let Some(score) = row.score {
+                agg.score_sum += score as f64;
+                agg.scored_runs += 1;
+            }
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(key, agg)| HistoryTrendRow {
+            key,
+            runs: agg.runs,
+            gate_failures: agg.gate_failures,
+            failure_rate: if agg.runs == 0 {
+                0.0
+            } else {
+                (agg.failures as f64 / agg.runs as f64) * 100.0
+            },
+            average_duration_ms: if agg.duration_runs == 0 {
+                0.0
+            } else {
+                agg.duration_sum / agg.duration_runs as f64
+            },
+            average_score: if agg.scored_runs == 0 {
+                0.0
+            } else {
+                agg.score_sum / agg.scored_runs as f64
+            },
+        })
+        .collect()
+}
+
+fn print_history_trend_text(rows: &[HistoryTrendRow]) {
+    println!("history trend");
+    for row in rows {
+        println!(
+            "- {} runs={} failure_rate={:.2}% avg_duration_ms={:.2} avg_score={:.2}",
+            row.key, row.runs, row.failure_rate, row.average_duration_ms, row.average_score
+        );
+    }
+}
+
+fn signed_delta(previous: f64, current: f64) -> f64 {
+    if previous <= 0.0 {
+        // Treat zero/invalid baseline as non-comparable to avoid false-positive alerts.
+        0.0
+    } else {
+        ((current - previous) / previous) * 100.0
     }
 }
 
@@ -648,6 +1155,9 @@ fn execute_scan(
         on_exceed,
         no_cache,
         profile_output,
+        metrics_output,
+        audit_log_output,
+        audit_actor,
         github_comment,
         github_publish,
         github_repo,
@@ -669,19 +1179,35 @@ fn execute_scan(
         github_suppress_comment_low_priority,
         github_suppress_comment_rerun,
     } = scan;
+    let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
-        ScanError::new(
+        ScanError::with_code(
             ScanErrorKind::Input,
+            FailureCode::InputInvalidOption,
             anyhow!("invalid value for scan.policy_preset from cli: {err}"),
         )
     })?;
 
     let config_path = resolve_config_path(repo_root, config_override);
     let loaded_cfg = load_policy_config(config_path.as_deref(), preset).map_err(|err| {
-        ScanError::new(
-            ScanErrorKind::Config,
-            anyhow::Error::new(err).context("failed to load policy config"),
-        )
+        if matches!(
+            &err,
+            ConfigError::Validation { field, message, .. }
+                if *field == "waiver.entries" && message.contains("expired")
+        ) {
+            ScanError::with_hint(
+                ScanErrorKind::Config,
+                FailureCode::WaiverExpired,
+                "Update waiver.expires_at or remove expired waiver entries.",
+                anyhow::Error::new(err).context("failed to load policy config"),
+            )
+        } else {
+            ScanError::with_code(
+                ScanErrorKind::Config,
+                FailureCode::ConfigLoadFailed,
+                anyhow::Error::new(err).context("failed to load policy config"),
+            )
+        }
     })?;
     for warning in &loaded_cfg.compatibility_warnings {
         eprintln!("warning: {warning}");
@@ -708,8 +1234,10 @@ fn execute_scan(
     let runner = Runner::new(cfg.clone());
     let diff_collect_start = Instant::now();
     let diff = runner.collect_diff(&ctx).map_err(|err| {
-        ScanError::new(
+        ScanError::with_hint(
             ScanErrorKind::Runtime,
+            FailureCode::GitDiffFailed,
+            "Verify the repository is a valid git worktree and retry with --scope worktree.",
             err.context("failed to collect git diff"),
         )
     })?;
@@ -727,8 +1255,10 @@ fn execute_scan(
             )
         })?;
         runner.evaluate(&ctx, eval_diff, &opts.mode).map_err(|err| {
-            ScanError::new(
+            ScanError::with_hint(
                 ScanErrorKind::Runtime,
+                FailureCode::RuntimeEvaluationFailed,
+                "Run `patchgate doctor` and retry with --no-cache to isolate runtime issues.",
                 err.context("failed to evaluate scan checks"),
             )
         })
@@ -879,7 +1409,7 @@ fn execute_scan(
             github_suppress_comment_rerun,
         );
         let req = resolve_publish_request(PublishRequestInput {
-            github_repo,
+            github_repo: github_repo.clone(),
             github_pr,
             github_sha,
             github_token_env,
@@ -898,16 +1428,15 @@ fn execute_scan(
             suppressed_comment_reason,
         })
         .map_err(|err| {
-            ScanError::new(
+            ScanError::with_hint(
                 ScanErrorKind::Publish,
+                FailureCode::PublishInputFailed,
+                "Set --github-repo/--github-pr/--github-sha or provide matching GitHub Actions env vars.",
                 err.context("failed to resolve GitHub publish inputs"),
             )
         })?;
         let published = publish_report(&report, &markdown, &req).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Publish,
-                err.context("failed to publish report to GitHub"),
-            )
+            classify_publish_scan_error(err.context("failed to publish report to GitHub"))
         })?;
         if let Some(payload) = published.dry_run_payload.as_ref() {
             let pretty = serde_json::to_string_pretty(payload).map_err(|err| {
@@ -916,7 +1445,10 @@ fn execute_scan(
                     anyhow!("failed to encode github dry-run payload: {err}"),
                 )
             })?;
-            eprintln!("github dry-run payload:\n{pretty}");
+            eprintln!(
+                "github dry-run payload:\n{}",
+                mask_sensitive(pretty.as_str())
+            );
             if let Some(path) = github_dry_run_output.as_ref() {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(|err| {
@@ -935,16 +1467,28 @@ fn execute_scan(
             }
         }
         if let Some(reason) = published.skipped_comment_reason.as_ref() {
-            eprintln!("github comment skipped: {reason}");
+            eprintln!(
+                "github comment skipped: {}",
+                mask_sensitive(reason.as_str())
+            );
         }
         if let Some(err) = published.comment_error.as_ref() {
-            eprintln!("warning: failed to publish PR comment: {err}");
+            eprintln!(
+                "warning: failed to publish PR comment: {}",
+                mask_sensitive(err.as_str())
+            );
         }
         if let Some(err) = published.check_run_error.as_ref() {
-            eprintln!("warning: failed to publish check run: {err}");
+            eprintln!(
+                "warning: failed to publish check run: {}",
+                mask_sensitive(err.as_str())
+            );
         }
         if let Some(err) = published.label_error.as_ref() {
-            eprintln!("warning: failed to apply labels: {err}");
+            eprintln!(
+                "warning: failed to apply labels: {}",
+                mask_sensitive(err.as_str())
+            );
         }
         if let Some(mode) = published.degraded_mode.as_ref() {
             eprintln!("warning: publish degraded mode activated: {mode}");
@@ -981,7 +1525,301 @@ fn execute_scan(
         write_scan_profile(path, &profile)?;
     }
 
+    let metrics_path = metrics_output
+        .as_deref()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            non_empty_path(cfg.observability.metrics_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p))
+        });
+    let audit_path = audit_log_output
+        .as_deref()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            non_empty_path(cfg.observability.audit_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p))
+        });
+    append_scan_success_records(
+        telemetry_repo.as_str(),
+        &report,
+        metrics_path.as_deref(),
+        audit_path.as_deref(),
+        resolve_audit_actor(audit_actor.as_deref()),
+        cfg.observability.audit_schema_version,
+    )?;
+
     Ok(gate_exit_code(&opts.mode, report.should_fail))
+}
+
+fn append_scan_success_records(
+    telemetry_repo: &str,
+    report: &Report,
+    metrics_path: Option<&Path>,
+    audit_path: Option<&Path>,
+    actor: String,
+    audit_schema_version: u8,
+) -> ScanResult<()> {
+    let unix_ts = current_unix_ts();
+    if let Some(path) = metrics_path {
+        let metrics = ScanMetricRecord {
+            schema_version: 1,
+            unix_ts,
+            repo: telemetry_repo.to_string(),
+            mode: report.mode.clone(),
+            scope: report.scope.clone(),
+            duration_ms: report.duration_ms,
+            changed_files: report.changed_files,
+            skipped_by_cache: report.skipped_by_cache,
+            score: Some(report.score),
+            threshold: Some(report.threshold),
+            should_fail: Some(report.should_fail),
+            check_penalties: report
+                .checks
+                .iter()
+                .filter(|c| c.triggered && c.penalty > 0)
+                .map(|c| (c.check.as_str().to_string(), c.penalty))
+                .collect(),
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: report.diagnostic_hints.clone(),
+        };
+        append_jsonl(path, &metrics).map_err(|err| {
+            ScanError::with_code(
+                ScanErrorKind::Output,
+                FailureCode::OutputWriteFailed,
+                err.context("failed to append metrics jsonl"),
+            )
+        })?;
+    }
+
+    if let Some(path) = audit_path {
+        let result = if report.should_fail {
+            "gate_fail"
+        } else {
+            "pass"
+        };
+        let audit = AuditLogRecord {
+            schema_version: audit_schema_version,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts,
+            actor,
+            repo: telemetry_repo.to_string(),
+            target: "scan".to_string(),
+            mode: report.mode.clone(),
+            scope: report.scope.clone(),
+            result: result.to_string(),
+            failure_code: None,
+            failure_category: None,
+            score: Some(report.score),
+            threshold: Some(report.threshold),
+            changed_files: Some(report.changed_files),
+            diagnostic_hints: report.diagnostic_hints.clone(),
+        };
+        append_jsonl(path, &audit).map_err(|err| {
+            ScanError::with_code(
+                ScanErrorKind::Output,
+                FailureCode::OutputWriteFailed,
+                err.context("failed to append audit jsonl"),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn append_scan_failure_records(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    scan: &ScanArgs,
+    err: &ScanError,
+) -> Result<()> {
+    let mut metrics_path = scan.metrics_output.clone();
+    let mut audit_path = scan.audit_log_output.clone();
+    let mut audit_schema_version = 1u8;
+    let mut telemetry_mode = scan.mode.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut telemetry_scope = scan.scope.clone().unwrap_or_else(|| "unknown".to_string());
+
+    let preset = parse_policy_preset(scan.policy_preset.as_deref())
+        .ok()
+        .flatten();
+    let config_path = resolve_config_path(repo_root, config_override);
+    if let Ok(loaded) = load_policy_config(config_path.as_deref(), preset) {
+        if metrics_path.is_none() {
+            metrics_path = non_empty_path(loaded.config.observability.metrics_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p));
+        }
+        if audit_path.is_none() {
+            audit_path = non_empty_path(loaded.config.observability.audit_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p));
+        }
+        audit_schema_version = loaded.config.observability.audit_schema_version;
+        if let Ok(opts) = resolve_scan_options(
+            &loaded.config,
+            None,
+            scan.scope.as_deref(),
+            scan.mode.as_deref(),
+        ) {
+            telemetry_mode = opts.mode;
+            telemetry_scope = opts.scope.as_str().to_string();
+        }
+    }
+
+    let unix_ts = current_unix_ts();
+    let telemetry_repo = resolve_telemetry_repo(repo_root, scan.github_repo.as_deref());
+    if let Some(path) = metrics_path.as_deref() {
+        let metrics = ScanMetricRecord {
+            schema_version: 1,
+            unix_ts,
+            repo: telemetry_repo.clone(),
+            mode: telemetry_mode.clone(),
+            scope: telemetry_scope.clone(),
+            duration_ms: 0,
+            changed_files: 0,
+            skipped_by_cache: false,
+            score: None,
+            threshold: None,
+            should_fail: None,
+            check_penalties: BTreeMap::new(),
+            failure_code: Some(err.code().as_str().to_string()),
+            failure_category: Some(err.code().category().to_string()),
+            diagnostic_hints: err.hint().map(|h| vec![h.to_string()]).unwrap_or_default(),
+        };
+        append_jsonl(path, &metrics)?;
+    }
+
+    if let Some(path) = audit_path.as_deref() {
+        let audit = AuditLogRecord {
+            schema_version: audit_schema_version,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts,
+            actor: resolve_audit_actor(scan.audit_actor.as_deref()),
+            repo: telemetry_repo,
+            target: "scan".to_string(),
+            mode: telemetry_mode,
+            scope: telemetry_scope,
+            result: "error".to_string(),
+            failure_code: Some(err.code().as_str().to_string()),
+            failure_category: Some(err.code().category().to_string()),
+            score: None,
+            threshold: None,
+            changed_files: None,
+            diagnostic_hints: err.hint().map(|h| vec![h.to_string()]).unwrap_or_default(),
+        };
+        append_jsonl(path, &audit)?;
+    }
+
+    Ok(())
+}
+
+fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(value)?)
+        .with_context(|| format!("append jsonl {}", path.display()))?;
+    Ok(())
+}
+
+fn non_empty_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+fn resolve_repo_relative_path(repo_root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn resolve_audit_actor(override_actor: Option<&str>) -> String {
+    if let Some(actor) = override_actor {
+        if !actor.trim().is_empty() {
+            return actor.to_string();
+        }
+    }
+    if let Ok(actor) = std::env::var("GITHUB_ACTOR") {
+        if !actor.trim().is_empty() {
+            return actor;
+        }
+    }
+    if let Ok(actor) = std::env::var("USER") {
+        if !actor.trim().is_empty() {
+            return actor;
+        }
+    }
+    if let Ok(actor) = std::env::var("USERNAME") {
+        if !actor.trim().is_empty() {
+            return actor;
+        }
+    }
+    "unknown".to_string()
+}
+
+fn resolve_telemetry_repo(repo_root: &Path, github_repo_override: Option<&str>) -> String {
+    if let Some(repo) = github_repo_override {
+        if !repo.trim().is_empty() {
+            return repo.to_string();
+        }
+    }
+    if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
+        if !repo.trim().is_empty() {
+            return repo;
+        }
+    }
+    if let Some(name) = repo_root.file_name() {
+        let name = name.to_string_lossy();
+        if !name.trim().is_empty() {
+            return format!("local/{name}");
+        }
+    }
+    "local".to_string()
+}
+
+fn current_unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn classify_publish_scan_error(err: anyhow::Error) -> ScanError {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains("saml") || lower.contains("sso") {
+        return ScanError::with_hint(
+            ScanErrorKind::Publish,
+            FailureCode::PublishSsoRequired,
+            "Authorize SSO for the token or use a GitHub App installation token approved for the organization.",
+            err,
+        );
+    }
+    if lower.contains("resource not accessible by integration")
+        || lower.contains("organization")
+        || lower.contains("org policy")
+    {
+        return ScanError::with_hint(
+            ScanErrorKind::Publish,
+            FailureCode::PublishOrgPolicyBlocked,
+            "Check organization policy restrictions and required repository permissions for comments/check-runs/labels.",
+            err,
+        );
+    }
+    ScanError::with_hint(
+        ScanErrorKind::Publish,
+        FailureCode::PublishApiFailed,
+        "Retry with --github-dry-run to inspect payload and verify token scopes.",
+        err,
+    )
 }
 
 fn resolve_publish_request(input: PublishRequestInput) -> Result<PublishRequest> {
@@ -1611,6 +2449,23 @@ fn print_text(report: &Report) {
     println!("Fingerprint: {}", report.fingerprint);
     println!("Duration: {}ms", report.duration_ms);
     println!("Changed files: {}", report.changed_files);
+    if !report.diagnostic_hints.is_empty() {
+        println!("Diagnostics:");
+        for hint in &report.diagnostic_hints {
+            println!("- {hint}");
+        }
+    }
+    if !report.supply_chain_signals.is_empty() {
+        println!("Supply-chain signals:");
+        for signal in &report.supply_chain_signals {
+            println!(
+                "- {} [{}] {}",
+                signal.id,
+                format!("{:?}", signal.severity).to_uppercase(),
+                signal.title
+            );
+        }
+    }
     if !report.check_durations_ms.is_empty() {
         let mut entries: Vec<String> = report
             .check_durations_ms
@@ -1730,6 +2585,12 @@ fn render_github_comment(report: &Report) -> String {
         medium_count,
         low_count
     ));
+    if !report.supply_chain_signals.is_empty() {
+        lines.push(format!(
+            "- Supply-chain signals: {}",
+            report.supply_chain_signals.len()
+        ));
+    }
     lines.push(String::new());
 
     lines.push("### Priority findings".to_string());
@@ -1788,6 +2649,37 @@ fn render_github_comment(report: &Report) -> String {
     }
 
     lines.push(String::new());
+    lines.push("### Diagnostic hints".to_string());
+    if report.diagnostic_hints.is_empty() {
+        lines.push("- No hints".to_string());
+    } else {
+        for hint in &report.diagnostic_hints {
+            lines.push(format!("- {hint}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("### Supply-chain signals".to_string());
+    if report.supply_chain_signals.is_empty() {
+        lines.push("- No signals".to_string());
+    } else {
+        for signal in &report.supply_chain_signals {
+            lines.push(format!(
+                "- **{}** [{}] {}",
+                signal.title,
+                format!("{:?}", signal.severity).to_uppercase(),
+                signal.message
+            ));
+            if !signal.related_files.is_empty() {
+                lines.push(format!(
+                    "  - related files: {}",
+                    signal.related_files.join(", ")
+                ));
+            }
+        }
+    }
+
+    lines.push(String::new());
     lines.push("### All findings".to_string());
 
     if sorted_findings.is_empty() {
@@ -1815,6 +2707,7 @@ fn render_github_comment(report: &Report) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -1828,14 +2721,17 @@ mod tests {
     use patchgate_github::PublishAuth;
 
     use super::{
-        apply_changed_file_overrides, apply_threshold_override, build_cache_key,
+        append_scan_failure_records, apply_changed_file_overrides, apply_threshold_override,
+        build_cache_key, build_history_summary, build_history_trend,
         changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
         gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        recover_cache_db, render_github_comment, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        run_policy_lint, sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanErrorKind, ScopeMode,
+        recover_cache_db, render_github_comment, resolve_audit_actor,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo, run_policy_lint,
+        sorted_findings_for_comment, FailureCode, OptionSource, PolicyExitCode, PolicyLintArgs,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
+        ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1885,6 +2781,43 @@ mod tests {
         )
         .expect("write temp event");
         path
+    }
+
+    fn default_scan_args() -> ScanArgs {
+        ScanArgs {
+            policy_preset: None,
+            format: None,
+            scope: None,
+            mode: None,
+            threshold: None,
+            max_changed_files: None,
+            on_exceed: None,
+            no_cache: false,
+            profile_output: None,
+            metrics_output: None,
+            audit_log_output: None,
+            audit_actor: None,
+            github_comment: None,
+            github_publish: false,
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            github_retry_max_attempts: 3,
+            github_retry_backoff_ms: 300,
+            github_retry_max_backoff_ms: 3000,
+            github_dry_run: false,
+            github_dry_run_output: None,
+            github_no_comment: false,
+            github_no_check_run: false,
+            github_apply_labels: false,
+            github_suppress_comment_no_change: false,
+            github_suppress_comment_low_priority: false,
+            github_suppress_comment_rerun: false,
+        }
     }
 
     #[test]
@@ -2054,6 +2987,119 @@ mod tests {
         env::remove_var("GITHUB_REF");
         env::remove_var("GITHUB_SHA");
         env::remove_var("GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_prefers_cli_override() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+
+        let repo =
+            resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), Some("cli/repo"));
+        assert_eq!(repo, "cli/repo");
+
+        env::remove_var("GITHUB_REPOSITORY");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_falls_back_to_env_then_path() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+
+        env::set_var("GITHUB_REPOSITORY", "env/repo");
+        let from_env = resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), None);
+        assert_eq!(from_env, "env/repo");
+
+        env::remove_var("GITHUB_REPOSITORY");
+        let from_path = resolve_telemetry_repo(PathBuf::from("/tmp/local-repo").as_path(), None);
+        assert_eq!(from_path, "local/local-repo");
+    }
+
+    #[test]
+    fn resolve_telemetry_repo_uses_local_when_repo_name_unavailable() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::remove_var("GITHUB_REPOSITORY");
+
+        let from_root = resolve_telemetry_repo(PathBuf::from("/").as_path(), None);
+        assert_eq!(from_root, "local");
+    }
+
+    #[test]
+    fn resolve_audit_actor_uses_username_when_user_missing() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_ACTOR", "USER", "USERNAME"]);
+        env::remove_var("GITHUB_ACTOR");
+        env::remove_var("USER");
+        env::set_var("USERNAME", "windows-user");
+
+        assert_eq!(resolve_audit_actor(None), "windows-user");
+    }
+
+    #[test]
+    fn failure_telemetry_uses_resolved_mode_and_scope_from_config_defaults() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::remove_var("GITHUB_REPOSITORY");
+
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-failure-telemetry-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut config_path = repo_root.clone();
+        config_path.push("policy.toml");
+        fs::write(
+            &config_path,
+            "policy_version = 2\n[output]\nmode = \"enforce\"\n[scope]\nmode = \"repo\"\n",
+        )
+        .expect("write policy");
+
+        let mut metrics_path = repo_root.clone();
+        metrics_path.push("metrics.jsonl");
+        let mut audit_path = repo_root.clone();
+        audit_path.push("audit.jsonl");
+
+        let mut scan = default_scan_args();
+        scan.metrics_output = Some(metrics_path.clone());
+        scan.audit_log_output = Some(audit_path.clone());
+        scan.mode = None;
+        scan.scope = None;
+
+        let err = ScanError::with_code(
+            ScanErrorKind::Runtime,
+            FailureCode::RuntimeEvaluationFailed,
+            anyhow::anyhow!("boom"),
+        );
+        append_scan_failure_records(&repo_root, Some(&config_path), &scan, &err)
+            .expect("append failure telemetry");
+
+        let metric_line = fs::read_to_string(&metrics_path)
+            .expect("read metrics")
+            .lines()
+            .next()
+            .expect("metrics line")
+            .to_string();
+        let metric: serde_json::Value =
+            serde_json::from_str(&metric_line).expect("decode metrics json");
+        assert_eq!(metric.get("mode").and_then(|v| v.as_str()), Some("enforce"));
+        assert_eq!(metric.get("scope").and_then(|v| v.as_str()), Some("repo"));
+
+        let audit_line = fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .next()
+            .expect("audit line")
+            .to_string();
+        let audit: serde_json::Value = serde_json::from_str(&audit_line).expect("decode audit");
+        assert_eq!(audit.get("mode").and_then(|v| v.as_str()), Some("enforce"));
+        assert_eq!(audit.get("scope").and_then(|v| v.as_str()), Some("repo"));
+
+        let _ = fs::remove_file(metrics_path);
+        let _ = fs::remove_file(audit_path);
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]
@@ -2283,7 +3329,7 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         assert_eq!(
             err.render(),
-            "patchgate scan error [input]: invalid value for scan.scope from cli: `all` (expected: staged|worktree|repo)"
+            "patchgate scan error [input:PG-IN-001]: invalid value for scan.scope from cli: `all` (expected: staged|worktree|repo)"
         );
     }
 
@@ -2294,7 +3340,7 @@ mod tests {
         assert_eq!(err.exit_code(), 3);
         assert_eq!(
             err.render(),
-            "patchgate scan error [config]: invalid value for scan.mode from config: `strict` (expected: warn|enforce)"
+            "patchgate scan error [config:PG-CFG-001]: invalid value for scan.mode from config: `strict` (expected: warn|enforce)"
         );
     }
 
@@ -2347,6 +3393,209 @@ mod tests {
                 "high-high-penalty".to_string(),
                 "medium-high-penalty".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn history_trend_excludes_unscored_rows_from_average_score() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 10);
+        let records = vec![
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_400,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 10,
+                changed_files: 1,
+                skipped_by_cache: false,
+                score: Some(80),
+                threshold: Some(70),
+                should_fail: Some(false),
+                check_penalties: penalties.clone(),
+                failure_code: None,
+                failure_category: None,
+                diagnostic_hints: vec![],
+            },
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_401,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 15,
+                changed_files: 0,
+                skipped_by_cache: false,
+                score: None,
+                threshold: None,
+                should_fail: None,
+                check_penalties: penalties,
+                failure_code: Some("PG-RT-001".to_string()),
+                failure_category: Some("runtime".to_string()),
+                diagnostic_hints: vec![],
+            },
+        ];
+
+        let trend = build_history_trend(&records);
+        let row = trend
+            .iter()
+            .find(|r| r.key.contains("check:test_gap"))
+            .expect("test_gap row");
+        assert_eq!(row.runs, 2);
+        assert_eq!(row.failure_rate, 50.0);
+        assert_eq!(row.average_duration_ms, 10.0);
+        assert_eq!(row.average_score, 80.0);
+    }
+
+    #[test]
+    fn history_summary_excludes_execution_error_rows_from_duration_average() {
+        let records = vec![
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_400,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 12,
+                changed_files: 1,
+                skipped_by_cache: false,
+                score: Some(90),
+                threshold: Some(70),
+                should_fail: Some(false),
+                check_penalties: BTreeMap::new(),
+                failure_code: None,
+                failure_category: None,
+                diagnostic_hints: vec![],
+            },
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_401,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 0,
+                changed_files: 0,
+                skipped_by_cache: false,
+                score: None,
+                threshold: None,
+                should_fail: None,
+                check_penalties: BTreeMap::new(),
+                failure_code: Some("PG-RT-001".to_string()),
+                failure_category: Some("runtime".to_string()),
+                diagnostic_hints: vec![],
+            },
+        ];
+
+        let summary = build_history_summary(&records, None, &Config::default().alerts);
+        assert_eq!(summary.failure_rate, 50.0);
+        assert_eq!(summary.average_duration_ms, 12.0);
+    }
+
+    #[test]
+    fn history_trend_ignores_non_triggered_check_penalty_keys() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 0);
+        penalties.insert("dangerous_change".to_string(), 0);
+        let records = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 7,
+            changed_files: 1,
+            skipped_by_cache: false,
+            score: Some(100),
+            threshold: Some(70),
+            should_fail: Some(false),
+            check_penalties: penalties,
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+
+        let trend = build_history_trend(&records);
+        assert_eq!(trend.len(), 1);
+        assert!(trend[0].key.contains("check:none"));
+    }
+
+    #[test]
+    fn history_trend_only_counts_triggered_checks_when_mixed_penalties_exist() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 12);
+        penalties.insert("dangerous_change".to_string(), 0);
+        let records = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 9,
+            changed_files: 2,
+            skipped_by_cache: false,
+            score: Some(88),
+            threshold: Some(70),
+            should_fail: Some(true),
+            check_penalties: penalties,
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+
+        let trend = build_history_trend(&records);
+        assert_eq!(trend.len(), 1);
+        assert!(trend[0].key.contains("check:test_gap"));
+        assert!(!trend[0].key.contains("dangerous_change"));
+    }
+
+    #[test]
+    fn history_summary_does_not_alert_duration_when_baseline_has_no_successful_runs() {
+        let baseline = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 0,
+            changed_files: 0,
+            skipped_by_cache: false,
+            score: None,
+            threshold: None,
+            should_fail: None,
+            check_penalties: BTreeMap::new(),
+            failure_code: Some("PG-RT-001".to_string()),
+            failure_category: Some("runtime".to_string()),
+            diagnostic_hints: vec![],
+        }];
+        let current = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_500,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 20,
+            changed_files: 2,
+            skipped_by_cache: false,
+            score: Some(95),
+            threshold: Some(70),
+            should_fail: Some(false),
+            check_penalties: BTreeMap::new(),
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+        let alerts_cfg = patchgate_config::AlertConfig {
+            score_drop_threshold: 99,
+            failure_rate_increase_pct: 99,
+            duration_increase_pct: 1,
+        };
+
+        let summary = build_history_summary(&current, Some(&baseline), &alerts_cfg);
+        assert!(
+            summary.alerts.is_empty(),
+            "unexpected alerts: {:?}",
+            summary.alerts
         );
     }
 

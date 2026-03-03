@@ -1,0 +1,63 @@
+name: Security Review
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Collect security review inputs
+        run: |
+          cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl
+          cargo run -p patchgate-cli -- history summary \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-summary.json
+          cargo run -p patchgate-cli -- history trend \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-trend.json
+          cargo run -p xtask -- ops audit-report \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/audit-report.md
+
+      - name: Build security review template
+        run: |
+          mkdir -p artifacts
+          {
+            echo "# Security Review Packet"
+            echo
+            echo "## Inputs"
+            echo "- history summary: artifacts/history-summary.json"
+            echo "- history trend: artifacts/history-trend.json"
+            echo "- audit report: artifacts/audit-report.md"
+            echo
+            echo "## Review Criteria"
+            echo "- Verify failure code trends are stable or improving."
+            echo "- Confirm no expired waivers are present."
+            echo "- Review supply-chain signals and high-risk file changes."
+            echo "- Check policy changes are labeled \`policy-approved\`."
+            echo
+            echo "## Decision"
+            echo "- [ ] Continue"
+            echo "- [ ] Mitigation required"
+          } > artifacts/security-review-template.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-review-packet
+          path: artifacts/

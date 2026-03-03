@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   nix-linux:
     name: nix (ubuntu)
@@ -13,6 +16,13 @@ jobs:
       - uses: cachix/install-nix-action@v30
       - name: fmt/lint/test (shared just recipe)
         run: nix develop --command just ci-check
+
+      - name: Enforce least-privilege workflow permissions
+        run: |
+          if grep -RIn "permissions:[[:space:]]*write-all" .github/workflows; then
+            echo "write-all permissions are forbidden."
+            exit 1
+          fi
 
       - name: Lint policy compatibility matrix
         run: |
@@ -45,6 +55,28 @@ jobs:
             --output config/benchmarks/ci-worktree-baseline.jsonl \
             --require-baseline \
             --report-output artifacts/bench-compare.json
+
+      - name: Emit observability logs and history summary
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl
+          nix develop --command cargo run -p patchgate-cli -- history summary \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-summary.json
+          nix develop --command cargo run -p patchgate-cli -- history trend \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-trend.json
+
+      - name: Upload observability artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-observability
+          path: artifacts/
 
   cross-platform:
     strategy:
