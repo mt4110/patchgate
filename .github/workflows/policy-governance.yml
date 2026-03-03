@@ -1,0 +1,35 @@
+name: Policy Governance
+
+on:
+  pull_request:
+    paths:
+      - "config/policy.toml.example"
+      - "config/presets/**"
+      - "config/policy.v1.legacy.toml"
+      - ".github/CODEOWNERS"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure CODEOWNERS includes policy paths
+        run: |
+          rg -n "^config/policy.toml.example" .github/CODEOWNERS
+          rg -n "^config/presets/" .github/CODEOWNERS
+
+      - name: Require `policy-approved` label for policy changes
+        if: github.event_name == 'pull_request'
+        run: |
+          labels=$(jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH")
+          echo "labels: $labels"
+          if ! echo "$labels" | grep -Fxq "policy-approved"; then
+            echo "Missing required label: policy-approved"
+            exit 1
+          fi

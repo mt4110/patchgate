@@ -594,21 +594,97 @@ fn http_status_error(
     headers: &HeaderMap,
     body: &str,
 ) -> PublishOpError {
-    let body_excerpt = truncate(body, 400);
+    let body_excerpt = mask_secrets(truncate(body, 400).as_str());
     let rate_limited = is_rate_limited(status, headers);
     let retryable =
         rate_limited || status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT;
+    let lower_body = body.to_ascii_lowercase();
+    let classification_prefix = if status == StatusCode::FORBIDDEN
+        && (lower_body.contains("saml")
+            || lower_body.contains("single sign-on")
+            || lower_body.contains("sso"))
+    {
+        "sso authorization required: "
+    } else if status == StatusCode::FORBIDDEN
+        && (lower_body.contains("resource not accessible by integration")
+            || lower_body.contains("organization")
+            || lower_body.contains("org policy"))
+    {
+        "organization policy blocked: "
+    } else {
+        ""
+    };
 
     PublishOpError::new(
         format!(
-            "{operation}: github api returned {}: {}",
+            "{operation}: github api returned {}: {}{}",
             status.as_u16(),
+            classification_prefix,
             body_excerpt
         ),
         retryable,
         rate_limited,
     )
     .with_status_code(status.as_u16())
+}
+
+fn mask_secrets(input: &str) -> String {
+    let mut masked = input.to_string();
+    for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"] {
+        masked = redact_prefixed_secret(masked, prefix);
+    }
+    redact_bearer_tokens(masked)
+}
+
+fn redact_prefixed_secret(mut input: String, prefix: &str) -> String {
+    let mut cursor = 0usize;
+    while let Some(offset) = input[cursor..].find(prefix) {
+        let start = cursor + offset;
+        let mut end = start + prefix.len();
+        while let Some(ch) = input[end..].chars().next() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > start + prefix.len() {
+            input.replace_range(start..end, &format!("{prefix}***"));
+            cursor = start + prefix.len() + 3;
+        } else {
+            cursor = end;
+        }
+        if cursor >= input.len() {
+            break;
+        }
+    }
+    input
+}
+
+fn redact_bearer_tokens(mut input: String) -> String {
+    let marker = "Bearer ";
+    let mut cursor = 0usize;
+    while let Some(offset) = input[cursor..].find(marker) {
+        let start = cursor + offset + marker.len();
+        let mut end = start;
+        while let Some(ch) = input[end..].chars().next() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > start {
+            input.replace_range(start..end, "***");
+            cursor = start + 3;
+        } else {
+            cursor = start;
+        }
+        if cursor >= input.len() {
+            break;
+        }
+    }
+    input
 }
 
 fn is_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
@@ -732,8 +808,8 @@ mod tests {
     use super::{
         backoff_delay_ms, check_run_conclusion, check_run_update_payload, ensure_comment_marker,
         is_check_run_update_fallback_candidate, is_comment_update_fallback_candidate,
-        is_same_comment_content, merge_priority_label_names, priority_label_name, with_retry,
-        LabelItem, PublishOpError, RetryPolicy, MARKER,
+        is_same_comment_content, mask_secrets, merge_priority_label_names, priority_label_name,
+        with_retry, LabelItem, PublishOpError, RetryPolicy, MARKER,
     };
 
     fn sample_report(mode: &str, penalty: u8, findings: Vec<Finding>) -> Report {
@@ -955,5 +1031,18 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("patchgate")
         );
+    }
+
+    #[test]
+    fn mask_secrets_redacts_github_token_prefixes() {
+        let masked = mask_secrets("token=ghp_abcdefghijklmnopqrstuvwxyz");
+        assert!(masked.contains("ghp_***"));
+        assert!(!masked.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn mask_secrets_redacts_bearer_values() {
+        let masked = mask_secrets("Authorization: Bearer abcdefghijklmnopqrstuvwxyz");
+        assert!(masked.contains("Bearer ***"));
     }
 }

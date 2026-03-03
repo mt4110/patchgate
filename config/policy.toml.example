@@ -15,6 +15,18 @@ on_exceed = "fail_open"   # fail_open | fail_closed
 enabled = true
 db_path = ".patchgate/cache.db"
 
+[observability]
+# Optional JSONL outputs. Empty string disables file emission from config.
+metrics_jsonl_path = ""
+audit_jsonl_path = ""
+audit_schema_version = 1
+
+[alerts]
+# Used by `patchgate history summary --baseline ...`
+score_drop_threshold = 15
+failure_rate_increase_pct = 25
+duration_increase_pct = 40
+
 [exclude]
 # Skip generated files or vendored code
 globs = [
@@ -149,3 +161,7 @@ large_lockfile_bonus_penalty = 1
 manifest_bonus_penalty = 2
 lockfile_bonus_penalty = 0
 large_lockfile_bonus_penalty = 0
+
+[waiver]
+# Each waiver entry must include check_id, reason, approver and future expires_at (RFC3339)
+entries = []

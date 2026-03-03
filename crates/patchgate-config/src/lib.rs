@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result as AnyResult;
+use chrono::{DateTime, Utc};
 use globset::Glob;
 use thiserror::Error;
 
@@ -467,6 +468,30 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         "dependency_update.lockfile_mass_update_lines",
         cfg.dependency_update.lockfile_mass_update_lines,
     )?;
+    validate_range_u8(
+        "alerts.score_drop_threshold",
+        cfg.alerts.score_drop_threshold,
+        0,
+        100,
+    )?;
+    validate_range_u8(
+        "alerts.failure_rate_increase_pct",
+        cfg.alerts.failure_rate_increase_pct,
+        0,
+        100,
+    )?;
+    validate_range_u8(
+        "alerts.duration_increase_pct",
+        cfg.alerts.duration_increase_pct,
+        0,
+        100,
+    )?;
+    validate_range_u8(
+        "observability.audit_schema_version",
+        cfg.observability.audit_schema_version,
+        1,
+        10,
+    )?;
 
     validate_globs("exclude.globs", &cfg.exclude.globs)?;
     validate_globs("generated_code.globs", &cfg.generated_code.globs)?;
@@ -496,6 +521,25 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty when `cache.enabled = true`",
         ));
     }
+    if !cfg.observability.metrics_jsonl_path.is_empty()
+        && cfg.observability.metrics_jsonl_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "observability.metrics_jsonl_path",
+            "must be non-empty string when provided",
+        ));
+    }
+    if !cfg.observability.audit_jsonl_path.is_empty()
+        && cfg.observability.audit_jsonl_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "observability.audit_jsonl_path",
+            "must be non-empty string when provided",
+        ));
+    }
+    validate_waivers(cfg)?;
 
     validate_dependency_penalty(
         "test_gap.missing_tests_penalty",
@@ -583,6 +627,54 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_waivers(cfg: &Config) -> Result<()> {
+    let now = Utc::now();
+    for (idx, entry) in cfg.waiver.entries.iter().enumerate() {
+        if entry.check_id.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "waiver.entries",
+                format!("entry[{idx}] check_id must be non-empty"),
+            ));
+        }
+        if entry.reason.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "waiver.entries",
+                format!("entry[{idx}] reason must be non-empty"),
+            ));
+        }
+        if entry.approver.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "waiver.entries",
+                format!("entry[{idx}] approver must be non-empty"),
+            ));
+        }
+        let parsed = DateTime::parse_from_rfc3339(entry.expires_at.as_str()).map_err(|err| {
+            validation_error(
+                ValidationCategory::Type,
+                "waiver.entries",
+                format!(
+                    "entry[{idx}] expires_at must be RFC3339 datetime: `{}` ({err})",
+                    entry.expires_at
+                ),
+            )
+        })?;
+        if parsed.with_timezone(&Utc) <= now {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "waiver.entries",
+                format!(
+                    "entry[{idx}] waiver is expired (expires_at={})",
+                    entry.expires_at
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -873,6 +965,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use chrono::{Duration, Utc};
+
     use super::{
         compatibility_warnings, load_effective_from_typed, load_from, load_from_typed,
         migrate_policy_text, Config, ConfigError, PolicyMigrationError, PolicyPreset,
@@ -1001,6 +1095,50 @@ critical_patterns = [".github/workflows/**"]
             other => panic!("unexpected error: {other}"),
         }
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_expired_waiver_entry() {
+        let expired = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        let path = write_temp_policy(&format!(
+            r#"
+[waiver]
+entries = [
+  {{ check_id = "dependency_update", reason = "temp", approver = "sec-team", expires_at = "{expired}" }}
+]
+"#
+        ));
+
+        let err = load_from_typed(&path).expect_err("must reject expired waiver");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, message, .. } => {
+                assert_eq!(field, "waiver.entries");
+                assert!(message.contains("expired"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_accepts_future_waiver_entry() {
+        let future = (Utc::now() + Duration::hours(48)).to_rfc3339();
+        let path = write_temp_policy(&format!(
+            r#"
+policy_version = 2
+[waiver]
+entries = [
+  {{ check_id = "dependency_update", reason = "temp", approver = "sec-team", expires_at = "{future}" }}
+]
+"#
+        ));
+
+        let loaded = load_from_typed(&path).expect("future waiver should pass");
+        assert_eq!(loaded.policy_version, POLICY_VERSION_CURRENT);
+        assert_eq!(loaded.waiver.entries.len(), 1);
         let _ = fs::remove_file(path);
     }
 

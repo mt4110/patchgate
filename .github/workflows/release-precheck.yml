@@ -4,6 +4,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   precheck:
     runs-on: ubuntu-latest
@@ -62,6 +65,24 @@ jobs:
           nix develop --command cargo run -p xtask -- bench profile \
             --repo . \
             --profile-output artifacts/scan-profile.json
+
+      - name: Generate audit and weekly summary artifacts
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl
+          nix develop --command cargo run -p xtask -- ops weekly-summary \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/weekly-ops-summary.md \
+            --trend-output artifacts/weekly-ops-trend.json
+          nix develop --command cargo run -p xtask -- ops audit-report \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/audit-report.md
 
       - name: Upload performance artifacts
         uses: actions/upload-artifact@v4

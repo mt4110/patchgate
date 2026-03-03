@@ -1,5 +1,9 @@
 # PR Plan: Phase61-70
 
+## 実装ステータス（2026-03-02）
+
+- PR61-PR70: 実装済み（CLI/Config/Core/Workflow/Docs反映）
+
 `docs/06_phase_backcast_1_100.md` の Phase61-70（運用監視と可観測性）を対象にしたPR実装計画です。  
 Phase51-60 までで高めた判定精度を、継続運用で計測・診断・改善できる状態へ進めます。
 

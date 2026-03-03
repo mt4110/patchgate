@@ -8,7 +8,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use patchgate_config::Config;
 use sha2::{Digest, Sha256};
 
-use crate::model::{CheckId, CheckScore, Finding, Location, Report, ReportMeta, Severity};
+use crate::model::{
+    CheckId, CheckScore, Finding, Location, Report, ReportMeta, Severity, SupplyChainSignal,
+};
 
 const MAX_STORED_LINE_SAMPLES: usize = 32;
 const MAX_STORED_LINE_CHARS: usize = 240;
@@ -168,6 +170,12 @@ impl Runner {
             CheckId::DependencyUpdate.as_str().to_string(),
             dependency_update_ms,
         );
+        report.supply_chain_signals = build_supply_chain_signals(&diff, &report.findings);
+        if !report.supply_chain_signals.is_empty() {
+            report.diagnostic_hints.push(
+                "Supply-chain signal detected: require dependency integrity review.".to_string(),
+            );
+        }
         Ok(report)
     }
 
@@ -849,6 +857,108 @@ fn dependency_ecosystem_for_manifest(path: &str) -> DependencyEcosystem {
     } else {
         DependencyEcosystem::Unknown
     }
+}
+
+fn build_supply_chain_signals(diff: &DiffData, findings: &[Finding]) -> Vec<SupplyChainSignal> {
+    let dependency_files: Vec<String> = diff
+        .files
+        .iter()
+        .filter(|f| is_dependency_path(&f.path))
+        .map(|f| f.path.clone())
+        .collect();
+    let infra_files: Vec<String> = diff
+        .files
+        .iter()
+        .filter(|f| is_infra_or_ci_path(&f.path))
+        .map(|f| f.path.clone())
+        .collect();
+    let lockfile_add_or_remove = findings
+        .iter()
+        .any(|f| f.id == "DU-004" && f.tags.iter().any(|t| t == "added-removed"));
+
+    let mut signals = Vec::new();
+    if !dependency_files.is_empty() && !infra_files.is_empty() {
+        let mut related_files = Vec::new();
+        related_files.extend(dependency_files.iter().take(3).cloned());
+        related_files.extend(infra_files.iter().take(3).cloned());
+        signals.push(SupplyChainSignal {
+            id: "SCM-001".to_string(),
+            title: "Dependency and infrastructure changed together".to_string(),
+            severity: Severity::High,
+            message: "Dependency updates and CI/infra changes are bundled in one diff. Validate provenance and rollback safety.".to_string(),
+            related_files,
+            tags: vec![
+                "supply-chain".to_string(),
+                "dependency".to_string(),
+                "infra".to_string(),
+            ],
+        });
+    }
+
+    if lockfile_add_or_remove && !infra_files.is_empty() {
+        let mut related_files = Vec::new();
+        related_files.extend(infra_files.iter().take(2).cloned());
+        related_files.extend(
+            diff.files
+                .iter()
+                .filter(|f| is_lockfile_path(&f.path))
+                .map(|f| f.path.clone())
+                .take(2),
+        );
+        signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls. Require security sign-off.".to_string(),
+            related_files,
+            tags: vec![
+                "supply-chain".to_string(),
+                "lockfile".to_string(),
+                "workflow".to_string(),
+            ],
+        });
+    }
+
+    signals
+}
+
+fn is_dependency_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with("cargo.toml")
+        || lower.ends_with("cargo.lock")
+        || lower.ends_with("package.json")
+        || lower.ends_with("package-lock.json")
+        || lower.ends_with("yarn.lock")
+        || lower.ends_with("pnpm-lock.yaml")
+        || lower.ends_with("go.mod")
+        || lower.ends_with("go.sum")
+        || lower.ends_with("requirements.txt")
+        || lower.ends_with("requirements-dev.txt")
+        || lower.ends_with("pyproject.toml")
+        || lower.ends_with("pipfile")
+        || lower.ends_with("pipfile.lock")
+        || lower.ends_with("poetry.lock")
+}
+
+fn is_lockfile_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with("cargo.lock")
+        || lower.ends_with("package-lock.json")
+        || lower.ends_with("yarn.lock")
+        || lower.ends_with("pnpm-lock.yaml")
+        || lower.ends_with("go.sum")
+        || lower.ends_with("pipfile.lock")
+        || lower.ends_with("poetry.lock")
+        || lower.ends_with("requirements.lock")
+}
+
+fn is_infra_or_ci_path(path: &str) -> bool {
+    path.starts_with(".github/workflows/")
+        || path.starts_with("infra/")
+        || path.starts_with("terraform/")
+        || path.starts_with("k8s/")
+        || path.starts_with("helm/")
+        || path.starts_with("migrations/")
 }
 
 fn dependency_ecosystem_for_lockfile(path: &str) -> DependencyEcosystem {
@@ -1878,5 +1988,89 @@ mod tests {
             .expect("evaluate");
         assert_eq!(eval.score.penalty, 0);
         assert!(eval.findings.is_empty());
+    }
+
+    #[test]
+    fn supply_chain_signal_detects_dependency_plus_infra_bundle() {
+        let policy = Config::default();
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Cargo.toml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 2,
+                    deleted: 1,
+                    added_lines: vec!["dep = \"1\"".to_string()],
+                    removed_lines: vec!["dep = \"0\"".to_string()],
+                },
+                ChangedFile {
+                    path: ".github/workflows/ci.yml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 2,
+                    deleted: 2,
+                    added_lines: vec!["permissions: write-all".to_string()],
+                    removed_lines: vec!["permissions: read-all".to_string()],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(
+            report
+                .supply_chain_signals
+                .iter()
+                .any(|s| s.id == "SCM-001"),
+            "dependency + infra change should trigger SCM-001"
+        );
+    }
+
+    #[test]
+    fn supply_chain_signal_escalates_lockfile_add_remove_with_ci_change() {
+        let policy = Config::default();
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Cargo.lock".to_string(),
+                    status: ChangeStatus::Added,
+                    old_path: None,
+                    added: 10,
+                    deleted: 0,
+                    added_lines: vec!["[[package]]".to_string()],
+                    removed_lines: vec![],
+                },
+                ChangedFile {
+                    path: ".github/workflows/release.yml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 1,
+                    added_lines: vec!["run: cargo test".to_string()],
+                    removed_lines: vec!["run: cargo check".to_string()],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(
+            report
+                .supply_chain_signals
+                .iter()
+                .any(|s| s.id == "SCM-002"),
+            "lockfile add/remove with CI change should trigger SCM-002"
+        );
     }
 }

@@ -1,5 +1,9 @@
 # PR Plan: Phase71-80
 
+## 実装ステータス（2026-03-02）
+
+- PR71-PR80: 実装済み（CLI/Config/Core/GitHub/Workflow/Docs反映）
+
 `docs/06_phase_backcast_1_100.md` の Phase71-80（セキュリティ/ガバナンス）を対象にしたPR実装計画です。  
 Phase61-70 で整備した可観測性を土台に、監査対応と権限制御を標準運用へ引き上げます。
 

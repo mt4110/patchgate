@@ -1,19 +1,59 @@
 # 04 Recipes
 
-Purpose: よくあるユースケースと設定例。
+## Common use cases
 
-## Common Use Cases
-
-### Legacy policy を current へ移行する
+### Scan + metrics/audit JSONL を同時出力
 
 ```bash
-patchgate policy lint --path policy.toml
-patchgate policy migrate --from 1 --to 2 --path policy.toml
-patchgate policy migrate --from 1 --to 2 --path policy.toml --write
-patchgate policy lint --path policy.toml --require-current-version
+patchgate scan \
+  --scope worktree \
+  --mode warn \
+  --format json \
+  --no-cache \
+  --metrics-output artifacts/scan-metrics.jsonl \
+  --audit-log-output artifacts/scan-audit.jsonl
 ```
 
-### GitHub publish を dry-run で検証する
+### 履歴サマリとトレンドを作る
+
+```bash
+patchgate history summary \
+  --input artifacts/scan-metrics.jsonl \
+  --format json > artifacts/history-summary.json
+
+patchgate history trend \
+  --input artifacts/scan-metrics.jsonl \
+  --format json > artifacts/history-trend.json
+```
+
+### ベースライン比較でアラート判定
+
+```bash
+patchgate history summary \
+  --input artifacts/current-metrics.jsonl \
+  --baseline artifacts/baseline-metrics.jsonl \
+  --format text
+```
+
+### 週次運用サマリを生成（xtask）
+
+```bash
+cargo run -p xtask -- ops weekly-summary \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --output artifacts/weekly-ops-summary.md \
+  --trend-output artifacts/weekly-ops-trend.json
+```
+
+### 監査レポートを生成（xtask）
+
+```bash
+cargo run -p xtask -- ops audit-report \
+  --audit-input artifacts/scan-audit.jsonl \
+  --output artifacts/audit-report.md
+```
+
+### GitHub publish dry-run（最小権限前提）
 
 ```bash
 patchgate scan \
@@ -28,77 +68,17 @@ patchgate scan \
   --github-dry-run-output artifacts/github-payload.json
 ```
 
-### retry/backoff と comment抑制を有効化する
+### policy変更の承認フロー
 
-```bash
-patchgate scan \
-  --scope worktree \
-  --mode enforce \
-  --github-publish \
-  --github-retry-max-attempts 5 \
-  --github-retry-backoff-ms 500 \
-  --github-retry-max-backoff-ms 5000 \
-  --github-suppress-comment-low-priority \
-  --github-suppress-comment-rerun
-```
+1. `config/policy.toml.example` または `config/presets/*` を変更
+2. PRに `policy-approved` ラベルを付与
+3. `policy-governance.yml` がラベルと `CODEOWNERS` を検証
 
-### review_priority ベースのラベル付与（opt-in）
+### セキュリティレビュー定例
 
-```bash
-patchgate scan \
-  --scope worktree \
-  --mode warn \
-  --github-publish \
-  --github-apply-labels
-```
-
-### scan の処理内訳をプロファイル出力する
-
-```bash
-patchgate scan \
-  --scope worktree \
-  --mode warn \
-  --format json \
-  --no-cache \
-  --profile-output artifacts/scan-profile.json
-```
-
-### 10kファイル想定の synthetic ベンチを比較する
-
-```bash
-cargo run -p xtask -- bench compare \
-  --case ci-scale-10k \
-  --output config/benchmarks/ci-scale-10k-baseline.jsonl \
-  --synthetic-files 10000 \
-  --synthetic-lines 1 \
-  --max-regression-pct 40 \
-  --report-output artifacts/bench-scale-10k.json
-```
-
-### Java/Kotlin 検知を段階有効化する
-
-```toml
-[language_rules]
-java_kotlin = true
-```
-
-## Policy distribution template
-
-### 配布フロー
-
-1. `policy/<name>.toml` を更新し、`policy_version` を明示
-2. `patchgate policy lint --path policy/<name>.toml --require-current-version` を通す
-3. 配布用タグを作成（例: `policy/my-team/v2026.03.02`）
-4. 利用側リポジトリではタグ pin で参照
-5. 問題発生時は直前タグへロールバック
-
-### pin 運用の例
-
-- 推奨: immutable tag（運用都合で再利用しない）
-- 監査ログに `policy tag` / `commit SHA` / `lint結果` を残す
-
-### ロールバックの基準例
-
-- false positive が急増
-- gate fail 率が閾値を超過
-- migration 後に互換性 warning が残存
+- workflow: `.github/workflows/security-review.yml`
+- 生成物:
+  - `artifacts/history-summary.json`
+  - `artifacts/history-trend.json`
+  - `artifacts/audit-report.md`
+  - `artifacts/security-review-template.md`
