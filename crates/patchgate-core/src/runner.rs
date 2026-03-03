@@ -954,6 +954,7 @@ fn is_lockfile_path(path: &str) -> bool {
         || lower.ends_with("go.sum")
         || lower.ends_with("pipfile.lock")
         || lower.ends_with("poetry.lock")
+        || lower.ends_with("gemfile.lock")
         || lower.ends_with("requirements.lock")
 }
 
@@ -2198,5 +2199,44 @@ mod tests {
                 .any(|s| s.id == "SCM-002"),
             "SCM-002 should be derived from diff topology, independent of dependency_update flag"
         );
+    }
+
+    #[test]
+    fn supply_chain_signal_scm002_detects_gemfile_lock_add_remove() {
+        let policy = Config::default();
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Gemfile.lock".to_string(),
+                    status: ChangeStatus::Added,
+                    old_path: None,
+                    added: 10,
+                    deleted: 0,
+                    added_lines: vec!["GEM".to_string()],
+                    removed_lines: vec![],
+                },
+                ChangedFile {
+                    path: ".github/workflows/release.yml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 0,
+                    added_lines: vec!["run: bundle install".to_string()],
+                    removed_lines: vec![],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .supply_chain_signals
+            .iter()
+            .any(|s| s.id == "SCM-002"));
     }
 }

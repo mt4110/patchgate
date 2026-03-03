@@ -594,21 +594,22 @@ fn http_status_error(
     headers: &HeaderMap,
     body: &str,
 ) -> PublishOpError {
-    let body_excerpt = mask_secrets(truncate(body, 400).as_str());
+    let body_excerpt_raw = truncate(body, 400);
+    let body_excerpt = mask_secrets(body_excerpt_raw.as_str());
     let rate_limited = is_rate_limited(status, headers);
     let retryable =
         rate_limited || status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT;
-    let lower_body = body.to_ascii_lowercase();
+    let lower_body_excerpt = body_excerpt_raw.to_ascii_lowercase();
     let classification_prefix = if status == StatusCode::FORBIDDEN
-        && (lower_body.contains("saml")
-            || lower_body.contains("single sign-on")
-            || lower_body.contains("sso"))
+        && (lower_body_excerpt.contains("saml")
+            || lower_body_excerpt.contains("single sign-on")
+            || lower_body_excerpt.contains("sso"))
     {
         "sso authorization required: "
     } else if status == StatusCode::FORBIDDEN
-        && (lower_body.contains("resource not accessible by integration")
-            || lower_body.contains("organization")
-            || lower_body.contains("org policy"))
+        && (lower_body_excerpt.contains("resource not accessible by integration")
+            || lower_body_excerpt.contains("organization")
+            || lower_body_excerpt.contains("org policy"))
     {
         "organization policy blocked: "
     } else {
@@ -812,12 +813,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, ReviewPriority};
+    use reqwest::header::HeaderMap;
+    use reqwest::StatusCode;
 
     use super::{
         backoff_delay_ms, check_run_conclusion, check_run_update_payload, ensure_comment_marker,
-        is_check_run_update_fallback_candidate, is_comment_update_fallback_candidate,
-        is_same_comment_content, mask_secrets, merge_priority_label_names, priority_label_name,
-        with_retry, LabelItem, PublishOpError, RetryPolicy, MARKER,
+        http_status_error, is_check_run_update_fallback_candidate,
+        is_comment_update_fallback_candidate, is_same_comment_content, mask_secrets,
+        merge_priority_label_names, priority_label_name, with_retry, LabelItem, PublishOpError,
+        RetryPolicy, MARKER,
     };
 
     fn sample_report(mode: &str, penalty: u8, findings: Vec<Finding>) -> Report {
@@ -1066,5 +1070,16 @@ mod tests {
         let masked = mask_secrets("Authorization: bearer abc.def");
         assert!(masked.contains("bearer ***"));
         assert!(!masked.contains("abc.def"));
+    }
+
+    #[test]
+    fn http_status_error_classifies_sso_from_excerpt() {
+        let err = http_status_error(
+            "op",
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            "SAML enforcement active",
+        );
+        assert!(err.message.contains("sso authorization required:"));
     }
 }

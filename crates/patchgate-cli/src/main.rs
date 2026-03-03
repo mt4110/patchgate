@@ -859,8 +859,14 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
 
     let mut grouped: BTreeMap<String, TrendAgg> = BTreeMap::new();
     for row in records {
-        if row.check_penalties.is_empty() {
-            let day = row.unix_ts / 86_400;
+        let day = row.unix_ts / 86_400;
+        let triggered_checks: Vec<&str> = row
+            .check_penalties
+            .iter()
+            .filter_map(|(check, penalty)| (*penalty > 0).then_some(check.as_str()))
+            .collect();
+
+        if triggered_checks.is_empty() {
             let key = format!("day:{day}|repo:{}|scope:{}|check:none", row.repo, row.scope);
             let agg = grouped.entry(key).or_default();
             agg.runs += 1;
@@ -880,8 +886,8 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
             }
             continue;
         }
-        for check in row.check_penalties.keys() {
-            let day = row.unix_ts / 86_400;
+
+        for check in triggered_checks {
             let key = format!(
                 "day:{day}|repo:{}|scope:{}|check:{}",
                 row.repo, row.scope, check
@@ -1573,6 +1579,7 @@ fn append_scan_success_records(
             check_penalties: report
                 .checks
                 .iter()
+                .filter(|c| c.triggered && c.penalty > 0)
                 .map(|c| (c.check.as_str().to_string(), c.penalty))
                 .collect(),
             failure_code: None,
@@ -3338,6 +3345,63 @@ mod tests {
         let summary = build_history_summary(&records, None, &Config::default().alerts);
         assert_eq!(summary.failure_rate, 50.0);
         assert_eq!(summary.average_duration_ms, 12.0);
+    }
+
+    #[test]
+    fn history_trend_ignores_non_triggered_check_penalty_keys() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 0);
+        penalties.insert("dangerous_change".to_string(), 0);
+        let records = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 7,
+            changed_files: 1,
+            skipped_by_cache: false,
+            score: Some(100),
+            threshold: Some(70),
+            should_fail: Some(false),
+            check_penalties: penalties,
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+
+        let trend = build_history_trend(&records);
+        assert_eq!(trend.len(), 1);
+        assert!(trend[0].key.contains("check:none"));
+    }
+
+    #[test]
+    fn history_trend_only_counts_triggered_checks_when_mixed_penalties_exist() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 12);
+        penalties.insert("dangerous_change".to_string(), 0);
+        let records = vec![ScanMetricRecord {
+            schema_version: 1,
+            unix_ts: 86_400,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 9,
+            changed_files: 2,
+            skipped_by_cache: false,
+            score: Some(88),
+            threshold: Some(70),
+            should_fail: Some(true),
+            check_penalties: penalties,
+            failure_code: None,
+            failure_category: None,
+            diagnostic_hints: vec![],
+        }];
+
+        let trend = build_history_trend(&records);
+        assert_eq!(trend.len(), 1);
+        assert!(trend[0].key.contains("check:test_gap"));
+        assert!(!trend[0].key.contains("dangerous_change"));
     }
 
     #[test]

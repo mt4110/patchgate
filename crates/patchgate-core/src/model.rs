@@ -162,13 +162,13 @@ impl Report {
             skipped_by_cache: meta.skipped_by_cache,
             changed_files: 0,
             check_durations_ms: BTreeMap::new(),
-            diagnostic_hints: diagnostic_hints_from_findings(score, should_fail),
+            diagnostic_hints: diagnostic_hints_from_score(score, should_fail),
             supply_chain_signals: Vec::new(),
         }
     }
 }
 
-fn diagnostic_hints_from_findings(score: u8, should_fail: bool) -> Vec<String> {
+fn diagnostic_hints_from_score(score: u8, should_fail: bool) -> Vec<String> {
     let mut hints = Vec::new();
     if should_fail {
         hints.push("Gate failed: prioritize critical/high findings first.".to_string());
