@@ -662,9 +662,9 @@ fn redact_prefixed_secret(mut input: String, prefix: &str) -> String {
 }
 
 fn redact_bearer_tokens(mut input: String) -> String {
-    let marker = "Bearer ";
+    let marker = "bearer ";
     let mut cursor = 0usize;
-    while let Some(offset) = input[cursor..].find(marker) {
+    while let Some(offset) = input[cursor..].to_ascii_lowercase().find(marker) {
         let start = cursor + offset + marker.len();
         let mut end = start;
         while let Some(ch) = input[end..].chars().next() {
@@ -1059,5 +1059,12 @@ mod tests {
         let masked = mask_secrets("Authorization: Bearer a+b/c=d~ef");
         assert!(masked.contains("Bearer ***"));
         assert!(!masked.contains("a+b/c=d~ef"));
+    }
+
+    #[test]
+    fn mask_secrets_redacts_bearer_values_case_insensitively() {
+        let masked = mask_secrets("Authorization: bearer abc.def");
+        assert!(masked.contains("bearer ***"));
+        assert!(!masked.contains("abc.def"));
     }
 }

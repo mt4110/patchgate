@@ -170,7 +170,7 @@ impl Runner {
             CheckId::DependencyUpdate.as_str().to_string(),
             dependency_update_ms,
         );
-        report.supply_chain_signals = build_supply_chain_signals(&diff, &report.findings);
+        report.supply_chain_signals = build_supply_chain_signals(&diff);
         if !report.supply_chain_signals.is_empty() {
             report.diagnostic_hints.push(
                 "Supply-chain signal detected: require dependency integrity review.".to_string(),
@@ -859,7 +859,7 @@ fn dependency_ecosystem_for_manifest(path: &str) -> DependencyEcosystem {
     }
 }
 
-fn build_supply_chain_signals(diff: &DiffData, findings: &[Finding]) -> Vec<SupplyChainSignal> {
+fn build_supply_chain_signals(diff: &DiffData) -> Vec<SupplyChainSignal> {
     let dependency_files: Vec<String> = diff
         .files
         .iter()
@@ -872,9 +872,9 @@ fn build_supply_chain_signals(diff: &DiffData, findings: &[Finding]) -> Vec<Supp
         .filter(|f| is_infra_or_ci_path(&f.path))
         .map(|f| f.path.clone())
         .collect();
-    let lockfile_add_or_remove = findings
-        .iter()
-        .any(|f| f.id == "DU-004" && f.tags.iter().any(|t| t == "added-removed"));
+    let lockfile_add_or_remove = diff.files.iter().any(|f| {
+        is_lockfile_path(&f.path) && matches!(f.status, ChangeStatus::Added | ChangeStatus::Deleted)
+    });
 
     let mut signals = Vec::new();
     if !dependency_files.is_empty() && !infra_files.is_empty() {
@@ -2155,5 +2155,48 @@ mod tests {
             .supply_chain_signals
             .iter()
             .any(|s| s.id == "SCM-001"));
+    }
+
+    #[test]
+    fn supply_chain_signal_scm002_works_when_dependency_update_is_disabled() {
+        let mut policy = Config::default();
+        policy.dependency_update.enabled = false;
+        let runner = Runner::new(policy);
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![
+                ChangedFile {
+                    path: "Cargo.lock".to_string(),
+                    status: ChangeStatus::Added,
+                    old_path: None,
+                    added: 10,
+                    deleted: 0,
+                    added_lines: vec!["[[package]]".to_string()],
+                    removed_lines: vec![],
+                },
+                ChangedFile {
+                    path: ".github/workflows/release.yml".to_string(),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 1,
+                    added_lines: vec!["permissions: write-all".to_string()],
+                    removed_lines: vec!["permissions: read-all".to_string()],
+                },
+            ],
+            fingerprint: "dummy".to_string(),
+        };
+
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(
+            report
+                .supply_chain_signals
+                .iter()
+                .any(|s| s.id == "SCM-002"),
+            "SCM-002 should be derived from diff topology, independent of dependency_update flag"
+        );
     }
 }

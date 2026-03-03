@@ -1633,23 +1633,20 @@ fn append_scan_failure_records(
     let mut audit_path = scan.audit_log_output.clone();
     let mut audit_schema_version = 1u8;
 
-    if metrics_path.is_none() || audit_path.is_none() {
-        let preset = parse_policy_preset(scan.policy_preset.as_deref())
-            .ok()
-            .flatten();
-        let config_path = resolve_config_path(repo_root, config_override);
-        if let Ok(loaded) = load_policy_config(config_path.as_deref(), preset) {
-            if metrics_path.is_none() {
-                metrics_path =
-                    non_empty_path(loaded.config.observability.metrics_jsonl_path.as_str())
-                        .map(|p| resolve_repo_relative_path(repo_root, p));
-            }
-            if audit_path.is_none() {
-                audit_path = non_empty_path(loaded.config.observability.audit_jsonl_path.as_str())
-                    .map(|p| resolve_repo_relative_path(repo_root, p));
-            }
-            audit_schema_version = loaded.config.observability.audit_schema_version;
+    let preset = parse_policy_preset(scan.policy_preset.as_deref())
+        .ok()
+        .flatten();
+    let config_path = resolve_config_path(repo_root, config_override);
+    if let Ok(loaded) = load_policy_config(config_path.as_deref(), preset) {
+        if metrics_path.is_none() {
+            metrics_path = non_empty_path(loaded.config.observability.metrics_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p));
         }
+        if audit_path.is_none() {
+            audit_path = non_empty_path(loaded.config.observability.audit_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p));
+        }
+        audit_schema_version = loaded.config.observability.audit_schema_version;
     }
 
     let unix_ts = current_unix_ts();

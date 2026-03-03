@@ -525,7 +525,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         && cfg.observability.metrics_jsonl_path.trim().is_empty()
     {
         return Err(validation_error(
-            ValidationCategory::Dependency,
+            ValidationCategory::Type,
             "observability.metrics_jsonl_path",
             "must be non-empty string when provided",
         ));
@@ -534,7 +534,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         && cfg.observability.audit_jsonl_path.trim().is_empty()
     {
         return Err(validation_error(
-            ValidationCategory::Dependency,
+            ValidationCategory::Type,
             "observability.audit_jsonl_path",
             "must be non-empty string when provided",
         ));
@@ -1139,6 +1139,32 @@ entries = [
         let loaded = load_from_typed(&path).expect("future waiver should pass");
         assert_eq!(loaded.policy_version, POLICY_VERSION_CURRENT);
         assert_eq!(loaded.waiver.entries.len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_reports_type_category_for_observability_path_whitespace() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[observability]
+metrics_jsonl_path = "   "
+"#,
+        );
+
+        let err =
+            load_from_typed(&path).expect_err("must reject whitespace-only observability path");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation {
+                category, field, ..
+            } => {
+                assert_eq!(category, ValidationCategory::Type);
+                assert_eq!(field, "observability.metrics_jsonl_path");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
         let _ = fs::remove_file(path);
     }
 
