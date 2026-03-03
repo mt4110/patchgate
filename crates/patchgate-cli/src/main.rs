@@ -1639,6 +1639,8 @@ fn append_scan_failure_records(
     let mut metrics_path = scan.metrics_output.clone();
     let mut audit_path = scan.audit_log_output.clone();
     let mut audit_schema_version = 1u8;
+    let mut telemetry_mode = scan.mode.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut telemetry_scope = scan.scope.clone().unwrap_or_else(|| "unknown".to_string());
 
     let preset = parse_policy_preset(scan.policy_preset.as_deref())
         .ok()
@@ -1654,6 +1656,15 @@ fn append_scan_failure_records(
                 .map(|p| resolve_repo_relative_path(repo_root, p));
         }
         audit_schema_version = loaded.config.observability.audit_schema_version;
+        if let Ok(opts) = resolve_scan_options(
+            &loaded.config,
+            None,
+            scan.scope.as_deref(),
+            scan.mode.as_deref(),
+        ) {
+            telemetry_mode = opts.mode;
+            telemetry_scope = opts.scope.as_str().to_string();
+        }
     }
 
     let unix_ts = current_unix_ts();
@@ -1663,8 +1674,8 @@ fn append_scan_failure_records(
             schema_version: 1,
             unix_ts,
             repo: telemetry_repo.clone(),
-            mode: scan.mode.clone().unwrap_or_else(|| "unknown".to_string()),
-            scope: scan.scope.clone().unwrap_or_else(|| "unknown".to_string()),
+            mode: telemetry_mode.clone(),
+            scope: telemetry_scope.clone(),
             duration_ms: 0,
             changed_files: 0,
             skipped_by_cache: false,
@@ -1687,8 +1698,8 @@ fn append_scan_failure_records(
             actor: resolve_audit_actor(scan.audit_actor.as_deref()),
             repo: telemetry_repo,
             target: "scan".to_string(),
-            mode: scan.mode.clone().unwrap_or_else(|| "unknown".to_string()),
-            scope: scan.scope.clone().unwrap_or_else(|| "unknown".to_string()),
+            mode: telemetry_mode,
+            scope: telemetry_scope,
             result: "error".to_string(),
             failure_code: Some(err.code().as_str().to_string()),
             failure_category: Some(err.code().category().to_string()),
@@ -1745,7 +1756,17 @@ fn resolve_audit_actor(override_actor: Option<&str>) -> String {
             return actor;
         }
     }
-    std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+    if let Ok(actor) = std::env::var("USER") {
+        if !actor.trim().is_empty() {
+            return actor;
+        }
+    }
+    if let Ok(actor) = std::env::var("USERNAME") {
+        if !actor.trim().is_empty() {
+            return actor;
+        }
+    }
+    "unknown".to_string()
 }
 
 fn resolve_telemetry_repo(repo_root: &Path, github_repo_override: Option<&str>) -> String {
@@ -2703,16 +2724,17 @@ mod tests {
     use patchgate_github::PublishAuth;
 
     use super::{
-        apply_changed_file_overrides, apply_threshold_override, build_cache_key,
-        build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
-        detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
-        is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
+        append_scan_failure_records, apply_changed_file_overrides, apply_threshold_override,
+        build_cache_key, build_history_summary, build_history_trend,
+        changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
+        gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        recover_cache_db, render_github_comment, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, run_policy_lint, sorted_findings_for_comment, OptionSource,
-        PolicyExitCode, PolicyLintArgs, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
-        ScanErrorKind, ScanMetricRecord, ScopeMode,
+        recover_cache_db, render_github_comment, resolve_audit_actor,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo, run_policy_lint,
+        sorted_findings_for_comment, FailureCode, OptionSource, PolicyExitCode, PolicyLintArgs,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
+        ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2762,6 +2784,43 @@ mod tests {
         )
         .expect("write temp event");
         path
+    }
+
+    fn default_scan_args() -> ScanArgs {
+        ScanArgs {
+            policy_preset: None,
+            format: None,
+            scope: None,
+            mode: None,
+            threshold: None,
+            max_changed_files: None,
+            on_exceed: None,
+            no_cache: false,
+            profile_output: None,
+            metrics_output: None,
+            audit_log_output: None,
+            audit_actor: None,
+            github_comment: None,
+            github_publish: false,
+            github_repo: None,
+            github_pr: None,
+            github_sha: None,
+            github_token_env: None,
+            github_check_name: None,
+            github_auth: None,
+            github_app_token_env: None,
+            github_retry_max_attempts: 3,
+            github_retry_backoff_ms: 300,
+            github_retry_max_backoff_ms: 3000,
+            github_dry_run: false,
+            github_dry_run_output: None,
+            github_no_comment: false,
+            github_no_check_run: false,
+            github_apply_labels: false,
+            github_suppress_comment_no_change: false,
+            github_suppress_comment_low_priority: false,
+            github_suppress_comment_rerun: false,
+        }
     }
 
     #[test]
@@ -2968,6 +3027,82 @@ mod tests {
 
         let from_root = resolve_telemetry_repo(PathBuf::from("/").as_path(), None);
         assert_eq!(from_root, "local");
+    }
+
+    #[test]
+    fn resolve_audit_actor_uses_username_when_user_missing() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_ACTOR", "USER", "USERNAME"]);
+        env::remove_var("GITHUB_ACTOR");
+        env::remove_var("USER");
+        env::set_var("USERNAME", "windows-user");
+
+        assert_eq!(resolve_audit_actor(None), "windows-user");
+    }
+
+    #[test]
+    fn failure_telemetry_uses_resolved_mode_and_scope_from_config_defaults() {
+        let _guard = env_lock();
+        let _env_snapshot = EnvSnapshot::capture(&["GITHUB_REPOSITORY"]);
+        env::remove_var("GITHUB_REPOSITORY");
+
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-failure-telemetry-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut config_path = repo_root.clone();
+        config_path.push("policy.toml");
+        fs::write(
+            &config_path,
+            "policy_version = 2\n[output]\nmode = \"enforce\"\n[scope]\nmode = \"repo\"\n",
+        )
+        .expect("write policy");
+
+        let mut metrics_path = repo_root.clone();
+        metrics_path.push("metrics.jsonl");
+        let mut audit_path = repo_root.clone();
+        audit_path.push("audit.jsonl");
+
+        let mut scan = default_scan_args();
+        scan.metrics_output = Some(metrics_path.clone());
+        scan.audit_log_output = Some(audit_path.clone());
+        scan.mode = None;
+        scan.scope = None;
+
+        let err = ScanError::with_code(
+            ScanErrorKind::Runtime,
+            FailureCode::RuntimeEvaluationFailed,
+            anyhow::anyhow!("boom"),
+        );
+        append_scan_failure_records(&repo_root, Some(&config_path), &scan, &err)
+            .expect("append failure telemetry");
+
+        let metric_line = fs::read_to_string(&metrics_path)
+            .expect("read metrics")
+            .lines()
+            .next()
+            .expect("metrics line")
+            .to_string();
+        let metric: serde_json::Value =
+            serde_json::from_str(&metric_line).expect("decode metrics json");
+        assert_eq!(metric.get("mode").and_then(|v| v.as_str()), Some("enforce"));
+        assert_eq!(metric.get("scope").and_then(|v| v.as_str()), Some("repo"));
+
+        let audit_line = fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .next()
+            .expect("audit line")
+            .to_string();
+        let audit: serde_json::Value = serde_json::from_str(&audit_line).expect("decode audit");
+        assert_eq!(audit.get("mode").and_then(|v| v.as_str()), Some("enforce"));
+        assert_eq!(audit.get("scope").and_then(|v| v.as_str()), Some("repo"));
+
+        let _ = fs::remove_file(metrics_path);
+        let _ = fs::remove_file(audit_path);
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]

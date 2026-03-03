@@ -584,7 +584,7 @@ fn run_audit_report(options: &OpsOptions) -> Result<()> {
 
 fn load_jsonl_records<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
     if !path.exists() {
-        return Ok(Vec::new());
+        bail!("input JSONL file does not exist: {}", path.display());
     }
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -932,7 +932,8 @@ mod tests {
 
     use super::{
         aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
-        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, TEMP_SEQ,
+        load_jsonl_records, validate_workload_identity, AuditLogRecord, BenchSample,
+        MetricLogRecord, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -1066,5 +1067,13 @@ mod tests {
         let counts = aggregate_failure_code_counts(&metrics, &audits);
         assert_eq!(counts.get("PG-RT-001"), Some(&2usize));
         assert_eq!(counts.get("PG-CFG-001"), Some(&1usize));
+    }
+
+    #[test]
+    fn load_jsonl_records_errors_when_file_is_missing() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let missing = std::env::temp_dir().join(format!("xtask-missing-{seq}.jsonl"));
+        let err = load_jsonl_records::<MetricLogRecord>(&missing).expect_err("must error");
+        assert!(err.to_string().contains("does not exist"));
     }
 }
