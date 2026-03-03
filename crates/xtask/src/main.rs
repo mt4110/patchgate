@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -91,7 +91,6 @@ struct MetricLogRecord {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 struct AuditLogRecord {
     unix_ts: u64,
     actor: String,
@@ -426,11 +425,28 @@ fn run_weekly_summary(options: &OpsOptions) -> Result<()> {
     };
 
     let mut failure_codes = BTreeMap::<String, usize>::new();
-    for code in metrics.iter().filter_map(|m| m.failure_code.as_ref()) {
-        *failure_codes.entry(code.clone()).or_insert(0) += 1;
+    let mut failure_events = BTreeSet::<String>::new();
+    for row in &metrics {
+        if let Some(code) = row.failure_code.as_ref() {
+            let key = format!(
+                "{}|{}|{}|{}|{}",
+                code, row.unix_ts, row.repo, row.mode, row.scope
+            );
+            if failure_events.insert(key) {
+                *failure_codes.entry(code.clone()).or_insert(0) += 1;
+            }
+        }
     }
-    for code in audits.iter().filter_map(|a| a.failure_code.as_ref()) {
-        *failure_codes.entry(code.clone()).or_insert(0) += 1;
+    for row in &audits {
+        if let Some(code) = row.failure_code.as_ref() {
+            let key = format!(
+                "{}|{}|{}|{}|{}",
+                code, row.unix_ts, row.repo, row.mode, row.scope
+            );
+            if failure_events.insert(key) {
+                *failure_codes.entry(code.clone()).or_insert(0) += 1;
+            }
+        }
     }
 
     let mut md = String::new();

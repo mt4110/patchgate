@@ -7,7 +7,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
-use patchgate_github::{publish_report, PublishAuth, PublishRequest, RetryPolicy};
+use patchgate_github::{
+    mask_secrets as mask_sensitive, publish_report, PublishAuth, PublishRequest, RetryPolicy,
+};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -405,7 +407,7 @@ impl ScanError {
     }
 
     fn print(&self) {
-        eprintln!("{}", mask_secrets(self.render().as_str()));
+        eprintln!("{}", mask_sensitive(self.render().as_str()));
         if let Some(hint) = self.hint.as_ref() {
             eprintln!("hint: {}", hint);
         }
@@ -838,6 +840,7 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
         gate_failures: usize,
         duration_sum: f64,
         score_sum: f64,
+        scored_runs: usize,
     }
 
     let mut grouped: BTreeMap<String, TrendAgg> = BTreeMap::new();
@@ -851,7 +854,10 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
                 agg.gate_failures += 1;
             }
             agg.duration_sum += row.duration_ms as f64;
-            agg.score_sum += row.score.unwrap_or(0) as f64;
+            if let Some(score) = row.score {
+                agg.score_sum += score as f64;
+                agg.scored_runs += 1;
+            }
             continue;
         }
         for check in row.check_penalties.keys() {
@@ -866,7 +872,10 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
                 agg.gate_failures += 1;
             }
             agg.duration_sum += row.duration_ms as f64;
-            agg.score_sum += row.score.unwrap_or(0) as f64;
+            if let Some(score) = row.score {
+                agg.score_sum += score as f64;
+                agg.scored_runs += 1;
+            }
         }
     }
 
@@ -886,10 +895,10 @@ fn build_history_trend(records: &[ScanMetricRecord]) -> Vec<HistoryTrendRow> {
             } else {
                 agg.duration_sum / agg.runs as f64
             },
-            average_score: if agg.runs == 0 {
+            average_score: if agg.scored_runs == 0 {
                 0.0
             } else {
-                agg.score_sum / agg.runs as f64
+                agg.score_sum / agg.scored_runs as f64
             },
         })
         .collect()
@@ -1151,8 +1160,11 @@ fn execute_scan(
 
     let config_path = resolve_config_path(repo_root, config_override);
     let loaded_cfg = load_policy_config(config_path.as_deref(), preset).map_err(|err| {
-        let msg = err.to_string();
-        if msg.contains("waiver is expired") {
+        if matches!(
+            &err,
+            ConfigError::Validation { field, message, .. }
+                if *field == "waiver.entries" && message.contains("expired")
+        ) {
             ScanError::with_hint(
                 ScanErrorKind::Config,
                 FailureCode::WaiverExpired,
@@ -1403,7 +1415,10 @@ fn execute_scan(
                     anyhow!("failed to encode github dry-run payload: {err}"),
                 )
             })?;
-            eprintln!("github dry-run payload:\n{}", mask_secrets(pretty.as_str()));
+            eprintln!(
+                "github dry-run payload:\n{}",
+                mask_sensitive(pretty.as_str())
+            );
             if let Some(path) = github_dry_run_output.as_ref() {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(|err| {
@@ -1422,24 +1437,27 @@ fn execute_scan(
             }
         }
         if let Some(reason) = published.skipped_comment_reason.as_ref() {
-            eprintln!("github comment skipped: {}", mask_secrets(reason.as_str()));
+            eprintln!(
+                "github comment skipped: {}",
+                mask_sensitive(reason.as_str())
+            );
         }
         if let Some(err) = published.comment_error.as_ref() {
             eprintln!(
                 "warning: failed to publish PR comment: {}",
-                mask_secrets(err.as_str())
+                mask_sensitive(err.as_str())
             );
         }
         if let Some(err) = published.check_run_error.as_ref() {
             eprintln!(
                 "warning: failed to publish check run: {}",
-                mask_secrets(err.as_str())
+                mask_sensitive(err.as_str())
             );
         }
         if let Some(err) = published.label_error.as_ref() {
             eprintln!(
                 "warning: failed to apply labels: {}",
-                mask_secrets(err.as_str())
+                mask_sensitive(err.as_str())
             );
         }
         if let Some(mode) = published.degraded_mode.as_ref() {
@@ -1551,7 +1569,7 @@ fn append_scan_success_records(
         };
         let audit = AuditLogRecord {
             schema_version: audit_schema_version,
-            audit_format: format!("patchgate.audit.v{audit_schema_version}"),
+            audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
             actor,
             repo: repo_root.display().to_string(),
@@ -1632,7 +1650,7 @@ fn append_scan_failure_records(
     if let Some(path) = audit_path.as_deref() {
         let audit = AuditLogRecord {
             schema_version: audit_schema_version,
-            audit_format: format!("patchgate.audit.v{audit_schema_version}"),
+            audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
             actor: resolve_audit_actor(scan.audit_actor.as_deref()),
             repo: repo_root.display().to_string(),
@@ -1732,66 +1750,6 @@ fn classify_publish_scan_error(err: anyhow::Error) -> ScanError {
         "Retry with --github-dry-run to inspect payload and verify token scopes.",
         err,
     )
-}
-
-fn mask_secrets(input: &str) -> String {
-    let mut masked = input.to_string();
-    for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"] {
-        masked = redact_prefixed_secret(masked, prefix);
-    }
-    masked = redact_bearer_tokens(masked);
-    masked
-}
-
-fn redact_prefixed_secret(mut input: String, prefix: &str) -> String {
-    let mut cursor = 0usize;
-    while let Some(offset) = input[cursor..].find(prefix) {
-        let start = cursor + offset;
-        let mut end = start + prefix.len();
-        while let Some(ch) = input[end..].chars().next() {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                end += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if end > start + prefix.len() {
-            input.replace_range(start..end, &format!("{prefix}***"));
-            cursor = start + prefix.len() + 3;
-        } else {
-            cursor = end;
-        }
-        if cursor >= input.len() {
-            break;
-        }
-    }
-    input
-}
-
-fn redact_bearer_tokens(mut input: String) -> String {
-    let marker = "Bearer ";
-    let mut cursor = 0usize;
-    while let Some(offset) = input[cursor..].find(marker) {
-        let start = cursor + offset + marker.len();
-        let mut end = start;
-        while let Some(ch) = input[end..].chars().next() {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
-                end += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if end > start {
-            input.replace_range(start..end, "***");
-            cursor = start + 3;
-        } else {
-            cursor = start;
-        }
-        if cursor >= input.len() {
-            break;
-        }
-    }
-    input
 }
 
 fn resolve_publish_request(input: PublishRequestInput) -> Result<PublishRequest> {
@@ -2679,6 +2637,7 @@ fn render_github_comment(report: &Report) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -2693,13 +2652,15 @@ mod tests {
 
     use super::{
         apply_changed_file_overrides, apply_threshold_override, build_cache_key,
-        changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
-        gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        recover_cache_db, render_github_comment, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        run_policy_lint, sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanErrorKind, ScopeMode,
+        build_history_trend, changed_file_limit_fail_open_report, detect_head_sha_from_env,
+        detect_pr_number_from_env, gate_exit_code, is_likely_cache_corruption, parse_mode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, render_github_comment,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, run_policy_lint,
+        sorted_findings_for_comment, OptionSource, PolicyExitCode, PolicyLintArgs,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanErrorKind, ScanMetricRecord,
+        ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3212,6 +3173,56 @@ mod tests {
                 "medium-high-penalty".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn history_trend_excludes_unscored_rows_from_average_score() {
+        let mut penalties = BTreeMap::new();
+        penalties.insert("test_gap".to_string(), 10);
+        let records = vec![
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_400,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 10,
+                changed_files: 1,
+                skipped_by_cache: false,
+                score: Some(80),
+                threshold: Some(70),
+                should_fail: Some(false),
+                check_penalties: penalties.clone(),
+                failure_code: None,
+                failure_category: None,
+                diagnostic_hints: vec![],
+            },
+            ScanMetricRecord {
+                schema_version: 1,
+                unix_ts: 86_401,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 15,
+                changed_files: 0,
+                skipped_by_cache: false,
+                score: None,
+                threshold: None,
+                should_fail: None,
+                check_penalties: penalties,
+                failure_code: Some("PG-RT-001".to_string()),
+                failure_category: Some("runtime".to_string()),
+                diagnostic_hints: vec![],
+            },
+        ];
+
+        let trend = build_history_trend(&records);
+        let row = trend
+            .iter()
+            .find(|r| r.key.contains("check:test_gap"))
+            .expect("test_gap row");
+        assert_eq!(row.runs, 2);
+        assert_eq!(row.average_score, 80.0);
     }
 
     #[test]

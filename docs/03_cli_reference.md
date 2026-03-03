@@ -29,13 +29,14 @@ Core options:
 
 GitHub publish options:
 
+- `--github-comment <path>`
 - `--github-publish`
 - `--github-repo <owner/repo>`
 - `--github-pr <number>`
 - `--github-sha <sha>`
 - `--github-auth <token|app>`
-- `--github-token-env <env_name>`
-- `--github-app-token-env <env_name>`
+- `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
+- `--github-app-token-env <env_name>` (default: `GITHUB_APP_INSTALLATION_TOKEN`)
 - `--github-check-name <name>`
 - `--github-retry-max-attempts <n>`
 - `--github-retry-backoff-ms <ms>`

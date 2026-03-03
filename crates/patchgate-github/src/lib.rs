@@ -628,7 +628,7 @@ fn http_status_error(
     .with_status_code(status.as_u16())
 }
 
-fn mask_secrets(input: &str) -> String {
+pub fn mask_secrets(input: &str) -> String {
     let mut masked = input.to_string();
     for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"] {
         masked = redact_prefixed_secret(masked, prefix);
