@@ -2478,14 +2478,15 @@ fn publish_generic_ci_payload(
         markdown: markdown.to_string(),
     };
     let pretty = serde_json::to_string_pretty(&payload)?;
-    if let Some(path) = output_path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        fs::write(path, pretty).with_context(|| format!("write {}", path.display()))?;
-    } else {
-        eprintln!("generic ci payload generated (set --ci-generic-output to persist)");
+    let path = output_path.ok_or_else(|| {
+        anyhow!(
+            "generic CI publish requires output path; set --ci-generic-output or integrations.ci.generic_output_path"
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    fs::write(path, pretty).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -3467,15 +3468,15 @@ mod tests {
         changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
         gate_exit_code, is_likely_cache_corruption, notification_payload, parse_mode,
         parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, redacted_endpoint,
-        render_github_comment, resolve_audit_actor, resolve_ci_provider,
-        resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
-        resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_policy_lint, run_policy_verify_v1, sign_webhook_payload,
-        sorted_findings_for_comment, CiProvider, FailureCode, NotificationKind, OptionSource,
-        PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
-        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
-        ScopeMode,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_policy_lint, run_policy_verify_v1,
+        sign_webhook_payload, sorted_findings_for_comment, CiProvider, FailureCode,
+        NotificationKind, OptionSource, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
+        ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4736,6 +4737,33 @@ allow_legacy_config_names = false
             findings_value.is_string(),
             "slack findings value must be encoded as string"
         );
+    }
+
+    #[test]
+    fn publish_generic_ci_payload_requires_output_path() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let err = publish_generic_ci_payload("example/repo", &report, "md", None)
+            .expect_err("missing output path must fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("generic CI publish requires output path"));
     }
 
     #[test]

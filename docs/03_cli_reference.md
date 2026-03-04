@@ -52,7 +52,7 @@ Provider/Webhook/Notification options:
 
 - `--publish`
 - `--ci-provider <github|generic>`
-- `--ci-generic-output <path>`
+- `--ci-generic-output <path>` (`--publish` かつ `ci-provider=generic` の場合は必須)
 - `--webhook-url <https://...>` (repeatable)
 - `--webhook-secret-env <env_name>`
 - `--webhook-timeout-ms <ms>`

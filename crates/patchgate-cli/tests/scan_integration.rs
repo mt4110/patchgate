@@ -293,6 +293,45 @@ fn scan_generic_ci_publish_writes_payload_file() -> TestResult<()> {
     Ok(())
 }
 
+#[test]
+fn scan_generic_ci_publish_fails_without_output_path() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.append_line(
+        "src/lib.rs",
+        "pub fn changed_for_generic_ci_missing_output() -> i32 { 12 }",
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+            "--publish",
+            "--ci-provider",
+            "generic",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "generic publish without output path should be publish error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("generic CI publish requires output path"),
+        "stderr should explain missing output path, got: {stderr}"
+    );
+
+    Ok(())
+}
+
 fn run_patchgate(repo: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_patchgate"))
         .current_dir(repo)

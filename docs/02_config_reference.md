@@ -41,7 +41,7 @@
 
 - `[integrations.ci]`
   - `provider = "github" | "generic"`
-  - `generic_output_path`
+  - `generic_output_path`（`provider = "generic"` で publish する場合は必須）
 - `[integrations.webhook]`
   - `enabled`
   - `urls`
