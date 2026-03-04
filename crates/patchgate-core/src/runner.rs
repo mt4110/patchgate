@@ -351,7 +351,7 @@ fn execute_plugin(
             .collect(),
     };
     let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
-    let max_stdout_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
+    let max_output_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
     let sandbox_profile = policy.plugins.sandbox.profile.as_str();
     let timeout = Duration::from_millis(plugin.timeout_ms);
 
@@ -406,14 +406,22 @@ fn execute_plugin(
         .take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture plugin stderr"))?;
     let stdout_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_limit_exceeded = Arc::new(AtomicBool::new(false));
     let stdout_limit_probe = Arc::clone(&stdout_limit_exceeded);
+    let stderr_limit_probe = Arc::clone(&stderr_limit_exceeded);
     let stdout_reader = thread::spawn(move || {
-        read_stream_with_limit(stdout, max_stdout_bytes, Some(stdout_limit_probe))
+        read_stream_with_limit(stdout, max_output_bytes, Some(stdout_limit_probe))
     });
-    let stderr_reader = thread::spawn(move || read_stream(stderr));
+    let stderr_reader = thread::spawn(move || {
+        read_stream_with_limit(stderr, max_output_bytes, Some(stderr_limit_probe))
+    });
 
-    let termination =
-        wait_for_child_with_timeout(&mut child, timeout, stdout_limit_exceeded.as_ref())?;
+    let termination = wait_for_child_with_timeout(
+        &mut child,
+        timeout,
+        stdout_limit_exceeded.as_ref(),
+        stderr_limit_exceeded.as_ref(),
+    )?;
     if !matches!(termination, ChildTermination::Exited(_)) {
         let _ = child.kill();
         let _ = child.wait();
@@ -438,11 +446,24 @@ fn execute_plugin(
     }
 
     if stdout_limit_exceeded.load(Ordering::Relaxed)
-        || matches!(termination, ChildTermination::StdoutLimitExceeded)
+        || stderr_limit_exceeded.load(Ordering::Relaxed)
+        || matches!(termination, ChildTermination::OutputLimitExceeded)
     {
+        let mut exceeded_streams = Vec::new();
+        if stdout_limit_exceeded.load(Ordering::Relaxed) {
+            exceeded_streams.push("stdout");
+        }
+        if stderr_limit_exceeded.load(Ordering::Relaxed) {
+            exceeded_streams.push("stderr");
+        }
+        let stream_label = if exceeded_streams.is_empty() {
+            "output".to_string()
+        } else {
+            exceeded_streams.join(",")
+        };
         let message = format!(
-            "plugin `{}` stdout exceeded sandbox.max_stdout_kib ({} KiB)",
-            plugin.id, policy.plugins.sandbox.max_stdout_kib
+            "plugin `{}` {} exceeded sandbox.max_stdout_kib ({} KiB)",
+            plugin.id, stream_label, policy.plugins.sandbox.max_stdout_kib
         );
         return Ok(PluginInvocation {
             plugin_id: plugin.id.clone(),
@@ -457,7 +478,7 @@ fn execute_plugin(
 
     let exit_status = match termination {
         ChildTermination::Exited(status) => status,
-        ChildTermination::TimedOut | ChildTermination::StdoutLimitExceeded => unreachable!(),
+        ChildTermination::TimedOut | ChildTermination::OutputLimitExceeded => unreachable!(),
     };
 
     let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
@@ -513,18 +534,21 @@ fn execute_plugin(
 enum ChildTermination {
     Exited(std::process::ExitStatus),
     TimedOut,
-    StdoutLimitExceeded,
+    OutputLimitExceeded,
 }
 
 fn wait_for_child_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
     stdout_limit_exceeded: &AtomicBool,
+    stderr_limit_exceeded: &AtomicBool,
 ) -> Result<ChildTermination> {
     let start = Instant::now();
     loop {
-        if stdout_limit_exceeded.load(Ordering::Relaxed) {
-            return Ok(ChildTermination::StdoutLimitExceeded);
+        if stdout_limit_exceeded.load(Ordering::Relaxed)
+            || stderr_limit_exceeded.load(Ordering::Relaxed)
+        {
+            return Ok(ChildTermination::OutputLimitExceeded);
         }
         if let Some(status) = child.try_wait()? {
             return Ok(ChildTermination::Exited(status));
@@ -566,12 +590,6 @@ fn read_stream_with_limit<R: Read>(
         }
     }
     Ok(stored)
-}
-
-fn read_stream<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
 }
 
 fn join_reader(
