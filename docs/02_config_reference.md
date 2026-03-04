@@ -64,7 +64,7 @@
 - `[release.slo]`
   - `availability_target_pct`
   - `p95_duration_ms`
-  - `false_positive_target_pct`
+  - `false_positive_target_pct`（現行実装では `gate_failure_rate_pct` を proxy 指標として判定）
 
 ## Validation categories
 

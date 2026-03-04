@@ -600,13 +600,13 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
-    if !cfg.integrations.webhook.secret_env.is_empty()
+    if (cfg.integrations.webhook.enabled || !cfg.integrations.webhook.urls.is_empty())
         && cfg.integrations.webhook.secret_env.trim().is_empty()
     {
         return Err(validation_error(
             ValidationCategory::Type,
             "integrations.webhook.secret_env",
-            "must be non-empty string when provided",
+            "must be non-empty when `integrations.webhook.enabled = true` or URLs are configured",
         ));
     }
     if !cfg.integrations.ci.generic_output_path.is_empty()
@@ -1398,6 +1398,53 @@ metrics_jsonl_path = "   "
             } => {
                 assert_eq!(category, ValidationCategory::Type);
                 assert_eq!(field, "observability.metrics_jsonl_path");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_webhook_secret_env_when_webhook_enabled() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[integrations.webhook]
+enabled = true
+secret_env = "   "
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must reject empty webhook secret env");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "integrations.webhook.secret_env")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_webhook_secret_env_when_urls_configured() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[integrations.webhook]
+enabled = false
+urls = ["https://hooks.example.test/services/secret"]
+secret_env = "   "
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must reject empty webhook secret env");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "integrations.webhook.secret_env")
             }
             other => panic!("unexpected error: {other}"),
         }

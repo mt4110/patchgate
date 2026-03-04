@@ -43,7 +43,7 @@ CI/Workflowで自動化済み:
 
 - [ ] **Tag**: `git tag -s vX.Y.Z -m "Release vX.Y.Z"`
 - [ ] **Artifact**: release binary + `SHA256SUMS`
-- [ ] **SBOM**: `sbom.cargo-metadata.json` を生成・添付
+- [ ] **SBOM-like metadata**: `sbom.cargo-metadata.json`（`cargo metadata` 出力）を生成・添付
 
 ## Post-Release
 

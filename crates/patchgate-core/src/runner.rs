@@ -390,11 +390,12 @@ fn execute_plugin(
             plugin.id, plugin.command
         )
     })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&input_json)
-            .context("failed to write plugin input")?;
-    }
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&input_json)?;
+            Ok(())
+        })
+    });
 
     let stdout = child
         .stdout
@@ -416,6 +417,9 @@ fn execute_plugin(
     if !matches!(termination, ChildTermination::Exited(_)) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+    if let Some(stdin_writer) = stdin_writer {
+        join_stdin_writer(stdin_writer, &termination)?;
     }
     let stdout = join_reader(stdout_reader, "stdout")?;
     let stderr = join_reader(stderr_reader, "stderr")?;
@@ -578,6 +582,22 @@ fn join_reader(
         .join()
         .map_err(|_| anyhow::anyhow!("plugin {stream_name} reader thread panicked"))?;
     output.with_context(|| format!("failed to read plugin {stream_name}"))
+}
+
+fn join_stdin_writer(
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    termination: &ChildTermination,
+) -> Result<()> {
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            if matches!(termination, ChildTermination::Exited(_)) {
+                return Err(err).context("failed to write plugin input");
+            }
+            Ok(())
+        }
+        Err(_) => Err(anyhow::anyhow!("plugin stdin writer thread panicked")),
+    }
 }
 
 fn plugin_to_core_finding(plugin_id: &str, finding: &PluginFinding) -> Finding {
@@ -2738,6 +2758,40 @@ mod tests {
         .expect("read stream");
         assert_eq!(output.len(), 16);
         assert!(!overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn join_stdin_writer_ignores_broken_pipe_on_timeout() {
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::TimedOut);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn join_stdin_writer_reports_error_when_process_exited() {
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .status()
+            .expect("status");
+        #[cfg(not(windows))]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+            .expect("status");
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::Exited(status));
+        assert!(result.is_err());
     }
 
     #[test]

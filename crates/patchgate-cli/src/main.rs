@@ -15,6 +15,7 @@ use patchgate_github::{
 };
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use reqwest::Url;
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2566,6 +2567,7 @@ fn dispatch_signed_webhooks(
         .build()
         .context("failed to build webhook client")?;
     for url in urls {
+        let safe_url = redacted_endpoint(url.as_str());
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -2585,12 +2587,12 @@ fn dispatch_signed_webhooks(
             .headers(headers)
             .body(body.clone())
             .send()
-            .with_context(|| format!("webhook request failed: {url}"))?;
+            .with_context(|| format!("webhook request failed: {safe_url}"))?;
         if !response.status().is_success() {
             return Err(anyhow!(
                 "webhook endpoint returned {} for {}",
                 response.status(),
-                url
+                safe_url
             ));
         }
     }
@@ -2623,6 +2625,7 @@ fn dispatch_notifications(
         .context("failed to build notifications client")?;
 
     for target in targets {
+        let safe_url = redacted_endpoint(target.url.as_str());
         let payload = notification_payload(target.kind, telemetry_repo, report)?;
         let body = serde_json::to_vec(&payload)?;
         let mut last_error: Option<anyhow::Error> = None;
@@ -2641,14 +2644,14 @@ fn dispatch_notifications(
                     last_error = Some(anyhow!(
                         "target `{}` ({}) returned status {}",
                         target.name,
-                        target.url,
+                        safe_url,
                         resp.status()
                     ));
                 }
                 Err(err) => {
                     last_error = Some(anyhow!(err).context(format!(
                         "target `{}` ({}) request failed",
-                        target.name, target.url
+                        target.name, safe_url
                     )));
                 }
             }
@@ -2681,7 +2684,7 @@ fn notification_payload(
                 {
                     "color": if report.should_fail { "danger" } else { "good" },
                     "fields": [
-                        {"title": "findings", "value": report.findings.len(), "short": true},
+                        {"title": "findings", "value": report.findings.len().to_string(), "short": true},
                         {"title": "priority", "value": format!("{:?}", report.review_priority), "short": true}
                     ]
                 }
@@ -2724,6 +2727,25 @@ fn sign_webhook_payload(secret: &[u8], timestamp: &[u8], body: &[u8]) -> Result<
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn redacted_endpoint(raw_url: &str) -> String {
+    match Url::parse(raw_url) {
+        Ok(url) => {
+            let mut output = format!("{}://", url.scheme());
+            if let Some(host) = url.host_str() {
+                output.push_str(host);
+            } else {
+                output.push_str("<host>");
+            }
+            if let Some(port) = url.port() {
+                output.push_str(format!(":{port}").as_str());
+            }
+            output.push_str("/***");
+            output
+        }
+        Err(_) => "<redacted-url>".to_string(),
+    }
 }
 
 fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResult<()> {
@@ -3443,15 +3465,17 @@ mod tests {
         append_scan_failure_records, apply_changed_file_overrides, apply_threshold_override,
         build_cache_key, build_history_summary, build_history_trend,
         changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
-        gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        recover_cache_db, render_github_comment, resolve_audit_actor, resolve_ci_provider,
+        gate_exit_code, is_likely_cache_corruption, notification_payload, parse_mode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, recover_cache_db, redacted_endpoint,
+        render_github_comment, resolve_audit_actor, resolve_ci_provider,
         resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
         resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
         resolve_webhook_signature, run_policy_lint, run_policy_verify_v1, sign_webhook_payload,
-        sorted_findings_for_comment, CiProvider, FailureCode, OptionSource, PolicyExitCode,
-        PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
-        ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
+        sorted_findings_for_comment, CiProvider, FailureCode, NotificationKind, OptionSource,
+        PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
+        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
+        ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4669,6 +4693,49 @@ allow_legacy_config_names = false
         .expect_err("must require env var");
         let message = format!("{err:#}");
         assert!(message.contains("missing webhook secret env var"));
+    }
+
+    #[test]
+    fn redacted_endpoint_masks_path_and_query() {
+        let masked = redacted_endpoint("https://hooks.example.com/services/abc/def?token=secret");
+        assert_eq!(masked, "https://hooks.example.com/***");
+    }
+
+    #[test]
+    fn notification_payload_slack_fields_are_strings() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let payload = notification_payload(NotificationKind::Slack, "example/repo", &report)
+            .expect("payload");
+        let findings_value = payload
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.get("fields"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.get("value"))
+            .expect("findings value");
+        assert!(
+            findings_value.is_string(),
+            "slack findings value must be encoded as string"
+        );
     }
 
     #[test]
