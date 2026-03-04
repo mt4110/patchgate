@@ -9,7 +9,19 @@ def main() -> int:
         print(json.dumps({"findings": [], "diagnostics": ["empty input"]}))
         return 0
 
-    payload = json.loads(raw)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(
+            json.dumps(
+                {
+                    "findings": [],
+                    "diagnostics": [f"invalid json input: {exc.msg}"],
+                }
+            )
+        )
+        return 0
+
     findings = []
     diagnostics = [
         f"plugin_id={payload.get('plugin_id', 'unknown')}",

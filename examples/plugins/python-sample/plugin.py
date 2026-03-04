@@ -2,7 +2,16 @@
 import json
 import sys
 
-payload = json.loads(sys.stdin.read() or "{}")
+raw = sys.stdin.read()
+if not raw.strip():
+    payload = {}
+else:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(json.dumps({"findings": [], "diagnostics": [f"invalid json input: {exc.msg}"]}))
+        raise SystemExit(0)
+
 findings = []
 for f in payload.get("changed_files", []):
     if f.get("path", "").startswith("infra/") and f.get("added", 0) > 0:

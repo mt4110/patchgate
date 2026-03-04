@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -245,6 +247,18 @@ fn evaluate_plugins(
                 if invocation.status != PluginInvocationStatus::Pass {
                     triggered = true;
                 }
+                if plugin.fail_mode == "fail_closed"
+                    && plugin_invocation_is_execution_failure(&invocation.status)
+                {
+                    let message = invocation
+                        .error
+                        .as_deref()
+                        .unwrap_or("plugin execution failed");
+                    return Err(anyhow::anyhow!(
+                        "plugin `{}` failed with fail_closed policy: {message}",
+                        plugin.id
+                    ));
+                }
                 for finding in &invocation.findings {
                     total_penalty = total_penalty.saturating_add(finding.penalty as u16);
                 }
@@ -302,6 +316,13 @@ fn evaluate_plugins(
     }
 
     Ok(outcome)
+}
+
+fn plugin_invocation_is_execution_failure(status: &PluginInvocationStatus) -> bool {
+    matches!(
+        status,
+        PluginInvocationStatus::Error | PluginInvocationStatus::TimedOut
+    )
 }
 
 fn execute_plugin(
@@ -375,16 +396,32 @@ fn execute_plugin(
             .context("failed to write plugin input")?;
     }
 
-    let timed_out = wait_for_child_with_timeout(&mut child, timeout)?;
-    if timed_out {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture plugin stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture plugin stderr"))?;
+    let stdout_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_limit_probe = Arc::clone(&stdout_limit_exceeded);
+    let stdout_reader = thread::spawn(move || {
+        read_stream_with_limit(stdout, max_stdout_bytes, Some(stdout_limit_probe))
+    });
+    let stderr_reader = thread::spawn(move || read_stream(stderr));
+
+    let termination =
+        wait_for_child_with_timeout(&mut child, timeout, stdout_limit_exceeded.as_ref())?;
+    if !matches!(termination, ChildTermination::Exited(_)) {
         let _ = child.kill();
+        let _ = child.wait();
     }
-    let output = child
-        .wait_with_output()
-        .context("failed to collect plugin output")?;
+    let stdout = join_reader(stdout_reader, "stdout")?;
+    let stderr = join_reader(stderr_reader, "stderr")?;
     let duration_ms = start.elapsed().as_millis();
 
-    if timed_out {
+    if matches!(termination, ChildTermination::TimedOut) {
         return Ok(PluginInvocation {
             plugin_id: plugin.id.clone(),
             status: PluginInvocationStatus::TimedOut,
@@ -396,18 +433,33 @@ fn execute_plugin(
         });
     }
 
-    if output.stdout.len() > max_stdout_bytes {
-        return Err(anyhow::anyhow!(
+    if stdout_limit_exceeded.load(Ordering::Relaxed)
+        || matches!(termination, ChildTermination::StdoutLimitExceeded)
+    {
+        let message = format!(
             "plugin `{}` stdout exceeded sandbox.max_stdout_kib ({} KiB)",
-            plugin.id,
-            policy.plugins.sandbox.max_stdout_kib
-        ));
+            plugin.id, policy.plugins.sandbox.max_stdout_kib
+        );
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::Error,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec![message.clone()],
+            error: Some(message),
+        });
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
+    let exit_status = match termination {
+        ChildTermination::Exited(status) => status,
+        ChildTermination::TimedOut | ChildTermination::StdoutLimitExceeded => unreachable!(),
+    };
+
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !exit_status.success() {
         let reason = if stderr.is_empty() {
-            format!("exit status: {}", output.status)
+            format!("exit status: {exit_status}")
         } else {
             stderr
         };
@@ -422,7 +474,7 @@ fn execute_plugin(
         });
     }
 
-    let stdout = String::from_utf8(output.stdout).context("plugin stdout was not utf8")?;
+    let stdout = String::from_utf8(stdout).context("plugin stdout was not utf8")?;
     let mut plugin_output: PluginOutput =
         serde_json::from_str(stdout.as_str()).context("failed to decode plugin output json")?;
     for finding in &mut plugin_output.findings {
@@ -453,17 +505,79 @@ fn execute_plugin(
     })
 }
 
-fn wait_for_child_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildTermination {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    StdoutLimitExceeded,
+}
+
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    stdout_limit_exceeded: &AtomicBool,
+) -> Result<ChildTermination> {
     let start = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(false);
+        if stdout_limit_exceeded.load(Ordering::Relaxed) {
+            return Ok(ChildTermination::StdoutLimitExceeded);
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(ChildTermination::Exited(status));
         }
         if start.elapsed() >= timeout {
-            return Ok(true);
+            return Ok(ChildTermination::TimedOut);
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn read_stream_with_limit<R: Read>(
+    mut reader: R,
+    max_bytes: usize,
+    overflow_flag: Option<Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    let mut stored = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut overflowed = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if overflowed {
+            continue;
+        }
+        let remaining = max_bytes.saturating_sub(stored.len());
+        if read <= remaining {
+            stored.extend_from_slice(&buffer[..read]);
+            continue;
+        }
+        if remaining > 0 {
+            stored.extend_from_slice(&buffer[..remaining]);
+        }
+        overflowed = true;
+        if let Some(flag) = overflow_flag.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    Ok(stored)
+}
+
+fn read_stream<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    let output = handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("plugin {stream_name} reader thread panicked"))?;
+    output.with_context(|| format!("failed to read plugin {stream_name}"))
 }
 
 fn plugin_to_core_finding(plugin_id: &str, finding: &PluginFinding) -> Finding {
@@ -2579,6 +2693,51 @@ mod tests {
         assert_eq!(finding.rule_id, "PLG-sample-plugin-001");
         assert_eq!(finding.category, "plugin");
         assert!(finding.tags.iter().any(|t| t == "plugin:sample-plugin"));
+    }
+
+    #[test]
+    fn plugin_execution_failure_status_detection() {
+        assert!(plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Error
+        ));
+        assert!(plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::TimedOut
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Pass
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Fail
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Skipped
+        ));
+    }
+
+    #[test]
+    fn read_stream_with_limit_truncates_and_marks_overflow() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let output = read_stream_with_limit(
+            std::io::Cursor::new(vec![b'x'; 64]),
+            8,
+            Some(Arc::clone(&overflow)),
+        )
+        .expect("read stream");
+        assert_eq!(output.len(), 8);
+        assert!(overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn read_stream_with_limit_without_overflow_keeps_all_bytes() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let output = read_stream_with_limit(
+            std::io::Cursor::new(vec![b'x'; 16]),
+            64,
+            Some(Arc::clone(&overflow)),
+        )
+        .expect("read stream");
+        assert_eq!(output.len(), 16);
+        assert!(!overflow.load(Ordering::Relaxed));
     }
 
     #[test]

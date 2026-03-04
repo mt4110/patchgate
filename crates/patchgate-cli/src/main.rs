@@ -2545,17 +2545,7 @@ fn dispatch_signed_webhooks(
     };
     let body = serde_json::to_vec(&envelope)?;
     let timestamp = current_unix_ts().to_string();
-    let signature = if secret_env.trim().is_empty() {
-        None
-    } else {
-        let secret = std::env::var(secret_env)
-            .with_context(|| format!("missing webhook secret env var: {secret_env}"))?;
-        Some(sign_webhook_payload(
-            secret.as_bytes(),
-            timestamp.as_bytes(),
-            body.as_slice(),
-        )?)
-    };
+    let signature = resolve_webhook_signature(secret_env, timestamp.as_bytes(), body.as_slice())?;
     let client = Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
@@ -2571,12 +2561,10 @@ fn dispatch_signed_webhooks(
             HeaderName::from_static("x-patchgate-timestamp"),
             HeaderValue::from_str(timestamp.as_str())?,
         );
-        if let Some(sig) = signature.as_ref() {
-            headers.insert(
-                HeaderName::from_static("x-patchgate-signature"),
-                HeaderValue::from_str(sig.as_str())?,
-            );
-        }
+        headers.insert(
+            HeaderName::from_static("x-patchgate-signature"),
+            HeaderValue::from_str(signature.as_str())?,
+        );
         let response = client
             .post(url)
             .headers(headers)
@@ -2592,6 +2580,17 @@ fn dispatch_signed_webhooks(
         }
     }
     Ok(())
+}
+
+fn resolve_webhook_signature(secret_env: &str, timestamp: &[u8], body: &[u8]) -> Result<String> {
+    if secret_env.trim().is_empty() {
+        return Err(anyhow!(
+            "webhook secret env var name is empty; set --webhook-secret-env or integrations.webhook.secret_env"
+        ));
+    }
+    let secret = std::env::var(secret_env)
+        .with_context(|| format!("missing webhook secret env var: {secret_env}"))?;
+    sign_webhook_payload(secret.as_bytes(), timestamp, body)
 }
 
 fn dispatch_notifications(
@@ -3433,11 +3432,11 @@ mod tests {
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
         recover_cache_db, render_github_comment, resolve_audit_actor, resolve_ci_provider,
         resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo, run_policy_lint,
-        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
-        FailureCode, OptionSource, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
-        ScanMetricRecord, ScopeMode,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_policy_lint, run_policy_verify_v1, sign_webhook_payload,
+        sorted_findings_for_comment, CiProvider, FailureCode, OptionSource, PolicyExitCode,
+        PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
+        ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4621,6 +4620,26 @@ allow_legacy_config_names = false
             sign_webhook_payload(b"secret", b"1700000000", br#"{"ok":true}"#).expect("signature");
         assert!(sig.starts_with("sha256="));
         assert_eq!(sig.len(), "sha256=".len() + 64);
+    }
+
+    #[test]
+    fn resolve_webhook_signature_rejects_empty_env_name() {
+        let err = resolve_webhook_signature("   ", b"1700000000", br#"{"ok":true}"#)
+            .expect_err("must reject empty env name");
+        let message = format!("{err:#}");
+        assert!(message.contains("webhook secret env var name is empty"));
+    }
+
+    #[test]
+    fn resolve_webhook_signature_requires_existing_env_var() {
+        let err = resolve_webhook_signature(
+            "PATCHGATE_WEBHOOK_SECRET_MISSING_FOR_TEST",
+            b"1700000000",
+            br#"{"ok":true}"#,
+        )
+        .expect_err("must require env var");
+        let message = format!("{err:#}");
+        assert!(message.contains("missing webhook secret env var"));
     }
 
     #[test]

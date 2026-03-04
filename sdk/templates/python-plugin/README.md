@@ -13,6 +13,6 @@ python3 main.py < sample-input.json
 ```json
 {
   "findings": [],
-  "diagnostics": ["plugin executed"]
+  "diagnostics": ["plugin_id=sample", "changed_files=2"]
 }
 ```
