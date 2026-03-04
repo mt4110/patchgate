@@ -1700,7 +1700,8 @@ fn execute_scan(
     let publish_requested = github_publish || publish;
     if publish_requested {
         let publish_start = Instant::now();
-        let ci_provider = resolve_ci_provider(
+        let ci_provider = resolve_ci_provider_for_publish(
+            github_publish,
             ci_provider.as_deref(),
             Some(cfg.integrations.ci.provider.as_str()),
         )
@@ -2440,6 +2441,19 @@ fn resolve_ci_provider(
     CiProvider::parse(cli_value.or(config_value))
 }
 
+fn resolve_ci_provider_for_publish(
+    github_publish: bool,
+    cli_value: Option<&str>,
+    config_value: Option<&str>,
+) -> std::result::Result<CiProvider, String> {
+    let effective_cli_value = if github_publish && cli_value.is_none() {
+        Some("github")
+    } else {
+        cli_value
+    };
+    resolve_ci_provider(effective_cli_value, config_value)
+}
+
 fn publish_generic_ci_payload(
     telemetry_repo: &str,
     report: &Report,
@@ -2537,14 +2551,15 @@ fn dispatch_signed_webhooks(
     if urls.is_empty() {
         return Ok(());
     }
+    let unix_ts = current_unix_ts();
     let envelope = WebhookEnvelope {
         event: "scan.completed",
-        unix_ts: current_unix_ts(),
+        unix_ts,
         repo: telemetry_repo,
         report,
     };
     let body = serde_json::to_vec(&envelope)?;
-    let timestamp = current_unix_ts().to_string();
+    let timestamp = unix_ts.to_string();
     let signature = resolve_webhook_signature(secret_env, timestamp.as_bytes(), body.as_slice())?;
     let client = Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
@@ -3431,8 +3446,8 @@ mod tests {
         gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
         recover_cache_db, render_github_comment, resolve_audit_actor, resolve_ci_provider,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
+        resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
         resolve_webhook_signature, run_policy_lint, run_policy_verify_v1, sign_webhook_payload,
         sorted_findings_for_comment, CiProvider, FailureCode, OptionSource, PolicyExitCode,
         PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
@@ -4611,6 +4626,20 @@ allow_legacy_config_names = false
     #[test]
     fn resolve_ci_provider_prefers_cli_value() {
         let provider = resolve_ci_provider(Some("generic"), Some("github")).expect("provider");
+        assert_eq!(provider, CiProvider::Generic);
+    }
+
+    #[test]
+    fn resolve_ci_provider_for_publish_prefers_github_publish_default() {
+        let provider = resolve_ci_provider_for_publish(true, None, Some("generic"))
+            .expect("provider for github publish");
+        assert_eq!(provider, CiProvider::GitHub);
+    }
+
+    #[test]
+    fn resolve_ci_provider_for_publish_keeps_explicit_cli_value() {
+        let provider = resolve_ci_provider_for_publish(true, Some("generic"), Some("github"))
+            .expect("explicit cli provider");
         assert_eq!(provider, CiProvider::Generic);
     }
 

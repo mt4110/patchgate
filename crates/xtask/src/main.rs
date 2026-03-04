@@ -708,16 +708,23 @@ fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!("- ga_ready: {}\n", ga_ready));
     md.push_str("\n## Checklist\n");
     md.push_str(&format!(
-        "- [ ] Metrics present: {} entries\n",
+        "- {} Metrics present: {} entries\n",
+        checklist_box(has_metrics),
         metrics.len()
     ));
     md.push_str(&format!(
-        "- [ ] Audit logs present: {} entries\n",
+        "- {} Audit logs present: {} entries\n",
+        checklist_box(has_audits),
         audits.len()
     ));
-    md.push_str(&format!("- [ ] SLO ready: {}\n", slo.ready));
     md.push_str(&format!(
-        "- [ ] Audit failures absent: {}\n",
+        "- {} SLO ready: {}\n",
+        checklist_box(slo.ready),
+        slo.ready
+    ));
+    md.push_str(&format!(
+        "- {} Audit failures absent: {}\n",
+        checklist_box(!has_audit_failures),
         !has_audit_failures
     ));
     md.push_str("\n## SLO Snapshot\n");
@@ -733,7 +740,24 @@ fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
 
     write_output(&options.output, md.as_str())?;
     println!("ga readiness report written: {}", options.output.display());
+    if !ga_ready {
+        bail!(
+            "ga readiness check failed (metrics_present={}, audits_present={}, slo_ready={}, audit_failures_absent={})",
+            has_metrics,
+            has_audits,
+            slo.ready,
+            !has_audit_failures
+        );
+    }
     Ok(())
+}
+
+fn checklist_box(condition: bool) -> &'static str {
+    if condition {
+        "[x]"
+    } else {
+        "[ ]"
+    }
 }
 
 fn build_slo_report(
@@ -1141,13 +1165,15 @@ fn is_duration_regressed(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
     use super::{
         aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
-        load_jsonl_records, validate_workload_identity, AuditLogRecord, BenchSample,
-        MetricLogRecord, TEMP_SEQ,
+        checklist_box, load_jsonl_records, run_ga_readiness, validate_workload_identity,
+        AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -1289,5 +1315,43 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("xtask-missing-{seq}.jsonl"));
         let err = load_jsonl_records::<MetricLogRecord>(&missing).expect_err("must error");
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn checklist_box_marks_condition() {
+        assert_eq!(checklist_box(true), "[x]");
+        assert_eq!(checklist_box(false), "[ ]");
+    }
+
+    #[test]
+    fn ga_readiness_fails_when_not_ready_and_writes_report() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-ga-readiness-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let metrics_input = base.join("metrics.jsonl");
+        let audit_input = base.join("audit.jsonl");
+        let output = base.join("ga-readiness.md");
+        fs::write(&metrics_input, "").expect("write metrics");
+        fs::write(&audit_input, "").expect("write audits");
+        let options = OpsOptions {
+            subcommand: OpsSubcommand::GaReadiness,
+            metrics_input,
+            audit_input,
+            output: output.clone(),
+            trend_output: None,
+            availability_target_pct: 99,
+            p95_target_ms: 1_500,
+            false_positive_target_pct: 5,
+        };
+
+        let err = run_ga_readiness(&options).expect_err("ga readiness must fail");
+        assert!(format!("{err:#}").contains("ga readiness check failed"));
+
+        let markdown = fs::read_to_string(PathBuf::from(&output)).expect("read output");
+        assert!(markdown.contains("- ga_ready: false"));
+        assert!(markdown.contains("- [ ] Metrics present: 0 entries"));
+        assert!(markdown.contains("- [ ] Audit logs present: 0 entries"));
+
+        let _ = fs::remove_dir_all(base);
     }
 }
