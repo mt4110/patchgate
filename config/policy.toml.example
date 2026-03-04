@@ -54,6 +54,7 @@ java_kotlin = false # opt-in
 test_gap_max_penalty = 35
 dangerous_change_max_penalty = 45
 dependency_update_max_penalty = 30
+plugin_max_penalty = 0 # optional external plugin contribution (0 keeps score unchanged)
 
 [test_gap]
 enabled = true
@@ -165,3 +166,45 @@ large_lockfile_bonus_penalty = 0
 [waiver]
 # Each waiver entry must include check_id, reason, approver and future expires_at (RFC3339)
 entries = []
+
+[plugins]
+enabled = false
+entries = []
+
+[plugins.sandbox]
+profile = "restricted" # none | restricted
+allow_network = false
+env_allowlist = []
+max_stdout_kib = 256
+
+[integrations.ci]
+provider = "github" # github | generic
+generic_output_path = ""
+
+[integrations.webhook]
+enabled = false
+urls = []
+secret_env = "PATCHGATE_WEBHOOK_SECRET"
+timeout_ms = 3000
+
+[integrations.notifications]
+enabled = false
+targets = []
+retry_max_attempts = 2
+retry_backoff_ms = 500
+timeout_ms = 3000
+
+[release.lts]
+active = false
+branch = "lts/v1"
+security_sla_hours = 72
+backport_labels = ["backport/lts-v1"]
+
+[release.slo]
+availability_target_pct = 99
+p95_duration_ms = 1500
+false_positive_target_pct = 5
+
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false

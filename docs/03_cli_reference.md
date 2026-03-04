@@ -10,8 +10,6 @@
 
 ### `patchgate scan`
 
-PR差分に対して品質ゲートを実行します。
-
 Core options:
 
 - `--policy-preset <strict|balanced|relaxed>`
@@ -23,8 +21,8 @@ Core options:
 - `--on-exceed <fail_open|fail_closed>`
 - `--no-cache`
 - `--profile-output <path>`
-- `--metrics-output <path>` (JSONL追記)
-- `--audit-log-output <path>` (JSONL追記)
+- `--metrics-output <path>`
+- `--audit-log-output <path>`
 - `--audit-actor <name>`
 
 GitHub publish options:
@@ -35,8 +33,8 @@ GitHub publish options:
 - `--github-pr <number>`
 - `--github-sha <sha>`
 - `--github-auth <token|app>`
-- `--github-token-env <env_name>` (default: `GITHUB_TOKEN`)
-- `--github-app-token-env <env_name>` (default: `GITHUB_APP_INSTALLATION_TOKEN`)
+- `--github-token-env <env_name>`
+- `--github-app-token-env <env_name>`
 - `--github-check-name <name>`
 - `--github-retry-max-attempts <n>`
 - `--github-retry-backoff-ms <ms>`
@@ -50,17 +48,26 @@ GitHub publish options:
 - `--github-suppress-comment-low-priority`
 - `--github-suppress-comment-rerun`
 
+Provider/Webhook/Notification options:
+
+- `--publish`
+- `--ci-provider <github|generic>`
+- `--ci-generic-output <path>`
+- `--webhook-url <https://...>` (repeatable)
+- `--webhook-secret-env <env_name>`
+- `--webhook-timeout-ms <ms>`
+- `--notify-target <kind=url>` (kind: `slack|teams|generic`)
+- `--notify-retry-max-attempts <n>`
+- `--notify-retry-backoff-ms <ms>`
+- `--notify-timeout-ms <ms>`
+
 ### `patchgate history summary`
 
-メトリクスJSONLを集計します。
-
 - `--input <metrics.jsonl>`
-- `--baseline <metrics.jsonl>`（任意、アラート比較用）
+- `--baseline <metrics.jsonl>`
 - `--format <text|json>`
 
 ### `patchgate history trend`
-
-メトリクスJSONLを repo/scope/check 単位で集計します。
 
 - `--input <metrics.jsonl>`
 - `--format <text|json>`
@@ -78,6 +85,13 @@ GitHub publish options:
 - `--path <file>`
 - `--write`
 
+### `patchgate policy verify-v1`
+
+- `--path <file>`
+- `--policy-preset <strict|balanced|relaxed>`
+- `--format <text|json>`
+- v1 RC/GA前提の移行準備状態を検証
+
 ## JSON contract (`scan --format json`)
 
 主要キー:
@@ -87,67 +101,39 @@ GitHub publish options:
 - `changed_files`, `check_durations_ms`
 - `diagnostic_hints`
 - `supply_chain_signals`
+- `plugin_invocations`
 - `checks[]`, `findings[]`
 
-`supply_chain_signals[]` 要素:
+## Metrics/Audit JSONL
 
-- `id`
-- `title`
-- `severity`
-- `message`
-- `related_files`
-- `tags`
+- Metrics (`schema_version=1`): repo/mode/scope/duration/score/failure code
+- Audit (`patchgate.audit.v1`): actor/target/result/failure code
 
-## Metrics/Audit JSONL contract
+## Failure codes
 
-Metrics record (`schema_version=1`) 主要キー:
-
-- `unix_ts`, `repo`, `mode`, `scope`
-- `duration_ms`, `changed_files`, `skipped_by_cache`
-- `score`, `threshold`, `should_fail`
-- `check_penalties`
-- `failure_code`, `failure_category`
-- `diagnostic_hints`
-
-Audit record (`audit_format=patchgate.audit.v1`) 主要キー:
-
-- `schema_version`, `audit_format`, `unix_ts`
-- `actor`, `repo`, `target`
-- `mode`, `scope`, `result`
-- `failure_code`, `failure_category`
-- `score`, `threshold`, `changed_files`
-
-## Failure code examples
-
-- `PG-IN-001` 入力不正
-- `PG-CFG-001` 設定読み込み失敗
-- `PG-GIT-001` Git差分収集失敗
-- `PG-RT-001` 評価実行失敗
-- `PG-OUT-001` 出力失敗
-- `PG-PUB-001/002` publish失敗
-- `PG-PUB-SSO-001` SSO未承認
-- `PG-PUB-ORG-001` Org policy制約
-- `PG-GOV-001` waiver期限切れ
+- `PG-IN-001`, `PG-CFG-001`, `PG-GIT-001`, `PG-RT-001`, `PG-OUT-001`
+- `PG-PUB-001`, `PG-PUB-002`, `PG-PUB-SSO-001`, `PG-PUB-ORG-001`
+- `PG-PUB-WEB-001`, `PG-NOT-001`, `PG-GOV-001`
 
 ## Exit code
 
 `scan`:
 
-- `0`: 成功（warn実行、または enforce pass）
-- `1`: gate fail（enforceで`score < threshold`）
-- `2`: 入力エラー
-- `3`: 設定エラー
-- `4`: 実行エラー
-- `5`: 出力エラー
-- `6`: publishエラー
+- `0`: success
+- `1`: gate fail (enforce)
+- `2`: input error
+- `3`: config error
+- `4`: runtime error
+- `5`: output error
+- `6`: publish/integration error
 
-`policy lint/migrate`:
+`policy lint/migrate/verify-v1`:
 
-- `0`: 成功
+- `0`: success
 - `10`: read/parse error
 - `11`: validation type
 - `12`: validation range
 - `13`: validation dependency
-- `14`: current version requirement violation
+- `14`: migration required / not ready
 - `15`: migration failure
 - `16`: I/O failure

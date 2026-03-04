@@ -3,13 +3,18 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
+use hmac::{Hmac, Mac};
 use patchgate_github::{
     mask_secrets as mask_sensitive, publish_report, PublishAuth, PublishRequest, RetryPolicy,
 };
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -187,6 +192,46 @@ struct ScanArgs {
     /// Suppress comment on rerun attempts (GITHUB_RUN_ATTEMPT > 1)
     #[arg(long)]
     github_suppress_comment_rerun: bool,
+
+    /// Publish scan results through provider abstraction
+    #[arg(long)]
+    publish: bool,
+
+    /// CI provider: github|generic
+    #[arg(long)]
+    ci_provider: Option<String>,
+
+    /// Generic provider payload output path
+    #[arg(long)]
+    ci_generic_output: Option<PathBuf>,
+
+    /// Signed webhook endpoint URL (repeatable)
+    #[arg(long = "webhook-url")]
+    webhook_urls: Vec<String>,
+
+    /// Env var name for webhook signing secret
+    #[arg(long)]
+    webhook_secret_env: Option<String>,
+
+    /// Webhook request timeout (ms)
+    #[arg(long)]
+    webhook_timeout_ms: Option<u64>,
+
+    /// Notification target in `kind=url` format (kind: slack|teams|generic)
+    #[arg(long = "notify-target")]
+    notify_targets: Vec<String>,
+
+    /// Notification retry max attempts
+    #[arg(long)]
+    notify_retry_max_attempts: Option<u8>,
+
+    /// Notification retry backoff (ms)
+    #[arg(long)]
+    notify_retry_backoff_ms: Option<u64>,
+
+    /// Notification request timeout (ms)
+    #[arg(long)]
+    notify_timeout_ms: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -243,6 +288,9 @@ enum PolicyCommand {
 
     /// Migrate policy config across policy versions
     Migrate(PolicyMigrateArgs),
+
+    /// Verify v1.0 readiness for migration
+    VerifyV1(PolicyVerifyV1Args),
 }
 
 #[derive(Args, Debug)]
@@ -277,6 +325,21 @@ struct PolicyMigrateArgs {
     /// Overwrite input file. Without this flag, output is dry-run to stdout.
     #[arg(long)]
     write: bool,
+}
+
+#[derive(Args, Debug)]
+struct PolicyVerifyV1Args {
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +385,8 @@ enum FailureCode {
     PublishApiFailed,
     PublishSsoRequired,
     PublishOrgPolicyBlocked,
+    PublishWebhookFailed,
+    NotificationFailed,
     WaiverExpired,
 }
 
@@ -337,6 +402,8 @@ impl FailureCode {
             FailureCode::PublishApiFailed => "PG-PUB-002",
             FailureCode::PublishSsoRequired => "PG-PUB-SSO-001",
             FailureCode::PublishOrgPolicyBlocked => "PG-PUB-ORG-001",
+            FailureCode::PublishWebhookFailed => "PG-PUB-WEB-001",
+            FailureCode::NotificationFailed => "PG-NOT-001",
             FailureCode::WaiverExpired => "PG-GOV-001",
         }
     }
@@ -351,7 +418,9 @@ impl FailureCode {
             FailureCode::PublishInputFailed
             | FailureCode::PublishApiFailed
             | FailureCode::PublishSsoRequired
-            | FailureCode::PublishOrgPolicyBlocked => "publish",
+            | FailureCode::PublishOrgPolicyBlocked
+            | FailureCode::PublishWebhookFailed
+            | FailureCode::NotificationFailed => "publish",
         }
     }
 }
@@ -488,6 +557,76 @@ impl GitHubAuthMode {
             other => Err(format!("`{other}` (expected: token|app)")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiProvider {
+    GitHub,
+    Generic,
+}
+
+impl CiProvider {
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw.unwrap_or("github") {
+            "github" => Ok(CiProvider::GitHub),
+            "generic" => Ok(CiProvider::Generic),
+            other => Err(format!("`{other}` (expected: github|generic)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationKind {
+    Slack,
+    Teams,
+    Generic,
+}
+
+impl NotificationKind {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "slack" => Ok(NotificationKind::Slack),
+            "teams" => Ok(NotificationKind::Teams),
+            "generic" => Ok(NotificationKind::Generic),
+            other => Err(format!("`{other}` (expected: slack|teams|generic)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedNotificationTarget {
+    name: String,
+    kind: NotificationKind,
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenericCiPublishPayload {
+    schema_version: u8,
+    provider: String,
+    repo: String,
+    unix_ts: u64,
+    summary: GenericPublishSummary,
+    report: Report,
+    markdown: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenericPublishSummary {
+    score: u8,
+    threshold: u8,
+    should_fail: bool,
+    mode: String,
+    scope: String,
+    findings: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookEnvelope<'a> {
+    event: &'a str,
+    unix_ts: u64,
+    repo: &'a str,
+    report: &'a Report,
 }
 
 struct ResolvedScanOptions {
@@ -672,6 +811,9 @@ fn execute_policy(repo_root: &Path, config_override: Option<&Path>, policy: Poli
         PolicyCommand::Lint(args) => run_policy_lint(repo_root, config_override, args).as_i32(),
         PolicyCommand::Migrate(args) => {
             run_policy_migrate(repo_root, config_override, args).as_i32()
+        }
+        PolicyCommand::VerifyV1(args) => {
+            run_policy_verify_v1(repo_root, config_override, args).as_i32()
         }
     }
 }
@@ -1060,6 +1202,151 @@ fn run_policy_migrate(
     PolicyExitCode::Ok
 }
 
+#[derive(Debug, Serialize)]
+struct V1ReadinessReport {
+    ready: bool,
+    policy_path: String,
+    policy_version: u32,
+    rc_frozen: bool,
+    strict_compatibility: bool,
+    plugins_enabled: bool,
+    plugin_entries: usize,
+    plugin_sandbox_profile: String,
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+fn run_policy_verify_v1(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyVerifyV1Args,
+) -> PolicyExitCode {
+    let Some(policy_path) = resolve_policy_path(repo_root, config_override, args.path.as_deref())
+    else {
+        eprintln!(
+            "patchgate policy verify-v1 error: policy file not found. tried: `policy.toml`, `.patchgate/policy.toml`"
+        );
+        return PolicyExitCode::ReadOrParse;
+    };
+
+    let preset = match parse_policy_preset(args.policy_preset.as_deref()) {
+        Ok(preset) => preset,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v1 error: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+
+    let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v1 error: {err:#}");
+            return map_config_error_to_policy_exit(&err);
+        }
+    };
+
+    let mut warnings = loaded.compatibility_warnings.clone();
+    let mut next_actions = Vec::new();
+    let cfg = loaded.config;
+
+    if policy_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n != "policy.toml")
+        .unwrap_or(false)
+    {
+        warnings.push("legacy policy filename detected; migrate to `policy.toml`".to_string());
+        next_actions.push("Rename policy file to `policy.toml` for v1 default path.".to_string());
+    }
+
+    if !cfg.compatibility.v1.rc_frozen {
+        warnings.push("compatibility.v1.rc_frozen=false".to_string());
+        next_actions
+            .push("Set `compatibility.v1.rc_frozen = true` after RC review freeze.".to_string());
+    }
+    if cfg.compatibility.v1.allow_legacy_config_names {
+        warnings.push("compatibility.v1.allow_legacy_config_names=true".to_string());
+        next_actions.push(
+            "Set `compatibility.v1.allow_legacy_config_names = false` before GA.".to_string(),
+        );
+    }
+    if cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none" {
+        warnings.push("plugins enabled with sandbox.profile=none".to_string());
+        next_actions.push(
+            "Use `plugins.sandbox.profile = \"restricted\"` for v1 secure baseline.".to_string(),
+        );
+    }
+
+    let ready = cfg.policy_version == POLICY_VERSION_CURRENT
+        && cfg.compatibility.v1.rc_frozen
+        && !cfg.compatibility.v1.allow_legacy_config_names
+        && !(cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none");
+    if ready {
+        next_actions.push("v1 readiness checks passed.".to_string());
+    }
+
+    let report = V1ReadinessReport {
+        ready,
+        policy_path: policy_path.display().to_string(),
+        policy_version: cfg.policy_version,
+        rc_frozen: cfg.compatibility.v1.rc_frozen,
+        strict_compatibility: !cfg.compatibility.v1.allow_legacy_config_names,
+        plugins_enabled: cfg.plugins.enabled,
+        plugin_entries: cfg.plugins.entries.len(),
+        plugin_sandbox_profile: cfg.plugins.sandbox.profile.clone(),
+        warnings,
+        next_actions,
+    };
+
+    match args.format.as_str() {
+        "json" => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(err) => {
+                eprintln!("patchgate policy verify-v1 error: failed to encode json: {err}");
+                return PolicyExitCode::IoFailed;
+            }
+        },
+        "text" => {
+            println!("patchgate policy verify-v1");
+            println!("- ready: {}", report.ready);
+            println!("- policy_path: {}", report.policy_path);
+            println!("- policy_version: {}", report.policy_version);
+            println!("- rc_frozen: {}", report.rc_frozen);
+            println!("- strict_compatibility: {}", report.strict_compatibility);
+            println!("- plugins_enabled: {}", report.plugins_enabled);
+            println!("- plugin_entries: {}", report.plugin_entries);
+            println!(
+                "- plugin_sandbox_profile: {}",
+                report.plugin_sandbox_profile
+            );
+            if report.warnings.is_empty() {
+                println!("- warnings: none");
+            } else {
+                println!("- warnings:");
+                for warning in &report.warnings {
+                    println!("  - {warning}");
+                }
+            }
+            println!("- next_actions:");
+            for action in &report.next_actions {
+                println!("  - {action}");
+            }
+        }
+        other => {
+            eprintln!(
+                "patchgate policy verify-v1 error: unsupported --format `{other}` (expected: text|json)"
+            );
+            return PolicyExitCode::ReadOrParse;
+        }
+    }
+
+    if ready {
+        PolicyExitCode::Ok
+    } else {
+        PolicyExitCode::MigrationRequired
+    }
+}
+
 fn map_config_error_to_policy_exit(err: &ConfigError) -> PolicyExitCode {
     match err {
         ConfigError::Read { .. } | ConfigError::Parse { .. } => PolicyExitCode::ReadOrParse,
@@ -1178,6 +1465,16 @@ fn execute_scan(
         github_suppress_comment_no_change,
         github_suppress_comment_low_priority,
         github_suppress_comment_rerun,
+        publish,
+        ci_provider,
+        ci_generic_output,
+        webhook_urls,
+        webhook_secret_env,
+        webhook_timeout_ms,
+        notify_targets,
+        notify_retry_max_attempts,
+        notify_retry_backoff_ms,
+        notify_timeout_ms,
     } = scan;
     let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
@@ -1400,109 +1697,197 @@ fn execute_scan(
         })?;
     }
 
-    if github_publish {
+    let publish_requested = github_publish || publish;
+    if publish_requested {
         let publish_start = Instant::now();
-        let suppressed_comment_reason = resolve_comment_suppression_reason(
-            &report,
-            github_suppress_comment_no_change,
-            github_suppress_comment_low_priority,
-            github_suppress_comment_rerun,
-        );
-        let req = resolve_publish_request(PublishRequestInput {
-            github_repo: github_repo.clone(),
-            github_pr,
-            github_sha,
-            github_token_env,
-            github_check_name,
-            github_auth,
-            github_app_token_env,
-            retry_policy: RetryPolicy {
-                max_attempts: github_retry_max_attempts,
-                backoff_base_ms: github_retry_backoff_ms,
-                backoff_max_ms: github_retry_max_backoff_ms,
-            },
-            github_dry_run,
-            publish_comment: !github_no_comment,
-            publish_check_run: !github_no_check_run,
-            apply_priority_label: github_apply_labels,
-            suppressed_comment_reason,
-        })
+        let ci_provider = resolve_ci_provider(
+            ci_provider.as_deref(),
+            Some(cfg.integrations.ci.provider.as_str()),
+        )
         .map_err(|err| {
-            ScanError::with_hint(
-                ScanErrorKind::Publish,
-                FailureCode::PublishInputFailed,
-                "Set --github-repo/--github-pr/--github-sha or provide matching GitHub Actions env vars.",
-                err.context("failed to resolve GitHub publish inputs"),
+            ScanError::with_code(
+                ScanErrorKind::Input,
+                FailureCode::InputInvalidOption,
+                anyhow!("invalid value for scan.ci_provider: {err}"),
             )
         })?;
-        let published = publish_report(&report, &markdown, &req).map_err(|err| {
-            classify_publish_scan_error(err.context("failed to publish report to GitHub"))
-        })?;
-        if let Some(payload) = published.dry_run_payload.as_ref() {
-            let pretty = serde_json::to_string_pretty(payload).map_err(|err| {
-                ScanError::new(
-                    ScanErrorKind::Output,
-                    anyhow!("failed to encode github dry-run payload: {err}"),
-                )
-            })?;
-            eprintln!(
-                "github dry-run payload:\n{}",
-                mask_sensitive(pretty.as_str())
-            );
-            if let Some(path) = github_dry_run_output.as_ref() {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(|err| {
+
+        match ci_provider {
+            CiProvider::GitHub => {
+                let suppressed_comment_reason = resolve_comment_suppression_reason(
+                    &report,
+                    github_suppress_comment_no_change,
+                    github_suppress_comment_low_priority,
+                    github_suppress_comment_rerun,
+                );
+                let req = resolve_publish_request(PublishRequestInput {
+                    github_repo: github_repo.clone(),
+                    github_pr,
+                    github_sha,
+                    github_token_env,
+                    github_check_name,
+                    github_auth,
+                    github_app_token_env,
+                    retry_policy: RetryPolicy {
+                        max_attempts: github_retry_max_attempts,
+                        backoff_base_ms: github_retry_backoff_ms,
+                        backoff_max_ms: github_retry_max_backoff_ms,
+                    },
+                    github_dry_run,
+                    publish_comment: !github_no_comment,
+                    publish_check_run: !github_no_check_run,
+                    apply_priority_label: github_apply_labels,
+                    suppressed_comment_reason,
+                })
+                .map_err(|err| {
+                    ScanError::with_hint(
+                        ScanErrorKind::Publish,
+                        FailureCode::PublishInputFailed,
+                        "Set --github-repo/--github-pr/--github-sha or provide matching GitHub Actions env vars.",
+                        err.context("failed to resolve GitHub publish inputs"),
+                    )
+                })?;
+                let published = publish_report(&report, &markdown, &req).map_err(|err| {
+                    classify_publish_scan_error(err.context("failed to publish report to GitHub"))
+                })?;
+                if let Some(payload) = published.dry_run_payload.as_ref() {
+                    let pretty = serde_json::to_string_pretty(payload).map_err(|err| {
                         ScanError::new(
                             ScanErrorKind::Output,
-                            anyhow!("failed to create dry-run output directory: {parent:?}: {err}"),
+                            anyhow!("failed to encode github dry-run payload: {err}"),
                         )
                     })?;
+                    eprintln!(
+                        "github dry-run payload:\n{}",
+                        mask_sensitive(pretty.as_str())
+                    );
+                    if let Some(path) = github_dry_run_output.as_ref() {
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|err| {
+                                ScanError::new(
+                                    ScanErrorKind::Output,
+                                    anyhow!(
+                                        "failed to create dry-run output directory: {parent:?}: {err}"
+                                    ),
+                                )
+                            })?;
+                        }
+                        fs::write(path, pretty).map_err(|err| {
+                            ScanError::new(
+                                ScanErrorKind::Output,
+                                anyhow!("failed to write github dry-run payload: {path:?}: {err}"),
+                            )
+                        })?;
+                    }
                 }
-                fs::write(path, pretty).map_err(|err| {
-                    ScanError::new(
-                        ScanErrorKind::Output,
-                        anyhow!("failed to write github dry-run payload: {path:?}: {err}"),
+                if let Some(reason) = published.skipped_comment_reason.as_ref() {
+                    eprintln!(
+                        "github comment skipped: {}",
+                        mask_sensitive(reason.as_str())
+                    );
+                }
+                if let Some(err) = published.comment_error.as_ref() {
+                    eprintln!(
+                        "warning: failed to publish PR comment: {}",
+                        mask_sensitive(err.as_str())
+                    );
+                }
+                if let Some(err) = published.check_run_error.as_ref() {
+                    eprintln!(
+                        "warning: failed to publish check run: {}",
+                        mask_sensitive(err.as_str())
+                    );
+                }
+                if let Some(err) = published.label_error.as_ref() {
+                    eprintln!(
+                        "warning: failed to apply labels: {}",
+                        mask_sensitive(err.as_str())
+                    );
+                }
+                if let Some(mode) = published.degraded_mode.as_ref() {
+                    eprintln!("warning: publish degraded mode activated: {mode}");
+                }
+                if !published.applied_labels.is_empty() {
+                    eprintln!("applied PR labels: {}", published.applied_labels.join(", "));
+                }
+                if let Some(url) = published.comment_url {
+                    eprintln!("published PR comment: {url}");
+                }
+                if let Some(url) = published.check_run_url {
+                    eprintln!("published check run: {url}");
+                }
+            }
+            CiProvider::Generic => {
+                let config_generic_output =
+                    non_empty_path(cfg.integrations.ci.generic_output_path.as_str())
+                        .map(|p| resolve_repo_relative_path(repo_root, p));
+                let generic_output = ci_generic_output.clone().or(config_generic_output);
+                publish_generic_ci_payload(
+                    telemetry_repo.as_str(),
+                    &report,
+                    &markdown,
+                    generic_output.as_deref(),
+                )
+                .map_err(|err| {
+                    ScanError::with_code(
+                        ScanErrorKind::Publish,
+                        FailureCode::PublishApiFailed,
+                        err.context("failed to publish generic CI payload"),
                     )
                 })?;
             }
         }
-        if let Some(reason) = published.skipped_comment_reason.as_ref() {
-            eprintln!(
-                "github comment skipped: {}",
-                mask_sensitive(reason.as_str())
-            );
-        }
-        if let Some(err) = published.comment_error.as_ref() {
-            eprintln!(
-                "warning: failed to publish PR comment: {}",
-                mask_sensitive(err.as_str())
-            );
-        }
-        if let Some(err) = published.check_run_error.as_ref() {
-            eprintln!(
-                "warning: failed to publish check run: {}",
-                mask_sensitive(err.as_str())
-            );
-        }
-        if let Some(err) = published.label_error.as_ref() {
-            eprintln!(
-                "warning: failed to apply labels: {}",
-                mask_sensitive(err.as_str())
-            );
-        }
-        if let Some(mode) = published.degraded_mode.as_ref() {
-            eprintln!("warning: publish degraded mode activated: {mode}");
-        }
-        if !published.applied_labels.is_empty() {
-            eprintln!("applied PR labels: {}", published.applied_labels.join(", "));
-        }
-        if let Some(url) = published.comment_url {
-            eprintln!("published PR comment: {url}");
-        }
-        if let Some(url) = published.check_run_url {
-            eprintln!("published check run: {url}");
-        }
         profile.publish_ms = publish_start.elapsed().as_millis();
+    }
+
+    let webhook_targets = resolve_webhook_targets(&cfg, &webhook_urls);
+    if !webhook_targets.is_empty() {
+        let timeout_ms = webhook_timeout_ms.unwrap_or(cfg.integrations.webhook.timeout_ms);
+        let secret_env = webhook_secret_env
+            .as_deref()
+            .unwrap_or(cfg.integrations.webhook.secret_env.as_str());
+        dispatch_signed_webhooks(
+            telemetry_repo.as_str(),
+            &report,
+            &webhook_targets,
+            timeout_ms,
+            secret_env,
+        )
+        .map_err(|err| {
+            ScanError::with_hint(
+                ScanErrorKind::Publish,
+                FailureCode::PublishWebhookFailed,
+                "Verify webhook URL reachability and webhook secret configuration.",
+                err.context("failed to dispatch webhook"),
+            )
+        })?;
+    }
+
+    let notification_targets =
+        resolve_notification_targets(&cfg, &notify_targets).map_err(|err| {
+            ScanError::with_code(
+                ScanErrorKind::Input,
+                FailureCode::InputInvalidOption,
+                err.context("failed to resolve notify targets"),
+            )
+        })?;
+    if !notification_targets.is_empty() {
+        dispatch_notifications(
+            telemetry_repo.as_str(),
+            &report,
+            notification_targets.as_slice(),
+            notify_retry_max_attempts.unwrap_or(cfg.integrations.notifications.retry_max_attempts),
+            notify_retry_backoff_ms.unwrap_or(cfg.integrations.notifications.retry_backoff_ms),
+            notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
+        )
+        .map_err(|err| {
+            ScanError::with_hint(
+                ScanErrorKind::Publish,
+                FailureCode::NotificationFailed,
+                "Check notification endpoint URL, payload contract, and retry settings.",
+                err.context("failed to send notifications"),
+            )
+        })?;
     }
 
     let output_start = Instant::now();
@@ -2048,6 +2433,285 @@ fn resolve_comment_suppression_reason(
     None
 }
 
+fn resolve_ci_provider(
+    cli_value: Option<&str>,
+    config_value: Option<&str>,
+) -> std::result::Result<CiProvider, String> {
+    CiProvider::parse(cli_value.or(config_value))
+}
+
+fn publish_generic_ci_payload(
+    telemetry_repo: &str,
+    report: &Report,
+    markdown: &str,
+    output_path: Option<&Path>,
+) -> Result<()> {
+    let payload = GenericCiPublishPayload {
+        schema_version: 1,
+        provider: "generic".to_string(),
+        repo: telemetry_repo.to_string(),
+        unix_ts: current_unix_ts(),
+        summary: GenericPublishSummary {
+            score: report.score,
+            threshold: report.threshold,
+            should_fail: report.should_fail,
+            mode: report.mode.clone(),
+            scope: report.scope.clone(),
+            findings: report.findings.len(),
+        },
+        report: report.clone(),
+        markdown: markdown.to_string(),
+    };
+    let pretty = serde_json::to_string_pretty(&payload)?;
+    if let Some(path) = output_path {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        fs::write(path, pretty).with_context(|| format!("write {}", path.display()))?;
+    } else {
+        eprintln!("generic ci payload generated (set --ci-generic-output to persist)");
+    }
+    Ok(())
+}
+
+fn resolve_webhook_targets(cfg: &Config, cli_urls: &[String]) -> Vec<String> {
+    if !cli_urls.is_empty() {
+        return cli_urls.to_vec();
+    }
+    if cfg.integrations.webhook.enabled {
+        return cfg.integrations.webhook.urls.clone();
+    }
+    Vec::new()
+}
+
+fn resolve_notification_targets(
+    cfg: &Config,
+    cli_targets: &[String],
+) -> std::result::Result<Vec<ResolvedNotificationTarget>, anyhow::Error> {
+    if !cli_targets.is_empty() {
+        let mut targets = Vec::new();
+        for (idx, raw) in cli_targets.iter().enumerate() {
+            let (kind_raw, url) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid notify target `{raw}` (expected: kind=url)"))?;
+            let kind = NotificationKind::parse(kind_raw)
+                .map_err(|err| anyhow!("invalid notify target kind: {err}"))?;
+            targets.push(ResolvedNotificationTarget {
+                name: format!("cli-{kind_raw}-{idx}"),
+                kind,
+                url: url.to_string(),
+            });
+        }
+        return Ok(targets);
+    }
+
+    if !cfg.integrations.notifications.enabled {
+        return Ok(Vec::new());
+    }
+
+    cfg.integrations
+        .notifications
+        .targets
+        .iter()
+        .map(|target| {
+            let kind = NotificationKind::parse(target.kind.as_str())
+                .map_err(|err| anyhow!("invalid notification target kind in config: {err}"))?;
+            Ok(ResolvedNotificationTarget {
+                name: target.name.clone(),
+                kind,
+                url: target.url.clone(),
+            })
+        })
+        .collect()
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn dispatch_signed_webhooks(
+    telemetry_repo: &str,
+    report: &Report,
+    urls: &[String],
+    timeout_ms: u64,
+    secret_env: &str,
+) -> Result<()> {
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let envelope = WebhookEnvelope {
+        event: "scan.completed",
+        unix_ts: current_unix_ts(),
+        repo: telemetry_repo,
+        report,
+    };
+    let body = serde_json::to_vec(&envelope)?;
+    let timestamp = current_unix_ts().to_string();
+    let signature = if secret_env.trim().is_empty() {
+        None
+    } else {
+        let secret = std::env::var(secret_env)
+            .with_context(|| format!("missing webhook secret env var: {secret_env}"))?;
+        Some(sign_webhook_payload(
+            secret.as_bytes(),
+            timestamp.as_bytes(),
+            body.as_slice(),
+        )?)
+    };
+    let client = Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .context("failed to build webhook client")?;
+    for url in urls {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            HeaderName::from_static("x-patchgate-event"),
+            HeaderValue::from_static("scan.completed"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-patchgate-timestamp"),
+            HeaderValue::from_str(timestamp.as_str())?,
+        );
+        if let Some(sig) = signature.as_ref() {
+            headers.insert(
+                HeaderName::from_static("x-patchgate-signature"),
+                HeaderValue::from_str(sig.as_str())?,
+            );
+        }
+        let response = client
+            .post(url)
+            .headers(headers)
+            .body(body.clone())
+            .send()
+            .with_context(|| format!("webhook request failed: {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "webhook endpoint returned {} for {}",
+                response.status(),
+                url
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_notifications(
+    telemetry_repo: &str,
+    report: &Report,
+    targets: &[ResolvedNotificationTarget],
+    retry_max_attempts: u8,
+    retry_backoff_ms: u64,
+    timeout_ms: u64,
+) -> Result<()> {
+    let attempts = retry_max_attempts.max(1);
+    let client = Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .context("failed to build notifications client")?;
+
+    for target in targets {
+        let payload = notification_payload(target.kind, telemetry_repo, report)?;
+        let body = serde_json::to_vec(&payload)?;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=attempts {
+            let response = client
+                .post(target.url.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send();
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    last_error = None;
+                    break;
+                }
+                Ok(resp) => {
+                    last_error = Some(anyhow!(
+                        "target `{}` ({}) returned status {}",
+                        target.name,
+                        target.url,
+                        resp.status()
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(anyhow!(err).context(format!(
+                        "target `{}` ({}) request failed",
+                        target.name, target.url
+                    )));
+                }
+            }
+            if attempt < attempts {
+                let delay =
+                    retry_backoff_ms.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn notification_payload(
+    kind: NotificationKind,
+    telemetry_repo: &str,
+    report: &Report,
+) -> Result<Value> {
+    let summary = format!(
+        "patchgate {}: score {}/{} (mode={}, scope={})",
+        telemetry_repo, report.score, report.threshold, report.mode, report.scope
+    );
+    let payload = match kind {
+        NotificationKind::Slack => serde_json::json!({
+            "text": summary,
+            "attachments": [
+                {
+                    "color": if report.should_fail { "danger" } else { "good" },
+                    "fields": [
+                        {"title": "findings", "value": report.findings.len(), "short": true},
+                        {"title": "priority", "value": format!("{:?}", report.review_priority), "short": true}
+                    ]
+                }
+            ],
+            "patchgate": report,
+        }),
+        NotificationKind::Teams => serde_json::json!({
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "summary": "patchgate scan notification",
+            "text": summary,
+            "sections": [
+                {
+                    "facts": [
+                        {"name": "findings", "value": report.findings.len().to_string()},
+                        {"name": "priority", "value": format!("{:?}", report.review_priority)}
+                    ]
+                }
+            ],
+            "patchgate": report,
+        }),
+        NotificationKind::Generic => serde_json::json!({
+            "event": "scan.completed.notification",
+            "repo": telemetry_repo,
+            "report": report,
+        }),
+    };
+    Ok(payload)
+}
+
+fn sign_webhook_payload(secret: &[u8], timestamp: &[u8], body: &[u8]) -> Result<String> {
+    let mut mac =
+        HmacSha256::new_from_slice(secret).context("failed to initialize webhook signer")?;
+    mac.update(timestamp);
+    mac.update(b".");
+    mac.update(body);
+    let digest = mac.finalize().into_bytes();
+    Ok(format!("sha256={}", encode_hex(digest.as_slice())))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn apply_threshold_override(cfg: &mut Config, threshold: Option<u8>) -> ScanResult<()> {
     if let Some(t) = threshold {
         if t > 100 {
@@ -2466,6 +3130,21 @@ fn print_text(report: &Report) {
             );
         }
     }
+    if !report.plugin_invocations.is_empty() {
+        println!("Plugin invocations:");
+        for invocation in &report.plugin_invocations {
+            println!(
+                "- {} status={:?} duration={}ms findings={}",
+                invocation.plugin_id,
+                invocation.status,
+                invocation.duration_ms,
+                invocation.findings.len()
+            );
+            if let Some(err) = invocation.error.as_ref() {
+                println!("  error: {err}");
+            }
+        }
+    }
     if !report.check_durations_ms.is_empty() {
         let mut entries: Vec<String> = report
             .check_durations_ms
@@ -2591,6 +3270,12 @@ fn render_github_comment(report: &Report) -> String {
             report.supply_chain_signals.len()
         ));
     }
+    if !report.plugin_invocations.is_empty() {
+        lines.push(format!(
+            "- Plugin invocations: {}",
+            report.plugin_invocations.len()
+        ));
+    }
     lines.push(String::new());
 
     lines.push("### Priority findings".to_string());
@@ -2680,6 +3365,26 @@ fn render_github_comment(report: &Report) -> String {
     }
 
     lines.push(String::new());
+    lines.push("### Plugin invocations".to_string());
+    if report.plugin_invocations.is_empty() {
+        lines.push("- No plugin invocations".to_string());
+    } else {
+        for invocation in &report.plugin_invocations {
+            lines.push(format!(
+                "- **{}** status=`{:?}` duration=`{}ms` findings=`{}` sandbox=`{}`",
+                invocation.plugin_id,
+                invocation.status,
+                invocation.duration_ms,
+                invocation.findings.len(),
+                invocation.sandbox_profile
+            ));
+            if let Some(err) = invocation.error.as_ref() {
+                lines.push(format!("  - error: {}", mask_sensitive(err.as_str())));
+            }
+        }
+    }
+
+    lines.push(String::new());
     lines.push("### All findings".to_string());
 
     if sorted_findings.is_empty() {
@@ -2726,10 +3431,11 @@ mod tests {
         changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
         gate_exit_code, is_likely_cache_corruption, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        recover_cache_db, render_github_comment, resolve_audit_actor,
+        recover_cache_db, render_github_comment, resolve_audit_actor, resolve_ci_provider,
         resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
         resolve_publish_request, resolve_scan_options, resolve_telemetry_repo, run_policy_lint,
-        sorted_findings_for_comment, FailureCode, OptionSource, PolicyExitCode, PolicyLintArgs,
+        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
+        FailureCode, OptionSource, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
         PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
         ScanMetricRecord, ScopeMode,
     };
@@ -2817,6 +3523,16 @@ mod tests {
             github_suppress_comment_no_change: false,
             github_suppress_comment_low_priority: false,
             github_suppress_comment_rerun: false,
+            publish: false,
+            ci_provider: None,
+            ci_generic_output: None,
+            webhook_urls: Vec::new(),
+            webhook_secret_env: None,
+            webhook_timeout_ms: None,
+            notify_targets: Vec::new(),
+            notify_retry_max_attempts: None,
+            notify_retry_backoff_ms: None,
+            notify_timeout_ms: None,
         }
     }
 
@@ -3825,6 +4541,86 @@ mod tests {
         assert_eq!(code, PolicyExitCode::ReadOrParse);
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_requires_ready_flags() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = false
+allow_legacy_config_names = true
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_passes_with_ready_flags() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-ready-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn resolve_ci_provider_prefers_cli_value() {
+        let provider = resolve_ci_provider(Some("generic"), Some("github")).expect("provider");
+        assert_eq!(provider, CiProvider::Generic);
+    }
+
+    #[test]
+    fn sign_webhook_payload_is_stable_and_prefixed() {
+        let sig =
+            sign_webhook_payload(b"secret", b"1700000000", br#"{"ok":true}"#).expect("signature");
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), "sha256=".len() + 64);
     }
 
     #[test]

@@ -251,6 +251,48 @@ fn scan_github_publish_dry_run_can_suppress_comment() -> TestResult<()> {
     Ok(())
 }
 
+#[test]
+fn scan_generic_ci_publish_writes_payload_file() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.append_line(
+        "src/lib.rs",
+        "pub fn changed_for_generic_ci() -> i32 { 11 }",
+    )?;
+    let payload_path = repo.root().join("artifacts/ci-generic.json");
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+            "--publish",
+            "--ci-provider",
+            "generic",
+            "--ci-generic-output",
+            payload_path
+                .to_str()
+                .ok_or("invalid generic ci output path utf8")?,
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "generic publish should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = fs::read_to_string(payload_path)?;
+    assert!(payload.contains("\"provider\": \"generic\""));
+    assert!(payload.contains("\"summary\""));
+
+    Ok(())
+}
+
 fn run_patchgate(repo: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_patchgate"))
         .current_dir(repo)

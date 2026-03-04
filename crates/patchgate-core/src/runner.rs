@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
@@ -9,7 +13,9 @@ use patchgate_config::Config;
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    CheckId, CheckScore, Finding, Location, Report, ReportMeta, Severity, SupplyChainSignal,
+    CheckId, CheckScore, Finding, Location, PluginChangedFile, PluginFinding, PluginInput,
+    PluginInvocation, PluginInvocationStatus, PluginOutput, Report, ReportMeta, Severity,
+    SupplyChainSignal,
 };
 
 const MAX_STORED_LINE_SAMPLES: usize = 32;
@@ -133,16 +139,22 @@ impl Runner {
             ))
         })?;
 
+        let plugin_outcome = evaluate_plugins(&self.policy, ctx, &diff, mode)?;
+
         let mut findings = Vec::new();
         findings.extend(test_gap.findings);
         findings.extend(dangerous_change.findings);
         findings.extend(dependency_update.findings);
+        findings.extend(plugin_outcome.findings);
 
-        let checks = vec![
+        let mut checks = vec![
             test_gap.score,
             dangerous_change.score,
             dependency_update.score,
         ];
+        if let Some(plugin_score) = plugin_outcome.score {
+            checks.push(plugin_score);
+        }
 
         let changed_files = diff.files.len();
         let fingerprint = diff.fingerprint.clone();
@@ -170,12 +182,22 @@ impl Runner {
             CheckId::DependencyUpdate.as_str().to_string(),
             dependency_update_ms,
         );
+        if let Some(plugin_duration_ms) = plugin_outcome.total_duration_ms {
+            report.check_durations_ms.insert(
+                CheckId::ExternalPlugin.as_str().to_string(),
+                plugin_duration_ms,
+            );
+        }
         report.supply_chain_signals = build_supply_chain_signals(&diff);
         if !report.supply_chain_signals.is_empty() {
             report.diagnostic_hints.push(
                 "Supply-chain signal detected: require dependency integrity review.".to_string(),
             );
         }
+        if !plugin_outcome.diagnostics.is_empty() {
+            report.diagnostic_hints.extend(plugin_outcome.diagnostics);
+        }
+        report.plugin_invocations = plugin_outcome.invocations;
         Ok(report)
     }
 
@@ -188,6 +210,303 @@ impl Runner {
 struct CheckEvaluation {
     score: CheckScore,
     findings: Vec<Finding>,
+}
+
+#[derive(Debug, Default)]
+struct PluginEvaluationOutcome {
+    score: Option<CheckScore>,
+    findings: Vec<Finding>,
+    invocations: Vec<PluginInvocation>,
+    diagnostics: Vec<String>,
+    total_duration_ms: Option<u128>,
+}
+
+fn evaluate_plugins(
+    policy: &Config,
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+) -> Result<PluginEvaluationOutcome> {
+    if !policy.plugins.enabled || policy.plugins.entries.is_empty() {
+        return Ok(PluginEvaluationOutcome::default());
+    }
+
+    let mut outcome = PluginEvaluationOutcome::default();
+    let mut total_penalty: u16 = 0;
+    let mut total_duration_ms = 0u128;
+    let mut triggered = false;
+
+    for plugin in &policy.plugins.entries {
+        let start = Instant::now();
+        let result = execute_plugin(policy, ctx, diff, mode, plugin);
+        total_duration_ms = total_duration_ms.saturating_add(start.elapsed().as_millis());
+        match result {
+            Ok(invocation) => {
+                if invocation.status != PluginInvocationStatus::Pass {
+                    triggered = true;
+                }
+                for finding in &invocation.findings {
+                    total_penalty = total_penalty.saturating_add(finding.penalty as u16);
+                }
+                outcome.findings.extend(
+                    invocation
+                        .findings
+                        .iter()
+                        .map(|f| plugin_to_core_finding(plugin.id.as_str(), f)),
+                );
+                outcome.diagnostics.extend(
+                    invocation
+                        .diagnostics
+                        .iter()
+                        .map(|d| format!("plugin:{}: {d}", plugin.id)),
+                );
+                outcome.invocations.push(invocation);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                triggered = true;
+                if plugin.fail_mode == "fail_closed" {
+                    return Err(anyhow::anyhow!(
+                        "plugin `{}` failed with fail_closed policy: {message}",
+                        plugin.id
+                    ));
+                }
+                outcome.diagnostics.push(format!(
+                    "plugin:{} failed (fail_open): {message}",
+                    plugin.id
+                ));
+                outcome.invocations.push(PluginInvocation {
+                    plugin_id: plugin.id.clone(),
+                    status: PluginInvocationStatus::Error,
+                    duration_ms: start.elapsed().as_millis(),
+                    sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                    findings: Vec::new(),
+                    diagnostics: vec!["execution failed".to_string()],
+                    error: Some(message),
+                });
+            }
+        }
+    }
+
+    let max_penalty = policy.weights.plugin_max_penalty;
+    let penalty = total_penalty.min(max_penalty as u16) as u8;
+    if !outcome.invocations.is_empty() {
+        outcome.score = Some(CheckScore {
+            check: CheckId::ExternalPlugin,
+            label: CheckId::ExternalPlugin.label().to_string(),
+            penalty,
+            max_penalty,
+            triggered: triggered || penalty > 0 || !outcome.findings.is_empty(),
+        });
+        outcome.total_duration_ms = Some(total_duration_ms);
+    }
+
+    Ok(outcome)
+}
+
+fn execute_plugin(
+    policy: &Config,
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<PluginInvocation> {
+    let input = PluginInput {
+        schema_version: 1,
+        api_version: "patchgate.plugin.v1".to_string(),
+        plugin_id: plugin.id.clone(),
+        repo_root: ctx.repo_root.to_string_lossy().to_string(),
+        mode: mode.to_string(),
+        scope: ctx.scope.as_str().to_string(),
+        changed_files: diff
+            .files
+            .iter()
+            .map(|f| PluginChangedFile {
+                path: f.path.clone(),
+                status: change_status_as_str(f.status).to_string(),
+                added: f.added,
+                deleted: f.deleted,
+            })
+            .collect(),
+    };
+    let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
+    let max_stdout_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
+    let sandbox_profile = policy.plugins.sandbox.profile.as_str();
+    let timeout = Duration::from_millis(plugin.timeout_ms);
+
+    let start = Instant::now();
+    let mut command = Command::new(plugin.command.as_str());
+    command.args(&plugin.args);
+    command.current_dir(&ctx.repo_root);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    if sandbox_profile == "restricted" {
+        command.env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            command.env("PATH", path);
+        }
+        for key in &policy.plugins.sandbox.env_allowlist {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+    }
+    command.env("PATCHGATE_PLUGIN_ID", plugin.id.as_str());
+    command.env("PATCHGATE_SANDBOX_PROFILE", sandbox_profile);
+    command.env(
+        "PATCHGATE_SANDBOX_NETWORK",
+        if policy.plugins.sandbox.allow_network {
+            "allow"
+        } else {
+            "deny"
+        },
+    );
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start plugin `{}` command `{}`",
+            plugin.id, plugin.command
+        )
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&input_json)
+            .context("failed to write plugin input")?;
+    }
+
+    let timed_out = wait_for_child_with_timeout(&mut child, timeout)?;
+    if timed_out {
+        let _ = child.kill();
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to collect plugin output")?;
+    let duration_ms = start.elapsed().as_millis();
+
+    if timed_out {
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::TimedOut,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec![format!("timeout after {}ms", plugin.timeout_ms)],
+            error: Some(format!("plugin timed out after {}ms", plugin.timeout_ms)),
+        });
+    }
+
+    if output.stdout.len() > max_stdout_bytes {
+        return Err(anyhow::anyhow!(
+            "plugin `{}` stdout exceeded sandbox.max_stdout_kib ({} KiB)",
+            plugin.id,
+            policy.plugins.sandbox.max_stdout_kib
+        ));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let reason = if stderr.is_empty() {
+            format!("exit status: {}", output.status)
+        } else {
+            stderr
+        };
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::Error,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec!["plugin process returned non-zero exit".to_string()],
+            error: Some(reason),
+        });
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("plugin stdout was not utf8")?;
+    let mut plugin_output: PluginOutput =
+        serde_json::from_str(stdout.as_str()).context("failed to decode plugin output json")?;
+    for finding in &mut plugin_output.findings {
+        if finding.rule_id.trim().is_empty() {
+            finding.rule_id = finding.id.clone();
+        }
+        if finding.category.trim().is_empty() {
+            finding.category = "plugin".to_string();
+        }
+    }
+    let status = if plugin_output.findings.is_empty() {
+        PluginInvocationStatus::Pass
+    } else {
+        PluginInvocationStatus::Fail
+    };
+    let mut diagnostics = plugin_output.diagnostics;
+    if !stderr.is_empty() {
+        diagnostics.push(format!("stderr: {stderr}"));
+    }
+    Ok(PluginInvocation {
+        plugin_id: plugin.id.clone(),
+        status,
+        duration_ms,
+        sandbox_profile: sandbox_profile.to_string(),
+        findings: plugin_output.findings,
+        diagnostics,
+        error: None,
+    })
+}
+
+fn wait_for_child_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(false);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn plugin_to_core_finding(plugin_id: &str, finding: &PluginFinding) -> Finding {
+    let mut tags = finding.tags.clone();
+    tags.push(format!("plugin:{plugin_id}"));
+    let core_id = if finding.id.trim().is_empty() {
+        format!("PLG-{plugin_id}-001")
+    } else {
+        finding.id.clone()
+    };
+    Finding {
+        id: core_id.clone(),
+        rule_id: if finding.rule_id.trim().is_empty() {
+            core_id
+        } else {
+            finding.rule_id.clone()
+        },
+        category: if finding.category.trim().is_empty() {
+            "plugin".to_string()
+        } else {
+            finding.category.clone()
+        },
+        docs_url: finding.docs_url.clone(),
+        check: CheckId::ExternalPlugin,
+        title: finding.title.clone(),
+        message: finding.message.clone(),
+        severity: finding.severity,
+        penalty: finding.penalty,
+        location: finding.location.clone(),
+        tags,
+    }
+}
+
+fn change_status_as_str(status: ChangeStatus) -> &'static str {
+    match status {
+        ChangeStatus::Added => "added",
+        ChangeStatus::Modified => "modified",
+        ChangeStatus::Deleted => "deleted",
+        ChangeStatus::Renamed => "renamed",
+        ChangeStatus::Copied => "copied",
+        ChangeStatus::TypeChanged => "type_changed",
+        ChangeStatus::Unknown => "unknown",
+    }
 }
 
 fn evaluate_test_gap(
@@ -2238,5 +2557,44 @@ mod tests {
             .supply_chain_signals
             .iter()
             .any(|s| s.id == "SCM-002"));
+    }
+
+    #[test]
+    fn plugin_to_core_finding_fills_defaults() {
+        let plugin_finding = PluginFinding {
+            id: String::new(),
+            rule_id: String::new(),
+            category: String::new(),
+            docs_url: String::new(),
+            title: "Plugin finding".to_string(),
+            message: "details".to_string(),
+            severity: Severity::Medium,
+            penalty: 3,
+            location: None,
+            tags: vec!["sample".to_string()],
+        };
+        let finding = plugin_to_core_finding("sample-plugin", &plugin_finding);
+        assert_eq!(finding.check, CheckId::ExternalPlugin);
+        assert_eq!(finding.id, "PLG-sample-plugin-001");
+        assert_eq!(finding.rule_id, "PLG-sample-plugin-001");
+        assert_eq!(finding.category, "plugin");
+        assert!(finding.tags.iter().any(|t| t == "plugin:sample-plugin"));
+    }
+
+    #[test]
+    fn evaluate_plugins_returns_empty_when_disabled() {
+        let policy = Config::default();
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![],
+            fingerprint: "dummy".to_string(),
+        };
+        let outcome = evaluate_plugins(&policy, &ctx, &diff, "warn").expect("evaluate");
+        assert!(outcome.score.is_none());
+        assert!(outcome.findings.is_empty());
+        assert!(outcome.invocations.is_empty());
     }
 }

@@ -5,25 +5,47 @@
 ## Core concepts
 
 - Diff-first: リポジトリ全体ではなく `staged/worktree/repo` の差分を評価
-- Multi-check scoring: `test_gap` / `dangerous_change` / `dependency_update` の減点合算
+- Multi-check scoring: `test_gap` / `dangerous_change` / `dependency_update` / `external_plugin` の減点合算
 - Gate mode:
   - `warn`: 判定結果のみ返す（exit code `0`）
   - `enforce`: `score < threshold` で失敗（exit code `1`）
 - Review priority: スコア帯を `P0..P3` に固定マップ
-- Scale guardrail: `scope.max_changed_files` と `on_exceed` で大規模差分の挙動を固定
+- Scale guardrail: `scope.max_changed_files` と `on_exceed` で大規模差分挙動を固定
 
-## Observability model (Phase61-70)
+## Plugin contract (Phase81-83)
 
-- Scan metrics JSONL: `--metrics-output` で scan実行の時系列メトリクスを記録
-- Audit log JSONL: `--audit-log-output` で actor/target/result/failure code を記録
+- API version: `patchgate.plugin.v1`
+- 入力: `PluginInput`（repo/scope/mode/changed_files）を `stdin` JSON で受け取る
+- 出力: `PluginOutput`（`findings[]`, `diagnostics[]`）を `stdout` JSON で返す
+- 実行結果は `Report.plugin_invocations[]` に保存
+- sandbox制約:
+  - `plugins.sandbox.profile = restricted` で最小環境変数のみ許可
+  - `timeout_ms` と `max_stdout_kib` を強制
+  - `fail_mode = fail_open|fail_closed`
+
+## Provider / Integration contract (Phase85-87)
+
+- CI provider abstraction:
+  - `github`: check-run/comment publish
+  - `generic`: 標準JSONペイロード出力
+- Webhook:
+  - `scan.completed` イベントを JSON 送信
+  - 署名ヘッダ `X-Patchgate-Signature: sha256=...`
+- Notification adapter:
+  - `slack|teams|generic` の共通送信契約
+  - retry/backoff で一時障害を吸収
+
+## Observability model (Phase61-70, 95)
+
+- Scan metrics JSONL: `--metrics-output`
+- Audit log JSONL: `--audit-log-output`
 - History aggregation:
-  - `patchgate history summary --input <metrics.jsonl>`
-  - `patchgate history trend --input <metrics.jsonl>`
-- Alert thresholds: `policy.toml` の `[alerts]` で score低下/失敗率増加/処理時間悪化を基準化
+  - `patchgate history summary`
+  - `patchgate history trend`
+- SLO report:
+  - `cargo run -p xtask -- ops slo-report`
 
-## Failure taxonomy (Phase62/70/74)
-
-機械可読コードで失敗分類を返します（例）。
+## Failure taxonomy
 
 - `PG-IN-001`: 入力オプション不正
 - `PG-CFG-001`: 設定読み込み失敗
@@ -32,44 +54,27 @@
 - `PG-PUB-001/002`: publish入力/API失敗
 - `PG-PUB-SSO-001`: SSO未承認
 - `PG-PUB-ORG-001`: Org policy制約
+- `PG-PUB-WEB-001`: webhook送信失敗
+- `PG-NOT-001`: 通知送信失敗
 - `PG-GOV-001`: waiver期限切れ
 
-失敗時は標準エラーに次アクションヒントを併記します。
+## v1 compatibility boundary (Phase91-93)
 
-## Audit contract (Phase63/73)
+- `patchgate policy verify-v1` で移行準備を検証
+- v1 GA前提:
+  - `policy_version = 2`
+  - `compatibility.v1.rc_frozen = true`
+  - `compatibility.v1.allow_legacy_config_names = false`
+- 非推奨項目は段階的に縮退し、破壊変更は新バージョン契約で分離
 
-- `audit_format = patchgate.audit.v1`
-- 監査レコードには以下を含む:
-  - 実行主体 (`actor`)
-  - 対象 (`target=scan`)
-  - 判定結果 (`pass/gate_fail/error`)
-  - 失敗分類 (`failure_code`, `failure_category`)
-- schema互換方針:
-  - 既存キーは削除しない
-  - 新規キーは optional 追加
-  - `audit_schema_version` で互換境界を明示
+## LTS and GA operation (Phase94-100)
 
-## Security and governance (Phase71-80)
-
-- Least privilege token:
-  - 既定は最小権限トークン前提
-  - workflowでは `permissions: write-all` を禁止
-- Secret masking:
-  - `ghp_`, `github_pat_`, `Bearer ...` などのトークン形状をログ出力時にマスク
-- Waiver management:
-  - `[waiver].entries[]` は `check_id/reason/approver/expires_at` 必須
-  - `expires_at` は RFC3339 かつ未来日時のみ許可
-
-## Supply-chain supplemental signals (Phase79)
-
-`Report.supply_chain_signals` は依存更新と危険ファイル変更を横断して補助シグナルを出力します。
-
-- `SCM-001`: dependency + CI/infra 変更の同時発生
-- `SCM-002`: lockfile追加/削除 + workflow変更の同時発生
-
-## Operational automation
-
-- 週次サマリ: `.github/workflows/weekly-ops-summary.yml`
-- 復旧演習: `.github/workflows/recovery-drill.yml`
-- 監査/承認統制: `.github/workflows/policy-governance.yml` + `.github/CODEOWNERS`
-- セキュリティ定例: `.github/workflows/security-review.yml`
+- LTS:
+  - `release.lts.branch`, `security_sla_hours`, `backport_labels`
+  - `.github/workflows/lts-backport.yml`
+- GA readiness:
+  - `.github/workflows/ga-readiness.yml`
+  - `cargo run -p xtask -- ops ga-readiness`
+- Release artifacts:
+  - `.github/workflows/release-ga.yml`
+  - checksum + SBOM相当（cargo metadata）

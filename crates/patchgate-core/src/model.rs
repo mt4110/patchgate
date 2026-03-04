@@ -17,6 +17,7 @@ pub enum CheckId {
     TestGap,
     DangerousChange,
     DependencyUpdate,
+    ExternalPlugin,
 }
 
 impl CheckId {
@@ -25,6 +26,7 @@ impl CheckId {
             CheckId::TestGap => "test_gap",
             CheckId::DangerousChange => "dangerous_change",
             CheckId::DependencyUpdate => "dependency_update",
+            CheckId::ExternalPlugin => "external_plugin",
         }
     }
 
@@ -33,11 +35,12 @@ impl CheckId {
             CheckId::TestGap => "Test coverage gap",
             CheckId::DangerousChange => "Dangerous file changes",
             CheckId::DependencyUpdate => "Dependency update risk",
+            CheckId::ExternalPlugin => "External plugin risk",
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Location {
     pub file: String,
     pub line: Option<u32>,
@@ -118,6 +121,8 @@ pub struct Report {
     pub diagnostic_hints: Vec<String>,
     #[serde(default)]
     pub supply_chain_signals: Vec<SupplyChainSignal>,
+    #[serde(default)]
+    pub plugin_invocations: Vec<PluginInvocation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +133,74 @@ pub struct SupplyChainSignal {
     pub message: String,
     pub related_files: Vec<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInvocationStatus {
+    Pass,
+    Fail,
+    Error,
+    TimedOut,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginInvocation {
+    pub plugin_id: String,
+    pub status: PluginInvocationStatus,
+    pub duration_ms: u128,
+    pub sandbox_profile: String,
+    #[serde(default)]
+    pub findings: Vec<PluginFinding>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginFinding {
+    pub id: String,
+    #[serde(default)]
+    pub rule_id: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub docs_url: String,
+    pub title: String,
+    pub message: String,
+    pub severity: Severity,
+    pub penalty: u8,
+    pub location: Option<Location>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginInput {
+    pub schema_version: u8,
+    pub api_version: String,
+    pub plugin_id: String,
+    pub repo_root: String,
+    pub mode: String,
+    pub scope: String,
+    pub changed_files: Vec<PluginChangedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginChangedFile {
+    pub path: String,
+    pub status: String,
+    pub added: u32,
+    pub deleted: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginOutput {
+    #[serde(default)]
+    pub findings: Vec<PluginFinding>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +237,7 @@ impl Report {
             check_durations_ms: BTreeMap::new(),
             diagnostic_hints: diagnostic_hints_from_score(score, should_fail),
             supply_chain_signals: Vec::new(),
+            plugin_invocations: Vec::new(),
         }
     }
 }

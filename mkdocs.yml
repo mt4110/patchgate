@@ -1,0 +1,17 @@
+site_name: patchgate docs
+site_description: Diff-aware quality gate for pull requests
+repo_url: https://github.com/mt4110/patchgate
+nav:
+  - Home: docs/00_quickstart.md
+  - Concepts: docs/01_concepts.md
+  - Config: docs/02_config_reference.md
+  - CLI: docs/03_cli_reference.md
+  - Recipes: docs/04_recipes.md
+  - Troubleshooting: docs/05_troubleshooting.md
+  - Architecture: docs/ARCHITECTURE.md
+  - Security: docs/SECURITY.md
+  - Roadmap: docs/ROADMAP.md
+  - Release Checklist: docs/99_release_checklist.md
+markdown_extensions:
+  - admonition
+  - tables

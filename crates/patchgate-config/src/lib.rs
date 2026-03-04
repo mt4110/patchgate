@@ -358,6 +358,16 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         cfg.generated_code.mode.as_str(),
         &["exclude", "decay"],
     )?;
+    validate_enum(
+        "plugins.sandbox.profile",
+        cfg.plugins.sandbox.profile.as_str(),
+        &["none", "restricted"],
+    )?;
+    validate_enum(
+        "integrations.ci.provider",
+        cfg.integrations.ci.provider.as_str(),
+        &["github", "generic"],
+    )?;
 
     validate_range_u8("output.fail_threshold", cfg.output.fail_threshold, 0, 100)?;
     validate_positive_u32("scope.max_changed_files", cfg.scope.max_changed_files)?;
@@ -386,12 +396,19 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         0,
         100,
     )?;
+    validate_range_u8(
+        "weights.plugin_max_penalty",
+        cfg.weights.plugin_max_penalty,
+        0,
+        100,
+    )?;
 
     let weight_sum = cfg
         .weights
         .test_gap_max_penalty
         .saturating_add(cfg.weights.dangerous_change_max_penalty)
-        .saturating_add(cfg.weights.dependency_update_max_penalty);
+        .saturating_add(cfg.weights.dependency_update_max_penalty)
+        .saturating_add(cfg.weights.plugin_max_penalty);
     if weight_sum == 0 {
         return Err(validation_error(
             ValidationCategory::Dependency,
@@ -492,6 +509,50 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         1,
         10,
     )?;
+    validate_positive_u32(
+        "plugins.sandbox.max_stdout_kib",
+        cfg.plugins.sandbox.max_stdout_kib,
+    )?;
+    validate_range_u16(
+        "release.lts.security_sla_hours",
+        cfg.release.lts.security_sla_hours,
+        1,
+        24 * 30,
+    )?;
+    validate_range_u8(
+        "release.slo.availability_target_pct",
+        cfg.release.slo.availability_target_pct,
+        1,
+        100,
+    )?;
+    validate_positive_u32(
+        "release.slo.p95_duration_ms",
+        cfg.release.slo.p95_duration_ms,
+    )?;
+    validate_range_u8(
+        "release.slo.false_positive_target_pct",
+        cfg.release.slo.false_positive_target_pct,
+        0,
+        100,
+    )?;
+    validate_range_u8(
+        "integrations.notifications.retry_max_attempts",
+        cfg.integrations.notifications.retry_max_attempts,
+        1,
+        10,
+    )?;
+    validate_positive_u64(
+        "integrations.notifications.retry_backoff_ms",
+        cfg.integrations.notifications.retry_backoff_ms,
+    )?;
+    validate_positive_u64(
+        "integrations.notifications.timeout_ms",
+        cfg.integrations.notifications.timeout_ms,
+    )?;
+    validate_positive_u64(
+        "integrations.webhook.timeout_ms",
+        cfg.integrations.webhook.timeout_ms,
+    )?;
 
     validate_globs("exclude.globs", &cfg.exclude.globs)?;
     validate_globs("generated_code.globs", &cfg.generated_code.globs)?;
@@ -538,6 +599,99 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "observability.audit_jsonl_path",
             "must be non-empty string when provided",
         ));
+    }
+    if !cfg.integrations.webhook.secret_env.is_empty()
+        && cfg.integrations.webhook.secret_env.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "integrations.webhook.secret_env",
+            "must be non-empty string when provided",
+        ));
+    }
+    if !cfg.integrations.ci.generic_output_path.is_empty()
+        && cfg.integrations.ci.generic_output_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "integrations.ci.generic_output_path",
+            "must be non-empty string when provided",
+        ));
+    }
+
+    for (idx, plugin) in cfg.plugins.entries.iter().enumerate() {
+        if plugin.id.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.entries",
+                format!("entry[{idx}] id must be non-empty"),
+            ));
+        }
+        if plugin.command.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.entries",
+                format!("entry[{idx}] command must be non-empty"),
+            ));
+        }
+        validate_enum_entry(
+            "plugins.entries",
+            "fail_mode",
+            idx,
+            plugin.fail_mode.as_str(),
+            &["fail_open", "fail_closed"],
+        )?;
+        validate_range_u64_entry(
+            "plugins.entries",
+            "timeout_ms",
+            idx,
+            plugin.timeout_ms,
+            100,
+            600_000,
+        )?;
+    }
+
+    for (idx, url) in cfg.integrations.webhook.urls.iter().enumerate() {
+        validate_url_entry("integrations.webhook.urls", idx, url)?;
+    }
+
+    for (idx, target) in cfg.integrations.notifications.targets.iter().enumerate() {
+        if target.name.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "integrations.notifications.targets",
+                format!("entry[{idx}] name must be non-empty"),
+            ));
+        }
+        validate_enum_entry(
+            "integrations.notifications.targets",
+            "kind",
+            idx,
+            target.kind.as_str(),
+            &["slack", "teams", "generic"],
+        )?;
+        validate_url_entry(
+            "integrations.notifications.targets",
+            idx,
+            target.url.as_str(),
+        )?;
+    }
+
+    if cfg.release.lts.branch.trim().is_empty() {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "release.lts.branch",
+            "must be non-empty",
+        ));
+    }
+    for (idx, label) in cfg.release.lts.backport_labels.iter().enumerate() {
+        if label.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "release.lts.backport_labels",
+                format!("entry[{idx}] must be non-empty"),
+            ));
+        }
     }
     validate_waivers(cfg)?;
 
@@ -914,6 +1068,89 @@ fn validate_positive_u32(field: &'static str, value: u32) -> Result<()> {
             "must be greater than 0".to_string(),
         ))
     }
+}
+
+fn validate_positive_u64(field: &'static str, value: u64) -> Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(validation_error(
+            ValidationCategory::Range,
+            field,
+            "must be greater than 0".to_string(),
+        ))
+    }
+}
+
+fn validate_range_u16(field: &'static str, value: u16, min: u16, max: u16) -> Result<()> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(validation_error(
+            ValidationCategory::Range,
+            field,
+            format!("`{value}` is outside allowed range {min}..={max}"),
+        ))
+    }
+}
+
+fn validate_enum_entry(
+    field: &'static str,
+    key: &str,
+    index: usize,
+    value: &str,
+    allowed: &[&str],
+) -> Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(validation_error(
+            ValidationCategory::Type,
+            field,
+            format!(
+                "entry[{index}] {key} has invalid value `{value}` (expected: {})",
+                allowed.join("|")
+            ),
+        ))
+    }
+}
+
+fn validate_range_u64_entry(
+    field: &'static str,
+    key: &str,
+    index: usize,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Result<()> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(validation_error(
+            ValidationCategory::Range,
+            field,
+            format!("entry[{index}] {key} `{value}` is outside allowed range {min}..={max}"),
+        ))
+    }
+}
+
+fn validate_url_entry(field: &'static str, index: usize, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            field,
+            format!("entry[{index}] url must be non-empty"),
+        ));
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            field,
+            format!("entry[{index}] url must start with http:// or https://"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_dependency_penalty(

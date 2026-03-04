@@ -15,118 +15,39 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase71-80](../phase71_80.md)
 - [PR Plan: Phase81-90](../phase81_90.md)
 - [PR Plan: Phase91-100](../phase91_100.md)
-- [PR Execution Checklist Template](09_pr_execution_checklist.md)
 
-## Active planning horizon
+## Active planning horizon (updated 2026-03-03)
 
-- Completed design: Phase1-80
-- New design scope in this update: Phase81-100
-- Next execution unit:
-  - Phase81-90: extensibility and ecosystem enablement
-  - Phase91-100: productization and LTS readiness
+- Completed baseline implementation: Phase1-100 (minimum viable contract)
+- Stabilization focus after batch implementation:
+  - plugin ecosystem hardening (sandbox isolation/SDK UX/conformance)
+  - v1 migration strictness uplift (`verify-v1` pass by default)
+  - LTS/GA workflow hardening (signing, SBOM, backport automation)
 
-## v0.3.0 (MVP)
-- Diff-based quality gate with 3 checks
-  - `test_gap`
-  - `dangerous_change`
-  - `dependency_update`
-- Score `0..100` and `fail_threshold`
-- `warn|enforce` execution mode
-- JSON output + GitHub comment markdown
-- SQLite cache for unchanged diff fingerprint
+## v0.3.9 (Phase81-90 baseline delivered)
 
-## v0.3.1
-- Check result explainability improvements
-- Better language-specific test heuristics
-- More precise dependency risk signals
+- Plugin extension API (`patchgate.plugin.v1`) + sandbox controls
+- CI provider abstraction (`github|generic`)
+- Signed webhook and notification adapters (`slack|teams|generic`)
+- Docs/site skeleton (`mkdocs.yml`), SDK templates, examples, contribution flow
 
-## v0.3.2
-- GitHub adapter as standalone crate
-- Check-run + PR comment posting helpers
-- Policy distribution and version pinning
+## v1.0.0-rc (Phase91-100 baseline delivered)
 
-## v0.3.3 (Phase21-30 target)
-- Policy schema versioning and migration workflow
-- Preset/override compatibility contract
-- Policy linting and breaking-change detection
+- `policy verify-v1` migration readiness command
+- Release/LTS policy sections in config (`release.*`, `compatibility.v1.*`)
+- SLO/GA operational report commands (`xtask ops slo-report|ga-readiness`)
+- LTS/GA/release workflows (`lts-backport.yml`, `ga-readiness.yml`, `release-ga.yml`)
 
-### Phase21-30 implementation notes
-- Compatibility matrix published in `docs/01_concepts.md` and `docs/03_cli_reference.md`
-- `policy lint` / `policy migrate` command set introduced
-- Presets standardized under `config/presets/{strict,balanced,relaxed}.toml`
+## Remaining work to GA hardening
 
-## v0.3.4 (Phase31-40 target)
-- Robust check-run/comment publishing with retry/backoff
-- Rate-limit-aware degraded operation
-- Dry-run and E2E verification for GitHub publishing
-
-### Phase31-40 implementation notes
-- Check Run and PR comment are idempotent upsert operations
-- Publish has retry/backoff policy and rate-limit degraded mode
-- Auth abstraction supports `token|app` mode
-- Optional review-priority label integration and comment suppression rules
-- Dry-run payload generation is available via CLI and workflow
-
-## v0.3.5 (Phase41-50 target)
-- Large-diff performance and memory reduction
-- Profiling/benchmark workflow for scale scenarios
-- CI performance regression gate with baseline comparison
-
-### Phase41-50 design notes
-- Diff collection and check execution cost are optimized with deterministic outputs
-- Performance metrics (including P95 SLO) become release criteria
-- Cross-platform performance drift is explicitly tracked in CI
-
-## v0.3.6 (Phase51-60 target)
-- Language-aware test-gap detection for major ecosystems
-- Ecosystem-specific dependency risk/severity expansion
-- Monorepo and generated-code handling policy
-
-### Phase51-60 design notes
-- Rule behavior remains schema-compatible while language precision improves
-- False positive reduction is tracked per language and package boundary
-- Enablement strategy (default/opt-in) is standardized for safe rollout
-
-## v0.3.7 (Phase61-70 target)
-- Execution telemetry, history aggregation, and trend signals
-- Failure taxonomy and audit-ready run records
-- MTTR-oriented diagnostic output and weekly operations summary
-
-### Phase61-70 design notes
-- Metrics and failure codes become machine-readable contracts for operations
-- Alert thresholds are policy-driven and validated in CI workflows
-- Runbook/recovery drills are treated as release-quality deliverables
-
-## v0.3.8 (Phase71-80 target)
-- Least-privilege token handling and stronger secret masking
-- Approval/expiry governance for policy changes and waivers
-- Automated audit reporting and security review cadence
-
-### Phase71-80 design notes
-- Governance controls are designed to be enforceable without blocking delivery
-- Audit artifacts are versioned and reusable for compliance evidence
-- Security signals are integrated with existing risk checks and release flow
-
-## v0.3.9 (Phase81-90 target)
-- Plugin extension API and sandbox execution policy
-- Multi-provider integration abstraction and webhook/notification adapters
-- Ecosystem onboarding assets (docs site, examples, community operations)
-
-### Phase81-90 design notes
-- Extension points are contract-first with compatibility/version guarantees
-- Integration differences are isolated behind provider/adapter boundaries
-- Ecosystem growth is backed by executable examples and contribution governance
-
-## v1.0.0 (Phase91-100 target)
-- v1.0 RC/GA specification freeze and migration assurance
-- LTS support model with SLA/SLO-backed operations
-- Signed release artifacts with SBOM and auditable release criteria
-
-### Phase91-100 design notes
-- v1.0 readiness is measured by compatibility and operability, not feature count
-- LTS and backport workflows are part of release quality gates
-- Post-GA roadmap is derived from operational evidence and adoption feedback
+1. Plugin sandboxをOSレベル隔離へ拡張（process/network/fs制限の強制）
+2. Plugin SDKを複数言語テンプレート化し、互換テストをCI化
+3. Generic provider/Webhook/Notificationの契約テストと再送戦略を強化
+4. `verify-v1` の判定ルールを実運用データで調整
+5. リリース署名/証明書連携とSBOM標準（CycloneDX/SPDX）を本実装化
+6. LTSバックポート自動化（cherry-pick bot / conflict report）
 
 ## Non-goals (current phase)
+
 - Full remote source scan as primary path
 - High-cost cloud inference in hot path

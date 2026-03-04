@@ -4,45 +4,50 @@
 
 `patchgate` は差分ベース品質ゲートです。
 
-- `patchgate-core` (core)
+- `patchgate-core`
   - Git差分収集
-  - 3チェック実行 (`test_gap`, `dangerous_change`, `dependency_update`)
+  - built-in checks (`test_gap`, `dangerous_change`, `dependency_update`)
+  - external plugin実行 (`patchgate.plugin.v1`)
   - スコアリング (0-100) とレビュー優先度判定
 - `patchgate-config`
-  - `policy.toml` の読み込みとデフォルト
+  - `policy.toml` 読み込み / バリデーション / migration
+  - plugin/integration/release/compat 設定
 - `patchgate-github`
-  - PRコメント upsert
-  - Check Run publish
+  - PR comment/check-run publish
 - `patchgate-cli`
-  - `scan` / `doctor`
-  - `warn|enforce` のexit code制御
-  - JSON/Text出力
-  - SQLiteキャッシュ
-  - GitHub publish 呼び出し
+  - `scan` / `doctor` / `history` / `policy`
+  - provider抽象 (`github|generic`)
+  - webhook / notification
+  - SQLite cache
+- `xtask`
+  - benchmark
+  - weekly ops / audit / slo / ga readiness report
 
 ## Data flow
 
-1. CLI が `policy.toml` を読み込む
-2. core が git diff から `DiffData` を生成
-3. `cache_key` で SQLite cache を引く
-4. miss なら 3チェックを実行し score を算出
-5. text/json と GitHub comment markdown を出力
-6. opt-in で GitHubに comment/check-run をpublish
+1. CLI が policy を解決してロード
+2. core が `DiffData` を生成
+3. cache hit判定
+4. built-in checks + plugin checks 実行
+5. report を text/json + markdown に整形
+6. provider publish / webhook / notifications を送信
+7. metrics/audit を記録
 
-## Cache key contract
+## Plugin execution boundary
 
-`scan` の cache hit/miss は次のキーで固定する:
+- Input: `PluginInput` JSON (stdin)
+- Output: `PluginOutput` JSON (stdout)
+- timeout/max stdout/fail mode は policy 管理
+- `restricted` sandbox は env allowlist 方式
 
-- schema version (`v1`)
-- CLI version (`CARGO_PKG_VERSION`)
-- diff fingerprint
-- policy hash
-- mode (`warn|enforce`)
-- scope (`staged|worktree|repo`)
+## CI provider boundary
 
-同一キーなら hit、いずれか1要素でも変われば miss とする。  
-`--no-cache` または `cache.enabled=false` では常に miss 扱いで再評価する。
+- `github`: API publish (comment/check-run/label)
+- `generic`: JSON artifact publish
+- provider差分は CLI アダプタ層に閉じ込める
 
-## Cost model
+## LTS/GA automation
 
-実行はローカル/CIで完結し、クラウドは履歴集計等のメタデータのみを想定。
+- LTS backport gate: `.github/workflows/lts-backport.yml`
+- GA readiness: `.github/workflows/ga-readiness.yml`
+- GA artifact build: `.github/workflows/release-ga.yml`

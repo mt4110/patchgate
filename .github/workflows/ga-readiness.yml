@@ -1,0 +1,43 @@
+name: GA Readiness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate metrics/audit sample
+        run: |
+          cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl
+
+      - name: Verify v1 readiness
+        run: |
+          cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --format text
+
+      - name: Build GA readiness report
+        run: |
+          cargo run -p xtask -- ops ga-readiness \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/ga-readiness.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ga-readiness
+          path: artifacts/ga-readiness.md
