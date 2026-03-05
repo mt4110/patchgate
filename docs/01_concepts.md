@@ -23,6 +23,7 @@
   - `plugins.sandbox.profile = isolated` で Linux `bwrap` によるOS隔離実行
   - `timeout_ms` と `max_stdout_kib` を強制
   - `fail_mode = fail_open|fail_closed`
+  - `plugins.signature.required = true` の場合、plugin実行前にed25519署名を検証
 
 ## Provider / Integration contract (Phase85-87)
 

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,6 +11,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use patchgate_config::Config;
 use sha2::{Digest, Sha256};
@@ -332,6 +335,18 @@ fn execute_plugin(
     mode: &str,
     plugin: &patchgate_config::PluginEntry,
 ) -> Result<PluginInvocation> {
+    if let Err(err) = verify_plugin_signature(policy, ctx, plugin) {
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::Error,
+            duration_ms: 0,
+            sandbox_profile: policy.plugins.sandbox.profile.clone(),
+            findings: Vec::new(),
+            diagnostics: vec![format!("signature verification failed: {err:#}")],
+            error: Some(format!("signature verification failed: {err:#}")),
+        });
+    }
+
     let input = PluginInput {
         schema_version: 1,
         api_version: "patchgate.plugin.v1".to_string(),
@@ -547,6 +562,62 @@ fn execute_plugin(
         diagnostics,
         error: None,
     })
+}
+
+fn verify_plugin_signature(
+    policy: &Config,
+    ctx: &Context,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<()> {
+    if !policy.plugins.signature.required {
+        return Ok(());
+    }
+    let key_env = policy.plugins.signature.public_key_env.trim();
+    if key_env.is_empty() {
+        anyhow::bail!("plugins.signature.public_key_env is empty");
+    }
+    let key_b64 = std::env::var(key_env)
+        .with_context(|| format!("missing plugin public key env var: {key_env}"))?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .context("failed to decode plugin public key (base64)")?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("plugin public key must be 32 bytes (ed25519)"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .context("failed to parse plugin public key (ed25519)")?;
+
+    let command_path = if PathBuf::from(plugin.command.as_str()).is_absolute() {
+        PathBuf::from(plugin.command.as_str())
+    } else {
+        ctx.repo_root.join(plugin.command.as_str())
+    };
+    let signature_path = if PathBuf::from(plugin.signature_path.as_str()).is_absolute() {
+        PathBuf::from(plugin.signature_path.as_str())
+    } else {
+        ctx.repo_root.join(plugin.signature_path.as_str())
+    };
+    let command_bytes = fs::read(&command_path).with_context(|| {
+        format!(
+            "failed to read plugin command file {}",
+            command_path.display()
+        )
+    })?;
+    let signature_text = fs::read_to_string(&signature_path).with_context(|| {
+        format!(
+            "failed to read plugin signature file {}",
+            signature_path.display()
+        )
+    })?;
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_text.trim())
+        .context("failed to decode plugin signature (base64)")?;
+    let signature = Signature::try_from(signature_bytes.as_slice())
+        .context("failed to parse plugin signature (ed25519)")?;
+    verifying_key
+        .verify(command_bytes.as_slice(), &signature)
+        .context("plugin signature verification failed")?;
+    Ok(())
 }
 
 fn build_isolated_plugin_command(
@@ -1978,6 +2049,7 @@ fn compile_globs(patterns: &[String]) -> Result<GlobSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     #[test]
     fn parse_name_status_supports_rename() {
@@ -2905,5 +2977,164 @@ mod tests {
         assert!(outcome.score.is_none());
         assert!(outcome.findings.is_empty());
         assert!(outcome.invocations.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_contract_harness_and_signature_verification_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!("PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_{}", std::process::id());
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-contract-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        let input_capture = temp_root.join("plugin-input.json");
+        let signature_path = temp_root.join("plugin.sig");
+
+        let script = format!(
+            "#!/usr/bin/env sh\nset -eu\ncat > \"{}\"\necho '{{\"findings\":[],\"diagnostics\":[\"ok\"]}}'\n",
+            input_capture.display()
+        );
+        std::fs::write(&plugin_path, script).expect("write plugin script");
+        let mut perms = std::fs::metadata(&plugin_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).expect("chmod +x");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let command_bytes = std::fs::read(&plugin_path).expect("read plugin");
+        let signature = signing_key.sign(command_bytes.as_slice());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        std::fs::write(&signature_path, signature_b64).expect("write signature");
+
+        policy.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        });
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 1,
+                deleted: 0,
+                added_lines: vec!["let x = 1;".to_string()],
+                removed_lines: vec![],
+            }],
+            fingerprint: "contract-fp".to_string(),
+        };
+        let runner = Runner::new(policy);
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .plugin_invocations
+            .iter()
+            .any(|i| i.plugin_id == "sample" && i.status == PluginInvocationStatus::Pass));
+        let captured = std::fs::read_to_string(&input_capture).expect("captured input");
+        assert!(captured.contains("\"api_version\":\"patchgate.plugin.v1\""));
+        assert!(captured.contains("\"plugin_id\":\"sample\""));
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_signature_verification_fails_with_tampered_signature() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_BAD_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-signature-bad-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        let signature_path = temp_root.join("plugin.sig");
+        std::fs::write(
+            &plugin_path,
+            "#!/usr/bin/env sh\necho '{\"findings\":[],\"diagnostics\":[]}'\n",
+        )
+        .expect("write plugin script");
+        let mut perms = std::fs::metadata(&plugin_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).expect("chmod +x");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+        std::fs::write(&signature_path, "ZmFrZS1zaWduYXR1cmU=").expect("write fake signature");
+
+        policy.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        });
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 1,
+                deleted: 0,
+                added_lines: vec!["let y = 1;".to_string()],
+                removed_lines: vec![],
+            }],
+            fingerprint: "bad-signature".to_string(),
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, diff, "warn")
+            .expect_err("must fail when tampered");
+        assert!(format!("{err:#}").contains("fail_closed policy"));
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    fn current_unix_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
     }
 }

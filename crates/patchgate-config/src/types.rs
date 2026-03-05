@@ -655,6 +655,8 @@ pub struct PluginConfig {
     pub entries: Vec<PluginEntry>,
     #[serde(default)]
     pub sandbox: PluginSandboxConfig,
+    #[serde(default)]
+    pub signature: PluginSignatureConfig,
 }
 
 impl Default for PluginConfig {
@@ -663,6 +665,7 @@ impl Default for PluginConfig {
             enabled: default_false(),
             entries: Vec::new(),
             sandbox: PluginSandboxConfig::default(),
+            signature: PluginSignatureConfig::default(),
         }
     }
 }
@@ -677,6 +680,8 @@ pub struct PluginEntry {
     pub timeout_ms: u64,
     #[serde(default = "default_plugin_fail_mode")]
     pub fail_mode: String, // "fail_open" | "fail_closed"
+    #[serde(default)]
+    pub signature_path: String,
 }
 
 fn default_plugin_timeout_ms() -> u64 {
@@ -716,6 +721,27 @@ fn default_plugin_sandbox_profile() -> String {
 
 fn default_plugin_max_stdout_kib() -> u32 {
     256
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSignatureConfig {
+    #[serde(default = "default_false")]
+    pub required: bool,
+    #[serde(default = "default_plugin_public_key_env")]
+    pub public_key_env: String,
+}
+
+impl Default for PluginSignatureConfig {
+    fn default() -> Self {
+        Self {
+            required: default_false(),
+            public_key_env: default_plugin_public_key_env(),
+        }
+    }
+}
+
+fn default_plugin_public_key_env() -> String {
+    "PATCHGATE_PLUGIN_PUBLIC_KEY".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
