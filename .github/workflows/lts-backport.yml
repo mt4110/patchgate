@@ -3,12 +3,18 @@ name: LTS Backport Check
 on:
   pull_request:
     branches:
+      - "main"
       - "lts/**"
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: read
+  contents: write
+  pull-requests: write
   issues: read
 
 jobs:
@@ -17,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate backport label for LTS PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'lts/')
         env:
           API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels
           GH_TOKEN: ${{ github.token }}
@@ -33,7 +39,7 @@ jobs:
           fi
 
       - name: Check LTS backport SLA age (72h)
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'lts/')
         run: |
           created_at="${{ github.event.pull_request.created_at }}"
           created_epoch=$(date -u -d "$created_at" +%s)
@@ -64,3 +70,72 @@ jobs:
         with:
           name: lts-backport-status-${{ github.event.pull_request.number }}
           path: artifacts/lts-backport-status.json
+
+  auto-backport:
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      contains(join(github.event.pull_request.labels.*.name, ','), 'backport/lts-v1')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "patchgate-backport-bot"
+          git config user.email "patchgate-backport-bot@users.noreply.github.com"
+
+      - name: Attempt auto backport
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+          TARGET_BRANCH: lts/v1
+        run: |
+          set -euo pipefail
+          short_sha="${SOURCE_SHA:0:7}"
+          backport_branch="backport/pr-${SOURCE_PR}-${short_sha}"
+          mkdir -p artifacts
+          git fetch origin "$TARGET_BRANCH"
+          git checkout -B "$backport_branch" "origin/$TARGET_BRANCH"
+          if ! git cherry-pick -x "$SOURCE_SHA"; then
+            git cherry-pick --abort || true
+            git diff --name-only --diff-filter=U > artifacts/conflict-files.txt || true
+            cat > artifacts/backport-conflict-report.md <<EOF
+          # LTS Backport Conflict Report
+
+          - source_pr: ${SOURCE_PR}
+          - source_sha: ${SOURCE_SHA}
+          - target_branch: ${TARGET_BRANCH}
+          - status: conflict
+          EOF
+            exit 1
+          fi
+          git push origin "$backport_branch" --force
+          echo "BACKPORT_BRANCH=$backport_branch" >> "$GITHUB_ENV"
+
+      - name: Create or update backport PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          existing=$(gh pr list --base lts/v1 --head "$BACKPORT_BRANCH" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            gh pr create \
+              --base lts/v1 \
+              --head "$BACKPORT_BRANCH" \
+              --title "LTS backport: #${SOURCE_PR}" \
+              --body "Auto-generated backport PR from #${SOURCE_PR}."
+          else
+            echo "Backport PR already exists: #$existing"
+          fi
+
+      - name: Upload conflict report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lts-backport-conflict-${{ github.event.pull_request.number }}
+          path: artifacts/
