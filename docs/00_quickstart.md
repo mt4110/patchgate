@@ -39,6 +39,7 @@ patchgate policy verify-v1 --path policy.toml --readiness-profile strict --forma
 - Signed webhook: `--webhook-url ... --webhook-secret-env ...`
 - Notifications: `--notify-target slack=...` / `--notify-target teams=...`
 - Delivery fallback: `--dead-letter-output artifacts/dead-letter.jsonl`
+- Replay dead-letter: `patchgate delivery replay --input artifacts/dead-letter.jsonl --dry-run`
 
 ## 7) SDK template
 

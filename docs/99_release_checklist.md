@@ -31,6 +31,7 @@ CI/Workflowで自動化済み:
   - [ ] 署名secret設定確認
   - [ ] 通知先疎通確認
   - [ ] `--dead-letter-output` の保存先確認
+  - [ ] dead-letter replay: `patchgate delivery replay --input artifacts/dead-letter.jsonl --dry-run`
 - [ ] **Observability Contract**:
   - [ ] `scan-metrics.jsonl` 出力
   - [ ] `scan-audit.jsonl` (`patchgate.audit.v1`) 出力

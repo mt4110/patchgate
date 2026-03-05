@@ -74,6 +74,15 @@ Provider/Webhook/Notification options:
 - `--input <metrics.jsonl>`
 - `--format <text|json>`
 
+### `patchgate delivery replay`
+
+- `--input <dead-letter.jsonl>`
+- `--transport <webhook|notification>`
+- `--max-records <n>`
+- `--retry-max-attempts <n>`
+- `--retry-backoff-ms <ms>`
+- `--dry-run`
+
 ### `patchgate policy lint`
 
 - `--path <file>`

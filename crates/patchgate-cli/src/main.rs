@@ -65,6 +65,9 @@ enum Command {
 
     /// Manage external plugin templates
     Plugin(PluginArgs),
+
+    /// Replay delivery dead-letter records
+    Delivery(DeliveryArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -297,6 +300,45 @@ struct PolicyArgs {
 struct PluginArgs {
     #[command(subcommand)]
     cmd: PluginCommand,
+}
+
+#[derive(Args, Debug)]
+struct DeliveryArgs {
+    #[command(subcommand)]
+    cmd: DeliveryCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DeliveryCommand {
+    /// Replay dead-letter records to their original endpoints
+    Replay(DeliveryReplayArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DeliveryReplayArgs {
+    /// Dead-letter JSONL input path
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Filter by transport kind: webhook|notification
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// Max records to replay
+    #[arg(long)]
+    max_records: Option<usize>,
+
+    /// Retry max attempts per record
+    #[arg(long, default_value_t = 2)]
+    retry_max_attempts: u8,
+
+    /// Retry backoff milliseconds
+    #[arg(long, default_value_t = 500)]
+    retry_backoff_ms: u64,
+
+    /// Print target records but do not send requests
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -748,7 +790,7 @@ struct AuditLogRecord {
     diagnostic_hints: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeadLetterRecord {
     schema_version: u8,
     unix_ts: u64,
@@ -819,6 +861,10 @@ fn main() -> Result<()> {
             let code = execute_plugin(&repo_root, plugin);
             std::process::exit(code);
         }
+        Command::Delivery(delivery) => {
+            let code = execute_delivery(delivery);
+            std::process::exit(code);
+        }
     }
 }
 
@@ -829,6 +875,18 @@ fn execute_plugin(repo_root: &Path, plugin: PluginArgs) -> i32 {
             Err(err) => {
                 eprintln!("patchgate plugin init error: {err:#}");
                 2
+            }
+        },
+    }
+}
+
+fn execute_delivery(delivery: DeliveryArgs) -> i32 {
+    match delivery.cmd {
+        DeliveryCommand::Replay(args) => match run_dead_letter_replay(args) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("patchgate delivery replay error: {err:#}");
+                6
             }
         },
     }
@@ -2958,6 +3016,112 @@ fn append_dead_letter(
     append_jsonl(path, &record).context("failed to append dead-letter record")
 }
 
+fn load_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("open dead-letter: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<DeadLetterRecord>(&line).with_context(|| {
+            format!(
+                "decode dead-letter line {} from {}",
+                idx + 1,
+                path.display()
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
+    let mut records = load_dead_letter_jsonl(&args.input)?;
+    if let Some(transport) = args.transport.as_deref() {
+        records.retain(|r| r.transport == transport);
+    }
+    if let Some(limit) = args.max_records {
+        records.truncate(limit);
+    }
+    if records.is_empty() {
+        println!("no dead-letter records to replay");
+        return Ok(());
+    }
+
+    let attempts = args.retry_max_attempts.max(1);
+    let client = Client::builder()
+        .timeout(Duration::from_millis(5_000))
+        .build()
+        .context("failed to build replay client")?;
+    let mut replayed = 0usize;
+    for record in records {
+        if record.endpoint.contains("***") {
+            eprintln!(
+                "skip replay (redacted endpoint): transport={} endpoint={}",
+                record.transport, record.endpoint
+            );
+            continue;
+        }
+        if args.dry_run {
+            println!(
+                "dry-run replay: transport={} endpoint={} idempotency_key={}",
+                record.transport, record.endpoint, record.idempotency_key
+            );
+            replayed += 1;
+            continue;
+        }
+
+        let body = serde_json::to_vec(&record.payload).context("encode dead-letter payload")?;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=attempts {
+            let response = client
+                .post(record.endpoint.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    "X-Patchgate-Idempotency-Key",
+                    record.idempotency_key.as_str(),
+                )
+                .body(body.clone())
+                .send();
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    last_error = None;
+                    break;
+                }
+                Ok(resp) => {
+                    last_error = Some(anyhow!(
+                        "replay target returned status {} for {}",
+                        resp.status(),
+                        redacted_endpoint(record.endpoint.as_str())
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(anyhow!(err).context(format!(
+                        "replay request failed for {}",
+                        redacted_endpoint(record.endpoint.as_str())
+                    )));
+                }
+            }
+            if attempt < attempts {
+                let delay = args
+                    .retry_backoff_ms
+                    .saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err).context("dead-letter replay failed");
+        }
+        replayed += 1;
+    }
+    println!("dead-letter replay completed: replayed_records={replayed}");
+    Ok(())
+}
+
 fn dispatch_signed_webhooks(
     telemetry_repo: &str,
     report: &Report,
@@ -3044,7 +3208,7 @@ fn dispatch_signed_webhooks(
             if let Err(dead_err) = append_dead_letter(
                 options.dead_letter_path,
                 "webhook",
-                safe_url.as_str(),
+                url,
                 options.idempotency_key,
                 error_message.as_str(),
                 &payload_value,
@@ -3132,7 +3296,7 @@ fn dispatch_notifications(
             if let Err(dead_err) = append_dead_letter(
                 options.dead_letter_path,
                 "notification",
-                safe_url.as_str(),
+                target.url.as_str(),
                 options.idempotency_key,
                 error_message.as_str(),
                 &payload,
@@ -3981,11 +4145,12 @@ mod tests {
         render_github_comment, resolve_audit_actor, resolve_ci_provider,
         resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
         resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_plugin_init, run_policy_lint, run_policy_verify_v1,
-        sign_webhook_payload, sorted_findings_for_comment, CiProvider, FailureCode,
-        NotificationKind, OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs,
-        PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs,
-        ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
+        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
+        DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource, PluginInitArgs,
+        PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
+        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
+        ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5308,6 +5473,34 @@ security_sla_hours = 72
         let content = fs::read_to_string(&path).expect("read dead-letter file");
         assert!(content.contains("\"transport\":\"webhook\""));
         assert!(content.contains("\"idempotency_key\":\"pgv1-key\""));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_dry_run_succeeds() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-dry-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        append_dead_letter(
+            Some(input.as_path()),
+            "notification",
+            "https://example.internal/hook",
+            "pgv1-replay-key",
+            "network timeout",
+            &serde_json::json!({ "event": "scan.completed.notification", "summary": { "score": 90 } }),
+        )
+        .expect("seed dead-letter");
+
+        run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            dry_run: true,
+        })
+        .expect("replay dry-run");
         let _ = fs::remove_dir_all(dir);
     }
 

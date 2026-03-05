@@ -13,6 +13,7 @@ patchgate scan \
 ```
 
 `policy.toml` 側で `plugins.enabled = true` と `plugins.entries[]` を設定します。
+署名検証を有効にする場合は `[plugins.signature] required = true` と `entries[].signature_path` を設定します。
 
 ### Pluginテンプレートを生成
 
@@ -58,6 +59,15 @@ patchgate scan \
   --notify-target slack=https://hooks.slack.com/services/... \
   --notify-target teams=https://outlook.office.com/webhook/... \
   --dead-letter-output artifacts/dead-letter.jsonl
+```
+
+### dead-letterを再送
+
+```bash
+patchgate delivery replay \
+  --input artifacts/dead-letter.jsonl \
+  --transport notification \
+  --retry-max-attempts 3
 ```
 
 ### 履歴サマリとトレンド
