@@ -33,6 +33,14 @@ pub struct Config {
     pub alerts: AlertConfig,
     #[serde(default)]
     pub waiver: WaiverConfig,
+    #[serde(default)]
+    pub plugins: PluginConfig,
+    #[serde(default)]
+    pub integrations: IntegrationConfig,
+    #[serde(default)]
+    pub release: ReleaseConfig,
+    #[serde(default)]
+    pub compatibility: CompatibilityConfig,
 }
 
 impl Default for Config {
@@ -52,6 +60,10 @@ impl Default for Config {
             observability: ObservabilityConfig::default(),
             alerts: AlertConfig::default(),
             waiver: WaiverConfig::default(),
+            plugins: PluginConfig::default(),
+            integrations: IntegrationConfig::default(),
+            release: ReleaseConfig::default(),
+            compatibility: CompatibilityConfig::default(),
         }
     }
 }
@@ -246,6 +258,8 @@ pub struct WeightsConfig {
     pub dangerous_change_max_penalty: u8,
     #[serde(default = "default_dependency_update_max")]
     pub dependency_update_max_penalty: u8,
+    #[serde(default = "default_plugin_max")]
+    pub plugin_max_penalty: u8,
 }
 
 impl Default for WeightsConfig {
@@ -254,6 +268,7 @@ impl Default for WeightsConfig {
             test_gap_max_penalty: default_test_gap_max(),
             dangerous_change_max_penalty: default_dangerous_change_max(),
             dependency_update_max_penalty: default_dependency_update_max(),
+            plugin_max_penalty: default_plugin_max(),
         }
     }
 }
@@ -268,6 +283,10 @@ fn default_dangerous_change_max() -> u8 {
 
 fn default_dependency_update_max() -> u8 {
     30
+}
+
+fn default_plugin_max() -> u8 {
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -626,6 +645,290 @@ fn default_failure_rate_increase_pct() -> u8 {
 
 fn default_duration_increase_pct() -> u8 {
     40
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub entries: Vec<PluginEntry>,
+    #[serde(default)]
+    pub sandbox: PluginSandboxConfig,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            entries: Vec::new(),
+            sandbox: PluginSandboxConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_plugin_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_plugin_fail_mode")]
+    pub fail_mode: String, // "fail_open" | "fail_closed"
+}
+
+fn default_plugin_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_plugin_fail_mode() -> String {
+    "fail_open".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSandboxConfig {
+    #[serde(default = "default_plugin_sandbox_profile")]
+    pub profile: String, // "none" | "restricted"
+    #[serde(default = "default_false")]
+    pub allow_network: bool,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    #[serde(default = "default_plugin_max_stdout_kib")]
+    pub max_stdout_kib: u32,
+}
+
+impl Default for PluginSandboxConfig {
+    fn default() -> Self {
+        Self {
+            profile: default_plugin_sandbox_profile(),
+            allow_network: default_false(),
+            env_allowlist: Vec::new(),
+            max_stdout_kib: default_plugin_max_stdout_kib(),
+        }
+    }
+}
+
+fn default_plugin_sandbox_profile() -> String {
+    "restricted".to_string()
+}
+
+fn default_plugin_max_stdout_kib() -> u32 {
+    256
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationConfig {
+    #[serde(default)]
+    pub ci: CiIntegrationConfig,
+    #[serde(default)]
+    pub webhook: WebhookIntegrationConfig,
+    #[serde(default)]
+    pub notifications: NotificationIntegrationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiIntegrationConfig {
+    #[serde(default = "default_ci_provider")]
+    pub provider: String, // "github" | "generic"
+    #[serde(default = "default_empty_string")]
+    pub generic_output_path: String,
+}
+
+impl Default for CiIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_ci_provider(),
+            generic_output_path: default_empty_string(),
+        }
+    }
+}
+
+fn default_ci_provider() -> String {
+    "github".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookIntegrationConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default = "default_webhook_secret_env")]
+    pub secret_env: String,
+    #[serde(default = "default_webhook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for WebhookIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            urls: Vec::new(),
+            secret_env: default_webhook_secret_env(),
+            timeout_ms: default_webhook_timeout_ms(),
+        }
+    }
+}
+
+fn default_webhook_secret_env() -> String {
+    "PATCHGATE_WEBHOOK_SECRET".to_string()
+}
+
+fn default_webhook_timeout_ms() -> u64 {
+    3_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationIntegrationConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub targets: Vec<NotificationTarget>,
+    #[serde(default = "default_notify_retry_max_attempts")]
+    pub retry_max_attempts: u8,
+    #[serde(default = "default_notify_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    #[serde(default = "default_notify_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for NotificationIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            targets: Vec::new(),
+            retry_max_attempts: default_notify_retry_max_attempts(),
+            retry_backoff_ms: default_notify_retry_backoff_ms(),
+            timeout_ms: default_notify_timeout_ms(),
+        }
+    }
+}
+
+fn default_notify_retry_max_attempts() -> u8 {
+    2
+}
+
+fn default_notify_retry_backoff_ms() -> u64 {
+    500
+}
+
+fn default_notify_timeout_ms() -> u64 {
+    3_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationTarget {
+    pub name: String,
+    pub kind: String, // "slack" | "teams" | "generic"
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseConfig {
+    #[serde(default)]
+    pub lts: LtsConfig,
+    #[serde(default)]
+    pub slo: SloConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LtsConfig {
+    #[serde(default = "default_false")]
+    pub active: bool,
+    #[serde(default = "default_lts_branch")]
+    pub branch: String,
+    #[serde(default = "default_security_sla_hours")]
+    pub security_sla_hours: u16,
+    #[serde(default = "default_lts_backport_labels")]
+    pub backport_labels: Vec<String>,
+}
+
+impl Default for LtsConfig {
+    fn default() -> Self {
+        Self {
+            active: default_false(),
+            branch: default_lts_branch(),
+            security_sla_hours: default_security_sla_hours(),
+            backport_labels: default_lts_backport_labels(),
+        }
+    }
+}
+
+fn default_lts_branch() -> String {
+    "lts/v1".to_string()
+}
+
+fn default_security_sla_hours() -> u16 {
+    72
+}
+
+fn default_lts_backport_labels() -> Vec<String> {
+    vec!["backport/lts-v1".to_string()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SloConfig {
+    #[serde(default = "default_slo_availability_target_pct")]
+    pub availability_target_pct: u8,
+    #[serde(default = "default_slo_p95_duration_ms")]
+    pub p95_duration_ms: u32,
+    #[serde(default = "default_slo_false_positive_target_pct")]
+    pub false_positive_target_pct: u8,
+}
+
+impl Default for SloConfig {
+    fn default() -> Self {
+        Self {
+            availability_target_pct: default_slo_availability_target_pct(),
+            p95_duration_ms: default_slo_p95_duration_ms(),
+            false_positive_target_pct: default_slo_false_positive_target_pct(),
+        }
+    }
+}
+
+fn default_slo_availability_target_pct() -> u8 {
+    99
+}
+
+fn default_slo_p95_duration_ms() -> u32 {
+    1_500
+}
+
+fn default_slo_false_positive_target_pct() -> u8 {
+    5
+}
+
+fn default_v1_rc_frozen() -> bool {
+    true
+}
+
+fn default_v1_allow_legacy_config_names() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatibilityConfig {
+    #[serde(default)]
+    pub v1: V1CompatibilityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct V1CompatibilityConfig {
+    #[serde(default = "default_v1_rc_frozen")]
+    pub rc_frozen: bool,
+    #[serde(default = "default_v1_allow_legacy_config_names")]
+    pub allow_legacy_config_names: bool,
+}
+
+impl Default for V1CompatibilityConfig {
+    fn default() -> Self {
+        Self {
+            rc_frozen: default_v1_rc_frozen(),
+            allow_legacy_config_names: default_v1_allow_legacy_config_names(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

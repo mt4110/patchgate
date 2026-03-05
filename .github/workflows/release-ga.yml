@@ -1,0 +1,38 @@
+name: Release GA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo build -p patchgate-cli --release
+          mkdir -p artifacts
+          cp target/release/patchgate "artifacts/patchgate-${RELEASE_VERSION}-linux-amd64"
+
+      - name: Generate checksums and SBOM-like metadata
+        run: |
+          sha256sum "artifacts/patchgate-${RELEASE_VERSION}-linux-amd64" > artifacts/SHA256SUMS
+          cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-ga-${{ inputs.version }}
+          path: artifacts/

@@ -26,6 +26,22 @@ patchgate scan --mode warn
 patchgate scan --mode enforce --format json
 ```
 
-## 5) CI template
+## 5) v1 readiness check
+
+```bash
+patchgate policy verify-v1 --path policy.toml --format text
+```
+
+## 6) Optional integrations
+
+- Generic CI provider: `--publish --ci-provider generic --ci-generic-output ...`
+- Signed webhook: `--webhook-url ... --webhook-secret-env ...`
+- Notifications: `--notify-target slack=...` / `--notify-target teams=...`
+
+## 7) SDK template
+
+- `sdk/templates/python-plugin` をコピーして plugin を作成
+
+## 8) CI template
 
 `docs/patchgate-action.yml` を `.github/workflows/patchgate.yml` にコピーして使います。

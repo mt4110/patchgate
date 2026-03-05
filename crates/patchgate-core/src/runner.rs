@@ -1,6 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
@@ -9,7 +15,9 @@ use patchgate_config::Config;
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    CheckId, CheckScore, Finding, Location, Report, ReportMeta, Severity, SupplyChainSignal,
+    CheckId, CheckScore, Finding, Location, PluginChangedFile, PluginFinding, PluginInput,
+    PluginInvocation, PluginInvocationStatus, PluginOutput, Report, ReportMeta, Severity,
+    SupplyChainSignal,
 };
 
 const MAX_STORED_LINE_SAMPLES: usize = 32;
@@ -133,16 +141,22 @@ impl Runner {
             ))
         })?;
 
+        let plugin_outcome = evaluate_plugins(&self.policy, ctx, &diff, mode)?;
+
         let mut findings = Vec::new();
         findings.extend(test_gap.findings);
         findings.extend(dangerous_change.findings);
         findings.extend(dependency_update.findings);
+        findings.extend(plugin_outcome.findings);
 
-        let checks = vec![
+        let mut checks = vec![
             test_gap.score,
             dangerous_change.score,
             dependency_update.score,
         ];
+        if let Some(plugin_score) = plugin_outcome.score {
+            checks.push(plugin_score);
+        }
 
         let changed_files = diff.files.len();
         let fingerprint = diff.fingerprint.clone();
@@ -170,12 +184,22 @@ impl Runner {
             CheckId::DependencyUpdate.as_str().to_string(),
             dependency_update_ms,
         );
+        if let Some(plugin_duration_ms) = plugin_outcome.total_duration_ms {
+            report.check_durations_ms.insert(
+                CheckId::ExternalPlugin.as_str().to_string(),
+                plugin_duration_ms,
+            );
+        }
         report.supply_chain_signals = build_supply_chain_signals(&diff);
         if !report.supply_chain_signals.is_empty() {
             report.diagnostic_hints.push(
                 "Supply-chain signal detected: require dependency integrity review.".to_string(),
             );
         }
+        if !plugin_outcome.diagnostics.is_empty() {
+            report.diagnostic_hints.extend(plugin_outcome.diagnostics);
+        }
+        report.plugin_invocations = plugin_outcome.invocations;
         Ok(report)
     }
 
@@ -188,6 +212,453 @@ impl Runner {
 struct CheckEvaluation {
     score: CheckScore,
     findings: Vec<Finding>,
+}
+
+#[derive(Debug, Default)]
+struct PluginEvaluationOutcome {
+    score: Option<CheckScore>,
+    findings: Vec<Finding>,
+    invocations: Vec<PluginInvocation>,
+    diagnostics: Vec<String>,
+    total_duration_ms: Option<u128>,
+}
+
+fn evaluate_plugins(
+    policy: &Config,
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+) -> Result<PluginEvaluationOutcome> {
+    if !policy.plugins.enabled || policy.plugins.entries.is_empty() {
+        return Ok(PluginEvaluationOutcome::default());
+    }
+
+    let mut outcome = PluginEvaluationOutcome::default();
+    let mut total_penalty: u16 = 0;
+    let mut total_duration_ms = 0u128;
+    let mut triggered = false;
+
+    for plugin in &policy.plugins.entries {
+        let start = Instant::now();
+        let result = execute_plugin(policy, ctx, diff, mode, plugin);
+        total_duration_ms = total_duration_ms.saturating_add(start.elapsed().as_millis());
+        match result {
+            Ok(invocation) => {
+                if invocation.status != PluginInvocationStatus::Pass {
+                    triggered = true;
+                }
+                if plugin.fail_mode == "fail_closed"
+                    && plugin_invocation_is_execution_failure(&invocation.status)
+                {
+                    let message = invocation
+                        .error
+                        .as_deref()
+                        .unwrap_or("plugin execution failed");
+                    return Err(anyhow::anyhow!(
+                        "plugin `{}` failed with fail_closed policy: {message}",
+                        plugin.id
+                    ));
+                }
+                for finding in &invocation.findings {
+                    total_penalty = total_penalty.saturating_add(finding.penalty as u16);
+                }
+                outcome.findings.extend(
+                    invocation
+                        .findings
+                        .iter()
+                        .map(|f| plugin_to_core_finding(plugin.id.as_str(), f)),
+                );
+                outcome.diagnostics.extend(
+                    invocation
+                        .diagnostics
+                        .iter()
+                        .map(|d| format!("plugin:{}: {d}", plugin.id)),
+                );
+                outcome.invocations.push(invocation);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                triggered = true;
+                if plugin.fail_mode == "fail_closed" {
+                    return Err(anyhow::anyhow!(
+                        "plugin `{}` failed with fail_closed policy: {message}",
+                        plugin.id
+                    ));
+                }
+                outcome.diagnostics.push(format!(
+                    "plugin:{} failed (fail_open): {message}",
+                    plugin.id
+                ));
+                outcome.invocations.push(PluginInvocation {
+                    plugin_id: plugin.id.clone(),
+                    status: PluginInvocationStatus::Error,
+                    duration_ms: start.elapsed().as_millis(),
+                    sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                    findings: Vec::new(),
+                    diagnostics: vec!["execution failed".to_string()],
+                    error: Some(message),
+                });
+            }
+        }
+    }
+
+    let max_penalty = policy.weights.plugin_max_penalty;
+    let penalty = total_penalty.min(max_penalty as u16) as u8;
+    if !outcome.invocations.is_empty() {
+        outcome.score = Some(CheckScore {
+            check: CheckId::ExternalPlugin,
+            label: CheckId::ExternalPlugin.label().to_string(),
+            penalty,
+            max_penalty,
+            triggered: triggered || penalty > 0 || !outcome.findings.is_empty(),
+        });
+        outcome.total_duration_ms = Some(total_duration_ms);
+    }
+
+    Ok(outcome)
+}
+
+fn plugin_invocation_is_execution_failure(status: &PluginInvocationStatus) -> bool {
+    matches!(
+        status,
+        PluginInvocationStatus::Error | PluginInvocationStatus::TimedOut
+    )
+}
+
+fn execute_plugin(
+    policy: &Config,
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<PluginInvocation> {
+    let input = PluginInput {
+        schema_version: 1,
+        api_version: "patchgate.plugin.v1".to_string(),
+        plugin_id: plugin.id.clone(),
+        repo_root: ctx.repo_root.to_string_lossy().to_string(),
+        mode: mode.to_string(),
+        scope: ctx.scope.as_str().to_string(),
+        changed_files: diff
+            .files
+            .iter()
+            .map(|f| PluginChangedFile {
+                path: f.path.clone(),
+                status: change_status_as_str(f.status).to_string(),
+                added: f.added,
+                deleted: f.deleted,
+            })
+            .collect(),
+    };
+    let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
+    let max_output_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
+    let sandbox_profile = policy.plugins.sandbox.profile.as_str();
+    let timeout = Duration::from_millis(plugin.timeout_ms);
+
+    let start = Instant::now();
+    let mut command = Command::new(plugin.command.as_str());
+    command.args(&plugin.args);
+    command.current_dir(&ctx.repo_root);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    if sandbox_profile == "restricted" {
+        command.env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            command.env("PATH", path);
+        }
+        for key in &policy.plugins.sandbox.env_allowlist {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+    }
+    command.env("PATCHGATE_PLUGIN_ID", plugin.id.as_str());
+    command.env("PATCHGATE_SANDBOX_PROFILE", sandbox_profile);
+    command.env(
+        "PATCHGATE_SANDBOX_NETWORK",
+        if policy.plugins.sandbox.allow_network {
+            "allow"
+        } else {
+            "deny"
+        },
+    );
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start plugin `{}` command `{}`",
+            plugin.id, plugin.command
+        )
+    })?;
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&input_json)?;
+            Ok(())
+        })
+    });
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture plugin stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture plugin stderr"))?;
+    let stdout_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_limit_probe = Arc::clone(&stdout_limit_exceeded);
+    let stderr_limit_probe = Arc::clone(&stderr_limit_exceeded);
+    let stdout_reader = thread::spawn(move || {
+        read_stream_with_limit(stdout, max_output_bytes, Some(stdout_limit_probe))
+    });
+    let stderr_reader = thread::spawn(move || {
+        read_stream_with_limit(stderr, max_output_bytes, Some(stderr_limit_probe))
+    });
+
+    let termination = wait_for_child_with_timeout(
+        &mut child,
+        timeout,
+        stdout_limit_exceeded.as_ref(),
+        stderr_limit_exceeded.as_ref(),
+    )?;
+    if !matches!(termination, ChildTermination::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(stdin_writer) = stdin_writer {
+        join_stdin_writer(stdin_writer, &termination)?;
+    }
+    let stdout = join_reader(stdout_reader, "stdout")?;
+    let stderr = join_reader(stderr_reader, "stderr")?;
+    let duration_ms = start.elapsed().as_millis();
+
+    if matches!(termination, ChildTermination::TimedOut) {
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::TimedOut,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec![format!("timeout after {}ms", plugin.timeout_ms)],
+            error: Some(format!("plugin timed out after {}ms", plugin.timeout_ms)),
+        });
+    }
+
+    if stdout_limit_exceeded.load(Ordering::Relaxed)
+        || stderr_limit_exceeded.load(Ordering::Relaxed)
+        || matches!(termination, ChildTermination::OutputLimitExceeded)
+    {
+        let mut exceeded_streams = Vec::new();
+        if stdout_limit_exceeded.load(Ordering::Relaxed) {
+            exceeded_streams.push("stdout");
+        }
+        if stderr_limit_exceeded.load(Ordering::Relaxed) {
+            exceeded_streams.push("stderr");
+        }
+        let stream_label = if exceeded_streams.is_empty() {
+            "output".to_string()
+        } else {
+            exceeded_streams.join(",")
+        };
+        let message = format!(
+            "plugin `{}` {} exceeded sandbox.max_stdout_kib ({} KiB)",
+            plugin.id, stream_label, policy.plugins.sandbox.max_stdout_kib
+        );
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::Error,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec![message.clone()],
+            error: Some(message),
+        });
+    }
+
+    let exit_status = match termination {
+        ChildTermination::Exited(status) => status,
+        ChildTermination::TimedOut | ChildTermination::OutputLimitExceeded => unreachable!(),
+    };
+
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !exit_status.success() {
+        let reason = if stderr.is_empty() {
+            format!("exit status: {exit_status}")
+        } else {
+            stderr
+        };
+        return Ok(PluginInvocation {
+            plugin_id: plugin.id.clone(),
+            status: PluginInvocationStatus::Error,
+            duration_ms,
+            sandbox_profile: sandbox_profile.to_string(),
+            findings: Vec::new(),
+            diagnostics: vec!["plugin process returned non-zero exit".to_string()],
+            error: Some(reason),
+        });
+    }
+
+    let stdout = String::from_utf8(stdout).context("plugin stdout was not utf8")?;
+    let mut plugin_output: PluginOutput =
+        serde_json::from_str(stdout.as_str()).context("failed to decode plugin output json")?;
+    for finding in &mut plugin_output.findings {
+        if finding.rule_id.trim().is_empty() {
+            finding.rule_id = finding.id.clone();
+        }
+        if finding.category.trim().is_empty() {
+            finding.category = "plugin".to_string();
+        }
+    }
+    let status = if plugin_output.findings.is_empty() {
+        PluginInvocationStatus::Pass
+    } else {
+        PluginInvocationStatus::Fail
+    };
+    let mut diagnostics = plugin_output.diagnostics;
+    if !stderr.is_empty() {
+        diagnostics.push(format!("stderr: {stderr}"));
+    }
+    Ok(PluginInvocation {
+        plugin_id: plugin.id.clone(),
+        status,
+        duration_ms,
+        sandbox_profile: sandbox_profile.to_string(),
+        findings: plugin_output.findings,
+        diagnostics,
+        error: None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildTermination {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    OutputLimitExceeded,
+}
+
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    stdout_limit_exceeded: &AtomicBool,
+    stderr_limit_exceeded: &AtomicBool,
+) -> Result<ChildTermination> {
+    let start = Instant::now();
+    loop {
+        if stdout_limit_exceeded.load(Ordering::Relaxed)
+            || stderr_limit_exceeded.load(Ordering::Relaxed)
+        {
+            return Ok(ChildTermination::OutputLimitExceeded);
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(ChildTermination::Exited(status));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(ChildTermination::TimedOut);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_stream_with_limit<R: Read>(
+    mut reader: R,
+    max_bytes: usize,
+    overflow_flag: Option<Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    let mut stored = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut overflowed = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if overflowed {
+            continue;
+        }
+        let remaining = max_bytes.saturating_sub(stored.len());
+        if read <= remaining {
+            stored.extend_from_slice(&buffer[..read]);
+            continue;
+        }
+        if remaining > 0 {
+            stored.extend_from_slice(&buffer[..remaining]);
+        }
+        overflowed = true;
+        if let Some(flag) = overflow_flag.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    Ok(stored)
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    let output = handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("plugin {stream_name} reader thread panicked"))?;
+    output.with_context(|| format!("failed to read plugin {stream_name}"))
+}
+
+fn join_stdin_writer(
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    termination: &ChildTermination,
+) -> Result<()> {
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            if matches!(termination, ChildTermination::Exited(_)) {
+                return Err(err).context("failed to write plugin input");
+            }
+            Ok(())
+        }
+        Err(_) => Err(anyhow::anyhow!("plugin stdin writer thread panicked")),
+    }
+}
+
+fn plugin_to_core_finding(plugin_id: &str, finding: &PluginFinding) -> Finding {
+    let mut tags = finding.tags.clone();
+    tags.push(format!("plugin:{plugin_id}"));
+    let core_id = if finding.id.trim().is_empty() {
+        format!("PLG-{plugin_id}-001")
+    } else {
+        finding.id.clone()
+    };
+    Finding {
+        id: core_id.clone(),
+        rule_id: if finding.rule_id.trim().is_empty() {
+            core_id
+        } else {
+            finding.rule_id.clone()
+        },
+        category: if finding.category.trim().is_empty() {
+            "plugin".to_string()
+        } else {
+            finding.category.clone()
+        },
+        docs_url: finding.docs_url.clone(),
+        check: CheckId::ExternalPlugin,
+        title: finding.title.clone(),
+        message: finding.message.clone(),
+        severity: finding.severity,
+        penalty: finding.penalty,
+        location: finding.location.clone(),
+        tags,
+    }
+}
+
+fn change_status_as_str(status: ChangeStatus) -> &'static str {
+    match status {
+        ChangeStatus::Added => "added",
+        ChangeStatus::Modified => "modified",
+        ChangeStatus::Deleted => "deleted",
+        ChangeStatus::Renamed => "renamed",
+        ChangeStatus::Copied => "copied",
+        ChangeStatus::TypeChanged => "type_changed",
+        ChangeStatus::Unknown => "unknown",
+    }
 }
 
 fn evaluate_test_gap(
@@ -2238,5 +2709,123 @@ mod tests {
             .supply_chain_signals
             .iter()
             .any(|s| s.id == "SCM-002"));
+    }
+
+    #[test]
+    fn plugin_to_core_finding_fills_defaults() {
+        let plugin_finding = PluginFinding {
+            id: String::new(),
+            rule_id: String::new(),
+            category: String::new(),
+            docs_url: String::new(),
+            title: "Plugin finding".to_string(),
+            message: "details".to_string(),
+            severity: Severity::Medium,
+            penalty: 3,
+            location: None,
+            tags: vec!["sample".to_string()],
+        };
+        let finding = plugin_to_core_finding("sample-plugin", &plugin_finding);
+        assert_eq!(finding.check, CheckId::ExternalPlugin);
+        assert_eq!(finding.id, "PLG-sample-plugin-001");
+        assert_eq!(finding.rule_id, "PLG-sample-plugin-001");
+        assert_eq!(finding.category, "plugin");
+        assert!(finding.tags.iter().any(|t| t == "plugin:sample-plugin"));
+    }
+
+    #[test]
+    fn plugin_execution_failure_status_detection() {
+        assert!(plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Error
+        ));
+        assert!(plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::TimedOut
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Pass
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Fail
+        ));
+        assert!(!plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::Skipped
+        ));
+    }
+
+    #[test]
+    fn read_stream_with_limit_truncates_and_marks_overflow() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let output = read_stream_with_limit(
+            std::io::Cursor::new(vec![b'x'; 64]),
+            8,
+            Some(Arc::clone(&overflow)),
+        )
+        .expect("read stream");
+        assert_eq!(output.len(), 8);
+        assert!(overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn read_stream_with_limit_without_overflow_keeps_all_bytes() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let output = read_stream_with_limit(
+            std::io::Cursor::new(vec![b'x'; 16]),
+            64,
+            Some(Arc::clone(&overflow)),
+        )
+        .expect("read stream");
+        assert_eq!(output.len(), 16);
+        assert!(!overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn join_stdin_writer_ignores_broken_pipe_on_timeout() {
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::TimedOut);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn join_stdin_writer_reports_error_when_process_exited() {
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .status()
+            .expect("status");
+        #[cfg(not(windows))]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+            .expect("status");
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::Exited(status));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn evaluate_plugins_returns_empty_when_disabled() {
+        let policy = Config::default();
+        let ctx = Context {
+            repo_root: PathBuf::from("."),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![],
+            fingerprint: "dummy".to_string(),
+        };
+        let outcome = evaluate_plugins(&policy, &ctx, &diff, "warn").expect("evaluate");
+        assert!(outcome.score.is_none());
+        assert!(outcome.findings.is_empty());
+        assert!(outcome.invocations.is_empty());
     }
 }

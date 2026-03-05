@@ -15,6 +15,9 @@ const DEFAULT_OUTPUT: &str = "target/benchmarks/patchgate_baseline.jsonl";
 const DEFAULT_PROFILE_OUTPUT: &str = "target/benchmarks/scan_profile.json";
 const DEFAULT_MAX_REGRESSION_PCT: f64 = 30.0;
 const DEFAULT_SYNTHETIC_LINES: usize = 1;
+const DEFAULT_SLO_AVAILABILITY_TARGET_PCT: u8 = 99;
+const DEFAULT_SLO_P95_TARGET_MS: u32 = 1_500;
+const DEFAULT_SLO_FALSE_POSITIVE_TARGET_PCT: u8 = 5;
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -28,6 +31,8 @@ enum BenchSubcommand {
 enum OpsSubcommand {
     WeeklySummary,
     AuditReport,
+    SloReport,
+    GaReadiness,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +57,9 @@ struct OpsOptions {
     audit_input: PathBuf,
     output: PathBuf,
     trend_output: Option<PathBuf>,
+    availability_target_pct: u8,
+    p95_target_ms: u32,
+    false_positive_target_pct: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +84,23 @@ struct BenchCompareReport {
     max_regression_pct: f64,
     regressed: bool,
     fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SloReport {
+    runs: usize,
+    successful_runs: usize,
+    gate_failures: usize,
+    availability_pct: f64,
+    p95_duration_ms: u128,
+    gate_failure_rate_pct: f64,
+    availability_target_pct: u8,
+    p95_target_ms: u32,
+    false_positive_target_pct: u8,
+    availability_ok: bool,
+    p95_ok: bool,
+    false_positive_ok: bool,
+    ready: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,7 +216,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]"
     );
 }
 
@@ -307,17 +332,22 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary` or `audit-report`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `slo-report`, or `ga-readiness`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
         "audit-report" => OpsSubcommand::AuditReport,
+        "slo-report" => OpsSubcommand::SloReport,
+        "ga-readiness" => OpsSubcommand::GaReadiness,
         other => bail!("unsupported ops subcommand `{other}`"),
     };
     let mut metrics_input = PathBuf::from("artifacts/scan-metrics.jsonl");
     let mut audit_input = PathBuf::from("artifacts/scan-audit.jsonl");
     let mut output = PathBuf::from("artifacts/ops-report.md");
     let mut trend_output = None;
+    let mut availability_target_pct = DEFAULT_SLO_AVAILABILITY_TARGET_PCT;
+    let mut p95_target_ms = DEFAULT_SLO_P95_TARGET_MS;
+    let mut false_positive_target_pct = DEFAULT_SLO_FALSE_POSITIVE_TARGET_PCT;
 
     while let Some(flag) = iter.next() {
         match flag.to_string_lossy().as_ref() {
@@ -345,6 +375,33 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .ok_or_else(|| anyhow!("missing value for --trend-output"))?;
                 trend_output = Some(PathBuf::from(value));
             }
+            "--availability-target-pct" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --availability-target-pct"))?;
+                availability_target_pct = value
+                    .to_string_lossy()
+                    .parse::<u8>()
+                    .context("failed to parse --availability-target-pct")?;
+            }
+            "--p95-target-ms" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --p95-target-ms"))?;
+                p95_target_ms = value
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .context("failed to parse --p95-target-ms")?;
+            }
+            "--false-positive-target-pct" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --false-positive-target-pct"))?;
+                false_positive_target_pct = value
+                    .to_string_lossy()
+                    .parse::<u8>()
+                    .context("failed to parse --false-positive-target-pct")?;
+            }
             other => bail!("unsupported flag `{other}`"),
         }
     }
@@ -355,6 +412,9 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         audit_input,
         output,
         trend_output,
+        availability_target_pct,
+        p95_target_ms,
+        false_positive_target_pct,
     })
 }
 
@@ -362,6 +422,8 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
     match options.subcommand {
         OpsSubcommand::WeeklySummary => run_weekly_summary(options),
         OpsSubcommand::AuditReport => run_audit_report(options),
+        OpsSubcommand::SloReport => run_slo_report(options),
+        OpsSubcommand::GaReadiness => run_ga_readiness(options),
     }
 }
 
@@ -580,6 +642,184 @@ fn run_audit_report(options: &OpsOptions) -> Result<()> {
     write_output(&options.output, md.as_str())?;
     println!("audit report written: {}", options.output.display());
     Ok(())
+}
+
+fn run_slo_report(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let report = build_slo_report(
+        &metrics,
+        options.availability_target_pct,
+        options.p95_target_ms,
+        options.false_positive_target_pct,
+    );
+
+    let mut md = String::new();
+    md.push_str("# SLO Report\n\n");
+    md.push_str(&format!("- runs: {}\n", report.runs));
+    md.push_str(&format!("- successful_runs: {}\n", report.successful_runs));
+    md.push_str(&format!("- gate_failures: {}\n", report.gate_failures));
+    md.push_str(&format!(
+        "- availability_pct: {:.2}%\n",
+        report.availability_pct
+    ));
+    md.push_str(&format!("- p95_duration_ms: {}\n", report.p95_duration_ms));
+    md.push_str(&format!(
+        "- gate_failure_rate_pct: {:.2}%\n",
+        report.gate_failure_rate_pct
+    ));
+    md.push_str("\n## Targets\n");
+    md.push_str(&format!(
+        "- availability_target_pct: {} (ok={})\n",
+        report.availability_target_pct, report.availability_ok
+    ));
+    md.push_str(&format!(
+        "- p95_target_ms: {} (ok={})\n",
+        report.p95_target_ms, report.p95_ok
+    ));
+    md.push_str(&format!(
+        "- false_positive_target_pct: {} (ok={})\n",
+        report.false_positive_target_pct, report.false_positive_ok
+    ));
+    md.push_str(&format!("\n- ready: {}\n", report.ready));
+
+    write_output(&options.output, md.as_str())?;
+    println!("slo report written: {}", options.output.display());
+    Ok(())
+}
+
+fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let slo = build_slo_report(
+        &metrics,
+        options.availability_target_pct,
+        options.p95_target_ms,
+        options.false_positive_target_pct,
+    );
+    let has_audit_failures = audits
+        .iter()
+        .any(|row| row.failure_code.is_some() || row.result == "error");
+    let has_metrics = !metrics.is_empty();
+    let has_audits = !audits.is_empty();
+    let ga_ready = slo.ready && has_metrics && has_audits && !has_audit_failures;
+
+    let mut md = String::new();
+    md.push_str("# GA Readiness\n\n");
+    md.push_str(&format!("- ga_ready: {}\n", ga_ready));
+    md.push_str("\n## Checklist\n");
+    md.push_str(&format!(
+        "- {} Metrics present: {} entries\n",
+        checklist_box(has_metrics),
+        metrics.len()
+    ));
+    md.push_str(&format!(
+        "- {} Audit logs present: {} entries\n",
+        checklist_box(has_audits),
+        audits.len()
+    ));
+    md.push_str(&format!(
+        "- {} SLO ready: {}\n",
+        checklist_box(slo.ready),
+        slo.ready
+    ));
+    md.push_str(&format!(
+        "- {} Audit failures absent: {}\n",
+        checklist_box(!has_audit_failures),
+        !has_audit_failures
+    ));
+    md.push_str("\n## SLO Snapshot\n");
+    md.push_str(&format!(
+        "- availability_pct: {:.2}%\n",
+        slo.availability_pct
+    ));
+    md.push_str(&format!("- p95_duration_ms: {}\n", slo.p95_duration_ms));
+    md.push_str(&format!(
+        "- gate_failure_rate_pct: {:.2}%\n",
+        slo.gate_failure_rate_pct
+    ));
+
+    write_output(&options.output, md.as_str())?;
+    println!("ga readiness report written: {}", options.output.display());
+    if !ga_ready {
+        bail!(
+            "ga readiness check failed (metrics_present={}, audits_present={}, slo_ready={}, audit_failures_absent={})",
+            has_metrics,
+            has_audits,
+            slo.ready,
+            !has_audit_failures
+        );
+    }
+    Ok(())
+}
+
+fn checklist_box(condition: bool) -> &'static str {
+    if condition {
+        "[x]"
+    } else {
+        "[ ]"
+    }
+}
+
+fn build_slo_report(
+    metrics: &[MetricLogRecord],
+    availability_target_pct: u8,
+    p95_target_ms: u32,
+    false_positive_target_pct: u8,
+) -> SloReport {
+    let runs = metrics.len();
+    let successful_runs = metrics.iter().filter(|m| m.failure_code.is_none()).count();
+    let gate_failures = metrics
+        .iter()
+        .filter(|m| m.should_fail.unwrap_or(false))
+        .count();
+    let availability_pct = if runs == 0 {
+        0.0
+    } else {
+        (successful_runs as f64 / runs as f64) * 100.0
+    };
+    let gate_failure_rate_pct = if runs == 0 {
+        0.0
+    } else {
+        (gate_failures as f64 / runs as f64) * 100.0
+    };
+    let mut durations: Vec<u128> = metrics
+        .iter()
+        .filter(|m| m.failure_code.is_none())
+        .map(|m| m.duration_ms)
+        .collect();
+    durations.sort_unstable();
+    let p95_duration_ms = percentile_u128(&durations, 95);
+
+    let availability_ok = availability_pct >= availability_target_pct as f64;
+    let p95_ok = p95_duration_ms <= p95_target_ms as u128;
+    let false_positive_ok = gate_failure_rate_pct <= false_positive_target_pct as f64;
+    let ready = availability_ok && p95_ok && false_positive_ok;
+
+    SloReport {
+        runs,
+        successful_runs,
+        gate_failures,
+        availability_pct,
+        p95_duration_ms,
+        gate_failure_rate_pct,
+        availability_target_pct,
+        p95_target_ms,
+        false_positive_target_pct,
+        availability_ok,
+        p95_ok,
+        false_positive_ok,
+        ready,
+    }
+}
+
+fn percentile_u128(sorted_values: &[u128], percentile: usize) -> u128 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let len = sorted_values.len();
+    let rank = len.saturating_mul(percentile).div_ceil(100).max(1);
+    let idx = rank.saturating_sub(1).min(len - 1);
+    sorted_values[idx]
 }
 
 fn load_jsonl_records<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
@@ -927,13 +1167,16 @@ fn is_duration_regressed(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
     use super::{
         aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
-        load_jsonl_records, validate_workload_identity, AuditLogRecord, BenchSample,
-        MetricLogRecord, TEMP_SEQ,
+        checklist_box, load_jsonl_records, percentile_u128, run_ga_readiness,
+        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions,
+        OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -1075,5 +1318,49 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("xtask-missing-{seq}.jsonl"));
         let err = load_jsonl_records::<MetricLogRecord>(&missing).expect_err("must error");
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn checklist_box_marks_condition() {
+        assert_eq!(checklist_box(true), "[x]");
+        assert_eq!(checklist_box(false), "[ ]");
+    }
+
+    #[test]
+    fn percentile_uses_ceiling_rank_for_small_samples() {
+        let values = vec![100u128, 200u128];
+        assert_eq!(percentile_u128(&values, 95), 200);
+    }
+
+    #[test]
+    fn ga_readiness_fails_when_not_ready_and_writes_report() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-ga-readiness-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let metrics_input = base.join("metrics.jsonl");
+        let audit_input = base.join("audit.jsonl");
+        let output = base.join("ga-readiness.md");
+        fs::write(&metrics_input, "").expect("write metrics");
+        fs::write(&audit_input, "").expect("write audits");
+        let options = OpsOptions {
+            subcommand: OpsSubcommand::GaReadiness,
+            metrics_input,
+            audit_input,
+            output: output.clone(),
+            trend_output: None,
+            availability_target_pct: 99,
+            p95_target_ms: 1_500,
+            false_positive_target_pct: 5,
+        };
+
+        let err = run_ga_readiness(&options).expect_err("ga readiness must fail");
+        assert!(format!("{err:#}").contains("ga readiness check failed"));
+
+        let markdown = fs::read_to_string(PathBuf::from(&output)).expect("read output");
+        assert!(markdown.contains("- ga_ready: false"));
+        assert!(markdown.contains("- [ ] Metrics present: 0 entries"));
+        assert!(markdown.contains("- [ ] Audit logs present: 0 entries"));
+
+        let _ = fs::remove_dir_all(base);
     }
 }

@@ -1,0 +1,33 @@
+name: LTS Backport Check
+
+on:
+  pull_request:
+    branches:
+      - "lts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate backport label for LTS PR
+        if: github.event_name == 'pull_request'
+        env:
+          API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          labels=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL" | jq -r '.[].name')
+          echo "labels: $labels"
+          if ! echo "$labels" | grep -Eq '^backport/lts-v1$'; then
+            echo "LTS PR requires label: backport/lts-v1"
+            exit 1
+          fi
