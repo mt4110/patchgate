@@ -38,6 +38,7 @@ patchgate policy verify-v1 --path policy.toml --readiness-profile strict --forma
 - Generic CI provider: `--publish --ci-provider generic --ci-generic-output ...`
 - Signed webhook: `--webhook-url ... --webhook-secret-env ...`
 - Notifications: `--notify-target slack=...` / `--notify-target teams=...`
+- Delivery fallback: `--dead-letter-output artifacts/dead-letter.jsonl`
 
 ## 7) SDK template
 

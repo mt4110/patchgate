@@ -32,9 +32,11 @@
 - Webhook:
   - `scan.completed` イベントを JSON 送信
   - 署名ヘッダ `X-Patchgate-Signature: sha256=...`
+  - 冪等ヘッダ `X-Patchgate-Idempotency-Key` を付与
 - Notification adapter:
   - `slack|teams|generic` の共通送信契約
   - retry/backoff で一時障害を吸収
+  - 失敗payloadは dead-letter(JSONL) に退避可能
 
 ## Observability model (Phase61-70, 95)
 
@@ -78,4 +80,4 @@
   - `cargo run -p xtask -- ops ga-readiness`
 - Release artifacts:
   - `.github/workflows/release-ga.yml`
-  - checksum + SBOM相当（cargo metadata）
+  - checksum + SBOM相当 + provenance metadata

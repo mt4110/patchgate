@@ -56,10 +56,12 @@ Provider/Webhook/Notification options:
 - `--webhook-url <https://...>` (repeatable)
 - `--webhook-secret-env <env_name>`
 - `--webhook-timeout-ms <ms>`
+- `--webhook-retry-max-attempts <n>`
 - `--notify-target <kind=url>` (kind: `slack|teams|generic`)
 - `--notify-retry-max-attempts <n>`
 - `--notify-retry-backoff-ms <ms>`
 - `--notify-timeout-ms <ms>`
+- `--dead-letter-output <path>` (配信失敗ペイロードをJSONL保存)
 
 ### `patchgate history summary`
 

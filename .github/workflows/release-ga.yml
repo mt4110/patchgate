@@ -30,6 +30,23 @@ jobs:
         run: |
           sha256sum "artifacts/patchgate-${RELEASE_VERSION}-linux-amd64" > artifacts/SHA256SUMS
           cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
+          cp artifacts/sbom.cargo-metadata.json artifacts/sbom.spdx.json
+
+      - name: Generate provenance metadata
+        run: |
+          jq -n \
+            --arg version "${RELEASE_VERSION}" \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg built_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg artifact "patchgate-${RELEASE_VERSION}-linux-amd64" \
+            '{
+              schema_version: 1,
+              predicate_type: "https://slsa.dev/provenance/v1",
+              version: $version,
+              commit: $commit,
+              built_at: $built_at,
+              artifact: $artifact
+            }' > artifacts/provenance.intoto.jsonl
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

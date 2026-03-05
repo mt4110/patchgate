@@ -43,7 +43,9 @@ patchgate scan \
   --mode warn \
   --format json \
   --webhook-url https://example.internal/hooks/patchgate \
-  --webhook-secret-env PATCHGATE_WEBHOOK_SECRET
+  --webhook-secret-env PATCHGATE_WEBHOOK_SECRET \
+  --webhook-retry-max-attempts 3 \
+  --dead-letter-output artifacts/dead-letter.jsonl
 ```
 
 ### Slack/Teams通知
@@ -54,7 +56,8 @@ patchgate scan \
   --mode warn \
   --format json \
   --notify-target slack=https://hooks.slack.com/services/... \
-  --notify-target teams=https://outlook.office.com/webhook/...
+  --notify-target teams=https://outlook.office.com/webhook/... \
+  --dead-letter-output artifacts/dead-letter.jsonl
 ```
 
 ### 履歴サマリとトレンド

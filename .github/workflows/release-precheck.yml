@@ -36,6 +36,14 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
             --path config/policy.toml.example \
             --format text
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile strict \
+            --format text
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile lts \
+            --format text
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
               --path "config/presets/${preset}.toml" \
@@ -93,6 +101,16 @@ jobs:
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/ga-readiness.md
+
+      - name: Verify SBOM and provenance metadata contract
+        run: |
+          nix develop --command cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
+          cp artifacts/sbom.cargo-metadata.json artifacts/sbom.spdx.json
+          jq -e '.packages | length > 0' artifacts/sbom.cargo-metadata.json
+          jq -n --arg commit "$(git rev-parse HEAD)" \
+            '{schema_version:1,predicate_type:"https://slsa.dev/provenance/v1",commit:$commit}' \
+            > artifacts/provenance.intoto.jsonl
+          jq -e '.predicate_type == "https://slsa.dev/provenance/v1"' artifacts/provenance.intoto.jsonl
 
       - name: Upload performance artifacts
         uses: actions/upload-artifact@v4

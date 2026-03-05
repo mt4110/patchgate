@@ -221,6 +221,10 @@ struct ScanArgs {
     #[arg(long)]
     webhook_timeout_ms: Option<u64>,
 
+    /// Webhook retry max attempts
+    #[arg(long)]
+    webhook_retry_max_attempts: Option<u8>,
+
     /// Notification target in `kind=url` format (kind: slack|teams|generic)
     #[arg(long = "notify-target")]
     notify_targets: Vec<String>,
@@ -236,6 +240,10 @@ struct ScanArgs {
     /// Notification request timeout (ms)
     #[arg(long)]
     notify_timeout_ms: Option<u64>,
+
+    /// JSONL output path for failed delivery payloads
+    #[arg(long)]
+    dead_letter_output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -689,6 +697,17 @@ struct ScanProfile {
     publish_ms: u128,
     output_ms: u128,
     check_durations_ms: BTreeMap<String, u128>,
+    delivery: DeliveryStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DeliveryStats {
+    webhook_attempted: usize,
+    webhook_succeeded: usize,
+    webhook_failed: usize,
+    notification_attempted: usize,
+    notification_succeeded: usize,
+    notification_failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,6 +746,17 @@ struct AuditLogRecord {
     threshold: Option<u8>,
     changed_files: Option<usize>,
     diagnostic_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterRecord {
+    schema_version: u8,
+    unix_ts: u64,
+    transport: String,
+    endpoint: String,
+    idempotency_key: String,
+    error: String,
+    payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1768,10 +1798,12 @@ fn execute_scan(
         webhook_urls,
         webhook_secret_env,
         webhook_timeout_ms,
+        webhook_retry_max_attempts,
         notify_targets,
         notify_retry_max_attempts,
         notify_retry_backoff_ms,
         notify_timeout_ms,
+        dead_letter_output,
     } = scan;
     let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
@@ -1858,7 +1890,7 @@ fn execute_scan(
         })
     };
 
-    let report = if profile.changed_files > cfg.scope.max_changed_files as usize {
+    let mut report = if profile.changed_files > cfg.scope.max_changed_files as usize {
         match cfg.scope.on_exceed.as_str() {
             "fail_open" => {
                 eprintln!(
@@ -2138,18 +2170,30 @@ fn execute_scan(
         profile.publish_ms = publish_start.elapsed().as_millis();
     }
 
+    let dead_letter_path = dead_letter_output
+        .as_ref()
+        .map(|p| resolve_repo_relative_path(repo_root, p.clone()));
+    let idempotency_key = build_delivery_idempotency_key(telemetry_repo.as_str(), &report);
+
     let webhook_targets = resolve_webhook_targets(&cfg, &webhook_urls);
     if !webhook_targets.is_empty() {
         let timeout_ms = webhook_timeout_ms.unwrap_or(cfg.integrations.webhook.timeout_ms);
         let secret_env = webhook_secret_env
             .as_deref()
             .unwrap_or(cfg.integrations.webhook.secret_env.as_str());
+        let retry_max_attempts = webhook_retry_max_attempts.unwrap_or(3);
         dispatch_signed_webhooks(
             telemetry_repo.as_str(),
             &report,
             &webhook_targets,
-            timeout_ms,
-            secret_env,
+            WebhookDispatchOptions {
+                timeout_ms,
+                retry_max_attempts,
+                secret_env,
+                idempotency_key: idempotency_key.as_str(),
+                dead_letter_path: dead_letter_path.as_deref(),
+            },
+            &mut profile.delivery,
         )
         .map_err(|err| {
             ScanError::with_hint(
@@ -2174,9 +2218,16 @@ fn execute_scan(
             telemetry_repo.as_str(),
             &report,
             notification_targets.as_slice(),
-            notify_retry_max_attempts.unwrap_or(cfg.integrations.notifications.retry_max_attempts),
-            notify_retry_backoff_ms.unwrap_or(cfg.integrations.notifications.retry_backoff_ms),
-            notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
+            NotificationDispatchOptions {
+                retry_max_attempts: notify_retry_max_attempts
+                    .unwrap_or(cfg.integrations.notifications.retry_max_attempts),
+                retry_backoff_ms: notify_retry_backoff_ms
+                    .unwrap_or(cfg.integrations.notifications.retry_backoff_ms),
+                timeout_ms: notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
+                idempotency_key: idempotency_key.as_str(),
+                dead_letter_path: dead_letter_path.as_deref(),
+            },
+            &mut profile.delivery,
         )
         .map_err(|err| {
             ScanError::with_hint(
@@ -2187,6 +2238,20 @@ fn execute_scan(
             )
         })?;
     }
+
+    if profile.delivery.webhook_failed > 0 || profile.delivery.notification_failed > 0 {
+        report.diagnostic_hints.push(format!(
+            "delivery failures: webhook_failed={}, notification_failed={}",
+            profile.delivery.webhook_failed, profile.delivery.notification_failed
+        ));
+    }
+    report.diagnostic_hints.push(format!(
+        "delivery stats: webhook {}/{}, notification {}/{}",
+        profile.delivery.webhook_succeeded,
+        profile.delivery.webhook_attempted,
+        profile.delivery.notification_succeeded,
+        profile.delivery.notification_attempted
+    ));
 
     let output_start = Instant::now();
     match opts.format.as_str() {
@@ -2841,16 +2906,69 @@ fn resolve_notification_targets(
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct WebhookDispatchOptions<'a> {
+    timeout_ms: u64,
+    retry_max_attempts: u8,
+    secret_env: &'a str,
+    idempotency_key: &'a str,
+    dead_letter_path: Option<&'a Path>,
+}
+
+struct NotificationDispatchOptions<'a> {
+    retry_max_attempts: u8,
+    retry_backoff_ms: u64,
+    timeout_ms: u64,
+    idempotency_key: &'a str,
+    dead_letter_path: Option<&'a Path>,
+}
+
+fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(telemetry_repo.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.fingerprint.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.mode.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.scope.as_bytes());
+    let digest = hasher.finalize();
+    format!("pgv1-{}", encode_hex(digest.as_slice()))
+}
+
+fn append_dead_letter(
+    path: Option<&Path>,
+    transport: &str,
+    endpoint: &str,
+    idempotency_key: &str,
+    error: &str,
+    payload: &Value,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let record = DeadLetterRecord {
+        schema_version: 1,
+        unix_ts: current_unix_ts(),
+        transport: transport.to_string(),
+        endpoint: endpoint.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        error: error.to_string(),
+        payload: payload.clone(),
+    };
+    append_jsonl(path, &record).context("failed to append dead-letter record")
+}
+
 fn dispatch_signed_webhooks(
     telemetry_repo: &str,
     report: &Report,
     urls: &[String],
-    timeout_ms: u64,
-    secret_env: &str,
+    options: WebhookDispatchOptions<'_>,
+    delivery: &mut DeliveryStats,
 ) -> Result<()> {
     if urls.is_empty() {
         return Ok(());
     }
+    let attempts = options.retry_max_attempts.max(1);
     let sanitized_report = sanitize_report_for_external(report)?;
     let unix_ts = current_unix_ts();
     let envelope = WebhookEnvelope {
@@ -2859,14 +2977,17 @@ fn dispatch_signed_webhooks(
         repo: telemetry_repo,
         report: &sanitized_report,
     };
+    let payload_value = serde_json::to_value(&envelope)?;
     let body = mask_sensitive(serde_json::to_string(&envelope)?.as_str()).into_bytes();
     let timestamp = unix_ts.to_string();
-    let signature = resolve_webhook_signature(secret_env, timestamp.as_bytes(), body.as_slice())?;
+    let signature =
+        resolve_webhook_signature(options.secret_env, timestamp.as_bytes(), body.as_slice())?;
     let client = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(Duration::from_millis(options.timeout_ms))
         .build()
         .context("failed to build webhook client")?;
     for url in urls {
+        delivery.webhook_attempted += 1;
         let safe_url = redacted_endpoint(url.as_str());
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -2882,18 +3003,55 @@ fn dispatch_signed_webhooks(
             HeaderName::from_static("x-patchgate-signature"),
             HeaderValue::from_str(signature.as_str())?,
         );
-        let response = client
-            .post(url)
-            .headers(headers)
-            .body(body.clone())
-            .send()
-            .with_context(|| format!("webhook request failed: {safe_url}"))?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "webhook endpoint returned {} for {}",
-                response.status(),
-                safe_url
-            ));
+        headers.insert(
+            HeaderName::from_static("x-patchgate-idempotency-key"),
+            HeaderValue::from_str(options.idempotency_key)?,
+        );
+
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=attempts {
+            let response = client
+                .post(url)
+                .headers(headers.clone())
+                .body(body.clone())
+                .send();
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    delivery.webhook_succeeded += 1;
+                    last_error = None;
+                    break;
+                }
+                Ok(resp) => {
+                    last_error = Some(anyhow!(
+                        "webhook endpoint returned {} for {}",
+                        resp.status(),
+                        safe_url
+                    ));
+                }
+                Err(err) => {
+                    last_error =
+                        Some(anyhow!(err).context(format!("webhook request failed: {safe_url}")));
+                }
+            }
+            if attempt < attempts {
+                let delay = 250u64.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        if let Some(err) = last_error {
+            delivery.webhook_failed += 1;
+            let error_message = format!("{err:#}");
+            if let Err(dead_err) = append_dead_letter(
+                options.dead_letter_path,
+                "webhook",
+                safe_url.as_str(),
+                options.idempotency_key,
+                error_message.as_str(),
+                &payload_value,
+            ) {
+                eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
+            }
+            return Err(err);
         }
     }
     Ok(())
@@ -2914,19 +3072,25 @@ fn dispatch_notifications(
     telemetry_repo: &str,
     report: &Report,
     targets: &[ResolvedNotificationTarget],
-    retry_max_attempts: u8,
-    retry_backoff_ms: u64,
-    timeout_ms: u64,
+    options: NotificationDispatchOptions<'_>,
+    delivery: &mut DeliveryStats,
 ) -> Result<()> {
-    let attempts = retry_max_attempts.max(1);
+    let attempts = options.retry_max_attempts.max(1);
     let client = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(Duration::from_millis(options.timeout_ms))
         .build()
         .context("failed to build notifications client")?;
 
     for target in targets {
+        delivery.notification_attempted += 1;
         let safe_url = redacted_endpoint(target.url.as_str());
-        let payload = notification_payload(target.kind, telemetry_repo, report)?;
+        let mut payload = notification_payload(target.kind, telemetry_repo, report)?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "idempotency_key".to_string(),
+                Value::String(options.idempotency_key.to_string()),
+            );
+        }
         let body = mask_sensitive(serde_json::to_string(&payload)?.as_str()).into_bytes();
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
@@ -2956,14 +3120,28 @@ fn dispatch_notifications(
                 }
             }
             if attempt < attempts {
-                let delay =
-                    retry_backoff_ms.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                let delay = options
+                    .retry_backoff_ms
+                    .saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
                 thread::sleep(Duration::from_millis(delay.min(10_000)));
             }
         }
         if let Some(err) = last_error {
+            delivery.notification_failed += 1;
+            let error_message = format!("{err:#}");
+            if let Err(dead_err) = append_dead_letter(
+                options.dead_letter_path,
+                "notification",
+                safe_url.as_str(),
+                options.idempotency_key,
+                error_message.as_str(),
+                &payload,
+            ) {
+                eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
+            }
             return Err(err);
         }
+        delivery.notification_succeeded += 1;
     }
     Ok(())
 }
@@ -3793,20 +3971,21 @@ mod tests {
     use patchgate_github::PublishAuth;
 
     use super::{
-        append_scan_failure_records, apply_changed_file_overrides, apply_threshold_override,
-        build_cache_key, build_history_summary, build_history_trend,
-        changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
-        gate_exit_code, is_likely_cache_corruption, notification_payload, parse_mode,
-        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
-        recover_cache_db, redacted_endpoint, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_plugin_init, run_policy_lint,
-        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
-        FailureCode, NotificationKind, OptionSource, PluginInitArgs, PolicyExitCode,
-        PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy,
-        ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
+        append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
+        apply_threshold_override, build_cache_key, build_delivery_idempotency_key,
+        build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
+        detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
+        is_likely_cache_corruption, notification_payload, parse_mode, parse_policy_preset,
+        parse_scope, pr_head_sha_from_event_payload, pr_number_from_event_payload,
+        pr_number_from_ref, publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
+        render_github_comment, resolve_audit_actor, resolve_ci_provider,
+        resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
+        resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_plugin_init, run_policy_lint, run_policy_verify_v1,
+        sign_webhook_payload, sorted_findings_for_comment, CiProvider, FailureCode,
+        NotificationKind, OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs,
+        PolicyVerifyV1Args, PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs,
+        ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3898,10 +4077,12 @@ mod tests {
             webhook_urls: Vec::new(),
             webhook_secret_env: None,
             webhook_timeout_ms: None,
+            webhook_retry_max_attempts: None,
             notify_targets: Vec::new(),
             notify_retry_max_attempts: None,
             notify_retry_backoff_ms: None,
             notify_timeout_ms: None,
+            dead_letter_output: None,
         }
     }
 
@@ -5081,6 +5262,53 @@ security_sla_hours = 72
             sign_webhook_payload(b"secret", b"1700000000", br#"{"ok":true}"#).expect("signature");
         assert!(sig.starts_with("sha256="));
         assert_eq!(sig.len(), "sha256=".len() + 64);
+    }
+
+    #[test]
+    fn delivery_idempotency_key_is_stable_for_same_report() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let key1 = build_delivery_idempotency_key("example/repo", &report);
+        let key2 = build_delivery_idempotency_key("example/repo", &report);
+        assert_eq!(key1, key2);
+        assert!(key1.starts_with("pgv1-"));
+    }
+
+    #[test]
+    fn append_dead_letter_writes_jsonl_record() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-dead-letter-{seq}"));
+        fs::create_dir_all(&dir).expect("create dead-letter dir");
+        let path = dir.join("dead-letter.jsonl");
+        append_dead_letter(
+            Some(path.as_path()),
+            "webhook",
+            "https://hooks.example.com/***",
+            "pgv1-key",
+            "test error",
+            &serde_json::json!({ "event": "scan.completed" }),
+        )
+        .expect("append dead-letter");
+        let content = fs::read_to_string(&path).expect("read dead-letter file");
+        assert!(content.contains("\"transport\":\"webhook\""));
+        assert!(content.contains("\"idempotency_key\":\"pgv1-key\""));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

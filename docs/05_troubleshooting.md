@@ -35,6 +35,7 @@
 - webhook URL 到達不可
 - 署名secret未設定 (`--webhook-secret-env`)
 - タイムアウト値 (`--webhook-timeout-ms`) を調整
+- 再送後も失敗する場合は `--dead-letter-output` の失敗payloadを確認
 
 ### `PG-NOT-001`
 
