@@ -816,7 +816,9 @@ fn percentile_u128(sorted_values: &[u128], percentile: usize) -> u128 {
     if sorted_values.is_empty() {
         return 0;
     }
-    let idx = (sorted_values.len() - 1) * percentile / 100;
+    let len = sorted_values.len();
+    let rank = len.saturating_mul(percentile).div_ceil(100).max(1);
+    let idx = rank.saturating_sub(1).min(len - 1);
     sorted_values[idx]
 }
 
@@ -1172,8 +1174,9 @@ mod tests {
 
     use super::{
         aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
-        checklist_box, load_jsonl_records, run_ga_readiness, validate_workload_identity,
-        AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
+        checklist_box, load_jsonl_records, percentile_u128, run_ga_readiness,
+        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions,
+        OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -1321,6 +1324,12 @@ mod tests {
     fn checklist_box_marks_condition() {
         assert_eq!(checklist_box(true), "[x]");
         assert_eq!(checklist_box(false), "[ ]");
+    }
+
+    #[test]
+    fn percentile_uses_ceiling_rank_for_small_samples() {
+        let values = vec![100u128, 200u128];
+        assert_eq!(percentile_u128(&values, 95), 200);
     }
 
     #[test]

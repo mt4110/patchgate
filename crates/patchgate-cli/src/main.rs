@@ -2461,6 +2461,7 @@ fn publish_generic_ci_payload(
     markdown: &str,
     output_path: Option<&Path>,
 ) -> Result<()> {
+    let sanitized_report = sanitize_report_for_external(report)?;
     let payload = GenericCiPublishPayload {
         schema_version: 1,
         provider: "generic".to_string(),
@@ -2474,10 +2475,11 @@ fn publish_generic_ci_payload(
             scope: report.scope.clone(),
             findings: report.findings.len(),
         },
-        report: report.clone(),
+        report: sanitized_report,
         markdown: markdown.to_string(),
     };
     let pretty = serde_json::to_string_pretty(&payload)?;
+    let pretty = mask_sensitive(pretty.as_str());
     let path = output_path.ok_or_else(|| {
         anyhow!(
             "generic CI publish requires output path; set --ci-generic-output or integrations.ci.generic_output_path"
@@ -2553,14 +2555,15 @@ fn dispatch_signed_webhooks(
     if urls.is_empty() {
         return Ok(());
     }
+    let sanitized_report = sanitize_report_for_external(report)?;
     let unix_ts = current_unix_ts();
     let envelope = WebhookEnvelope {
         event: "scan.completed",
         unix_ts,
         repo: telemetry_repo,
-        report,
+        report: &sanitized_report,
     };
-    let body = serde_json::to_vec(&envelope)?;
+    let body = mask_sensitive(serde_json::to_string(&envelope)?.as_str()).into_bytes();
     let timestamp = unix_ts.to_string();
     let signature = resolve_webhook_signature(secret_env, timestamp.as_bytes(), body.as_slice())?;
     let client = Client::builder()
@@ -2628,7 +2631,7 @@ fn dispatch_notifications(
     for target in targets {
         let safe_url = redacted_endpoint(target.url.as_str());
         let payload = notification_payload(target.kind, telemetry_repo, report)?;
-        let body = serde_json::to_vec(&payload)?;
+        let body = mask_sensitive(serde_json::to_string(&payload)?.as_str()).into_bytes();
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
             let response = client
@@ -2690,7 +2693,6 @@ fn notification_payload(
                     ]
                 }
             ],
-            "patchgate": report,
         }),
         NotificationKind::Teams => serde_json::json!({
             "@type": "MessageCard",
@@ -2705,15 +2707,47 @@ fn notification_payload(
                     ]
                 }
             ],
-            "patchgate": report,
         }),
         NotificationKind::Generic => serde_json::json!({
             "event": "scan.completed.notification",
             "repo": telemetry_repo,
-            "report": report,
+            "summary": {
+                "score": report.score,
+                "threshold": report.threshold,
+                "should_fail": report.should_fail,
+                "mode": report.mode,
+                "scope": report.scope,
+                "review_priority": format!("{:?}", report.review_priority),
+                "findings": report.findings.len(),
+            },
         }),
     };
     Ok(payload)
+}
+
+fn sanitize_report_for_external(report: &Report) -> Result<Report> {
+    let mut value = serde_json::to_value(report).context("failed to encode report")?;
+    mask_json_string_values(&mut value);
+    serde_json::from_value(value).context("failed to decode sanitized report")
+}
+
+fn mask_json_string_values(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            *s = mask_sensitive(s.as_str());
+        }
+        Value::Array(values) => {
+            for item in values {
+                mask_json_string_values(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                mask_json_string_values(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 fn sign_webhook_payload(secret: &[u8], timestamp: &[u8], body: &[u8]) -> Result<String> {
@@ -4740,6 +4774,50 @@ allow_legacy_config_names = false
     }
 
     #[test]
+    fn notification_payload_does_not_embed_full_report() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let slack = notification_payload(NotificationKind::Slack, "example/repo", &report)
+            .expect("slack payload");
+        assert!(
+            slack.get("patchgate").is_none(),
+            "slack payload must avoid full report embedding"
+        );
+        let teams = notification_payload(NotificationKind::Teams, "example/repo", &report)
+            .expect("teams payload");
+        assert!(
+            teams.get("patchgate").is_none(),
+            "teams payload must avoid full report embedding"
+        );
+        let generic = notification_payload(NotificationKind::Generic, "example/repo", &report)
+            .expect("generic payload");
+        assert!(
+            generic.get("report").is_none(),
+            "generic payload must avoid full report embedding"
+        );
+        assert!(
+            generic.get("summary").is_some(),
+            "generic payload must include bounded summary"
+        );
+    }
+
+    #[test]
     fn publish_generic_ci_payload_requires_output_path() {
         let report = Report::new(
             vec![],
@@ -4764,6 +4842,47 @@ allow_legacy_config_names = false
             .expect_err("missing output path must fail");
         let message = format!("{err:#}");
         assert!(message.contains("generic CI publish requires output path"));
+    }
+
+    #[test]
+    fn publish_generic_ci_payload_masks_sensitive_report_strings() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-generic-mask-{seq}"));
+        fs::create_dir_all(&dir).expect("create output dir");
+        let output = dir.join("payload.json");
+
+        let mut report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        report
+            .diagnostic_hints
+            .push("bearer super-secret-token".to_string());
+
+        publish_generic_ci_payload("example/repo", &report, "md", Some(output.as_path()))
+            .expect("publish generic payload");
+        let written = fs::read_to_string(output).expect("read payload");
+        assert!(
+            !written.contains("super-secret-token"),
+            "payload must not contain raw bearer token"
+        );
+        assert!(written.contains("bearer ***"), "payload should be masked");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
