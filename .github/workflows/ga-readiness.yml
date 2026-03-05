@@ -29,6 +29,20 @@ jobs:
           cargo run -p patchgate-cli -- policy verify-v1 \
             --path config/policy.toml.example \
             --format text
+          cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile strict \
+            --format text
+          cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile lts \
+            --format text
+
+      - name: Build verify-v1 calibration report
+        run: |
+          cargo run -p xtask -- ops verify-v1-calibrate \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --output artifacts/verify-v1-calibration.md
 
       - name: Build GA readiness report
         run: |
@@ -37,7 +51,21 @@ jobs:
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/ga-readiness.md
 
+      - name: Build v1.1 readiness summary
+        run: |
+          mkdir -p artifacts
+          cat > artifacts/v1.1-readiness.md <<'EOF'
+          # v1.1 Readiness
+
+          - verify-v1 profiles: executed (standard/strict/lts)
+          - calibration report: generated
+          - ga-readiness report: generated
+          EOF
+
       - uses: actions/upload-artifact@v4
         with:
           name: ga-readiness
-          path: artifacts/ga-readiness.md
+          path: |
+            artifacts/ga-readiness.md
+            artifacts/verify-v1-calibration.md
+            artifacts/v1.1-readiness.md

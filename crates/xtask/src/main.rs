@@ -33,6 +33,7 @@ enum OpsSubcommand {
     AuditReport,
     SloReport,
     GaReadiness,
+    VerifyV1Calibrate,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,16 @@ struct SloReport {
     p95_ok: bool,
     false_positive_ok: bool,
     ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifyV1Calibration {
+    runs: usize,
+    availability_pct: f64,
+    gate_failure_rate_pct: f64,
+    execution_error_rate_pct: f64,
+    recommended_profile: String,
+    next_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,7 +227,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH"
     );
 }
 
@@ -332,13 +343,14 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `slo-report`, or `ga-readiness`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `slo-report`, `ga-readiness`, or `verify-v1-calibrate`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
         "audit-report" => OpsSubcommand::AuditReport,
         "slo-report" => OpsSubcommand::SloReport,
         "ga-readiness" => OpsSubcommand::GaReadiness,
+        "verify-v1-calibrate" => OpsSubcommand::VerifyV1Calibrate,
         other => bail!("unsupported ops subcommand `{other}`"),
     };
     let mut metrics_input = PathBuf::from("artifacts/scan-metrics.jsonl");
@@ -424,6 +436,7 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
         OpsSubcommand::AuditReport => run_audit_report(options),
         OpsSubcommand::SloReport => run_slo_report(options),
         OpsSubcommand::GaReadiness => run_ga_readiness(options),
+        OpsSubcommand::VerifyV1Calibrate => run_verify_v1_calibrate(options),
     }
 }
 
@@ -750,6 +763,109 @@ fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_verify_v1_calibrate(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let calibration = build_verify_v1_calibration(&metrics);
+
+    let mut md = String::new();
+    md.push_str("# verify-v1 Calibration\n\n");
+    md.push_str(&format!("- runs: {}\n", calibration.runs));
+    md.push_str(&format!(
+        "- availability_pct: {:.2}%\n",
+        calibration.availability_pct
+    ));
+    md.push_str(&format!(
+        "- gate_failure_rate_pct: {:.2}%\n",
+        calibration.gate_failure_rate_pct
+    ));
+    md.push_str(&format!(
+        "- execution_error_rate_pct: {:.2}%\n",
+        calibration.execution_error_rate_pct
+    ));
+    md.push_str(&format!(
+        "- recommended_profile: `{}`\n",
+        calibration.recommended_profile
+    ));
+    md.push_str("\n## Next Actions\n");
+    if calibration.next_actions.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for action in &calibration.next_actions {
+            md.push_str(&format!("- {action}\n"));
+        }
+    }
+    md.push_str("\n## Suggested command\n");
+    md.push_str(&format!(
+        "- `patchgate policy verify-v1 --readiness-profile {} --format text`\n",
+        calibration.recommended_profile
+    ));
+
+    write_output(&options.output, md.as_str())?;
+    println!(
+        "verify-v1 calibration report written: {}",
+        options.output.display()
+    );
+    Ok(())
+}
+
+fn build_verify_v1_calibration(metrics: &[MetricLogRecord]) -> VerifyV1Calibration {
+    let runs = metrics.len();
+    if runs == 0 {
+        return VerifyV1Calibration {
+            runs: 0,
+            availability_pct: 0.0,
+            gate_failure_rate_pct: 0.0,
+            execution_error_rate_pct: 0.0,
+            recommended_profile: "standard".to_string(),
+            next_actions: vec!["collect at least one metrics run before calibration".to_string()],
+        };
+    }
+
+    let execution_errors = metrics.iter().filter(|m| m.failure_code.is_some()).count();
+    let successful = runs.saturating_sub(execution_errors);
+    let gate_failures = metrics
+        .iter()
+        .filter(|m| m.should_fail.unwrap_or(false))
+        .count();
+    let availability_pct = (successful as f64 / runs as f64) * 100.0;
+    let gate_failure_rate_pct = (gate_failures as f64 / runs as f64) * 100.0;
+    let execution_error_rate_pct = (execution_errors as f64 / runs as f64) * 100.0;
+
+    let mut next_actions = Vec::new();
+    let recommended_profile = if availability_pct >= 99.5
+        && gate_failure_rate_pct <= 3.0
+        && execution_error_rate_pct <= 0.5
+    {
+        "lts"
+    } else if availability_pct >= 99.0
+        && gate_failure_rate_pct <= 5.0
+        && execution_error_rate_pct <= 1.0
+    {
+        "strict"
+    } else {
+        if availability_pct < 99.0 {
+            next_actions.push("improve run stability to availability >= 99%".to_string());
+        }
+        if gate_failure_rate_pct > 5.0 {
+            next_actions
+                .push("reduce gate failure rate below 5% by tuning rules/threshold".to_string());
+        }
+        if execution_error_rate_pct > 1.0 {
+            next_actions.push("reduce execution errors below 1%".to_string());
+        }
+        "standard"
+    };
+
+    VerifyV1Calibration {
+        runs,
+        availability_pct,
+        gate_failure_rate_pct,
+        execution_error_rate_pct,
+        recommended_profile: recommended_profile.to_string(),
+        next_actions,
+    }
 }
 
 fn checklist_box(condition: bool) -> &'static str {
@@ -1173,10 +1289,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        aggregate_failure_code_counts, average_duration_for_summary, canonical_repo_path,
-        checklist_box, load_jsonl_records, percentile_u128, run_ga_readiness,
-        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions,
-        OpsSubcommand, TEMP_SEQ,
+        aggregate_failure_code_counts, average_duration_for_summary,
+        build_verify_v1_calibration, canonical_repo_path, checklist_box, load_jsonl_records,
+        percentile_u128, run_ga_readiness, validate_workload_identity, AuditLogRecord,
+        BenchSample, MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -1362,5 +1478,33 @@ mod tests {
         assert!(markdown.contains("- [ ] Audit logs present: 0 entries"));
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn verify_v1_calibration_recommends_lts_for_high_stability() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 1,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 10,
+                score: Some(95),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+            MetricLogRecord {
+                unix_ts: 2,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 12,
+                score: Some(93),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+        ];
+        let calibration = build_verify_v1_calibration(&metrics);
+        assert_eq!(calibration.recommended_profile, "lts");
     }
 }
