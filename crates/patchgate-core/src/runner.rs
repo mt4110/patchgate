@@ -356,13 +356,32 @@ fn execute_plugin(
     let timeout = Duration::from_millis(plugin.timeout_ms);
 
     let start = Instant::now();
-    let mut command = Command::new(plugin.command.as_str());
-    command.args(&plugin.args);
+    let mut command = match sandbox_profile {
+        "isolated" => match build_isolated_plugin_command(policy, ctx, plugin) {
+            Ok(command) => command,
+            Err(message) => {
+                return Ok(PluginInvocation {
+                    plugin_id: plugin.id.clone(),
+                    status: PluginInvocationStatus::Error,
+                    duration_ms: 0,
+                    sandbox_profile: sandbox_profile.to_string(),
+                    findings: Vec::new(),
+                    diagnostics: vec![message.clone()],
+                    error: Some(message),
+                });
+            }
+        },
+        _ => {
+            let mut command = Command::new(plugin.command.as_str());
+            command.args(&plugin.args);
+            command
+        }
+    };
     command.current_dir(&ctx.repo_root);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    if sandbox_profile == "restricted" {
+    if sandbox_profile == "restricted" || sandbox_profile == "isolated" {
         command.env_clear();
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
@@ -528,6 +547,65 @@ fn execute_plugin(
         diagnostics,
         error: None,
     })
+}
+
+fn build_isolated_plugin_command(
+    policy: &Config,
+    ctx: &Context,
+    plugin: &patchgate_config::PluginEntry,
+) -> std::result::Result<Command, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !command_exists("bwrap") {
+            return Err(
+                "sandbox profile `isolated` requires `bwrap` (bubblewrap) on Linux".to_string(),
+            );
+        }
+        let repo = ctx.repo_root.to_string_lossy().to_string();
+        let mut command = Command::new("bwrap");
+        command
+            .arg("--die-with-parent")
+            .arg("--new-session")
+            .arg("--unshare-user")
+            .arg("--unshare-pid")
+            .arg("--unshare-ipc")
+            .arg("--unshare-uts")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("--ro-bind")
+            .arg(repo.as_str())
+            .arg(repo.as_str())
+            .arg("--chdir")
+            .arg(repo.as_str());
+        if policy.plugins.sandbox.allow_network {
+            command.arg("--share-net");
+        } else {
+            command.arg("--unshare-net");
+        }
+        command.arg("--").arg(plugin.command.as_str());
+        command.args(&plugin.args);
+        Ok(command)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = policy;
+        let _ = ctx;
+        let _ = plugin;
+        Err("sandbox profile `isolated` is currently supported only on Linux".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

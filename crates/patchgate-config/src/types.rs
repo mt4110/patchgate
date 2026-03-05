@@ -690,7 +690,7 @@ fn default_plugin_fail_mode() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginSandboxConfig {
     #[serde(default = "default_plugin_sandbox_profile")]
-    pub profile: String, // "none" | "restricted"
+    pub profile: String, // "none" | "restricted" | "isolated"
     #[serde(default = "default_false")]
     pub allow_network: bool,
     #[serde(default)]

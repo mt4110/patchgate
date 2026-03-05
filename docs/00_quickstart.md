@@ -30,6 +30,7 @@ patchgate scan --mode enforce --format json
 
 ```bash
 patchgate policy verify-v1 --path policy.toml --format text
+patchgate policy verify-v1 --path policy.toml --readiness-profile strict --format text
 ```
 
 ## 6) Optional integrations

@@ -375,6 +375,10 @@ struct PolicyVerifyV1Args {
     /// Output format: text|json
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Readiness profile: standard|strict|lts
+    #[arg(long, default_value = "standard")]
+    readiness_profile: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1401,13 +1405,43 @@ struct V1ReadinessReport {
     ready: bool,
     policy_path: String,
     policy_version: u32,
+    readiness_profile: String,
     rc_frozen: bool,
     strict_compatibility: bool,
     plugins_enabled: bool,
     plugin_entries: usize,
     plugin_sandbox_profile: String,
+    lts_active: bool,
+    lts_security_sla_hours: u16,
     warnings: Vec<String>,
     next_actions: Vec<String>,
+    autofix_suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessProfile {
+    Standard,
+    Strict,
+    Lts,
+}
+
+impl ReadinessProfile {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "standard" => Ok(Self::Standard),
+            "strict" => Ok(Self::Strict),
+            "lts" => Ok(Self::Lts),
+            other => Err(format!("`{other}` (expected: standard|strict|lts)")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+            Self::Lts => "lts",
+        }
+    }
 }
 
 fn run_policy_verify_v1(
@@ -1430,6 +1464,13 @@ fn run_policy_verify_v1(
             return PolicyExitCode::ReadOrParse;
         }
     };
+    let readiness_profile = match ReadinessProfile::parse(args.readiness_profile.as_str()) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v1 error: invalid --readiness-profile: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
 
     let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
         Ok(loaded) => loaded,
@@ -1441,6 +1482,7 @@ fn run_policy_verify_v1(
 
     let mut warnings = loaded.compatibility_warnings.clone();
     let mut next_actions = Vec::new();
+    let mut autofix_suggestions = Vec::new();
     let cfg = loaded.config;
 
     if policy_path
@@ -1457,24 +1499,67 @@ fn run_policy_verify_v1(
         warnings.push("compatibility.v1.rc_frozen=false".to_string());
         next_actions
             .push("Set `compatibility.v1.rc_frozen = true` after RC review freeze.".to_string());
+        autofix_suggestions.push("compatibility.v1.rc_frozen = true".to_string());
     }
     if cfg.compatibility.v1.allow_legacy_config_names {
         warnings.push("compatibility.v1.allow_legacy_config_names=true".to_string());
         next_actions.push(
             "Set `compatibility.v1.allow_legacy_config_names = false` before GA.".to_string(),
         );
+        autofix_suggestions.push("compatibility.v1.allow_legacy_config_names = false".to_string());
     }
     if cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none" {
         warnings.push("plugins enabled with sandbox.profile=none".to_string());
         next_actions.push(
             "Use `plugins.sandbox.profile = \"restricted\"` for v1 secure baseline.".to_string(),
         );
+        autofix_suggestions.push("plugins.sandbox.profile = \"restricted\"".to_string());
+    }
+    if cfg.plugins.enabled
+        && matches!(
+            readiness_profile,
+            ReadinessProfile::Strict | ReadinessProfile::Lts
+        )
+        && cfg.plugins.sandbox.profile != "isolated"
+    {
+        warnings.push(
+            "strict readiness requires plugins.sandbox.profile=isolated when plugins are enabled"
+                .to_string(),
+        );
+        next_actions.push(
+            "Set `plugins.sandbox.profile = \"isolated\"` and verify `bwrap` is available."
+                .to_string(),
+        );
+        autofix_suggestions.push("plugins.sandbox.profile = \"isolated\"".to_string());
+    }
+    if matches!(readiness_profile, ReadinessProfile::Lts) && !cfg.release.lts.active {
+        warnings.push("lts readiness requires release.lts.active=true".to_string());
+        next_actions
+            .push("Enable `[release.lts] active = true` before LTS readiness gate.".to_string());
+        autofix_suggestions.push("release.lts.active = true".to_string());
+    }
+    if matches!(readiness_profile, ReadinessProfile::Lts) && cfg.release.lts.security_sla_hours > 72
+    {
+        warnings.push("lts readiness expects release.lts.security_sla_hours <= 72".to_string());
+        next_actions.push(
+            "Set `release.lts.security_sla_hours` to 72 or lower for default LTS policy."
+                .to_string(),
+        );
+        autofix_suggestions.push("release.lts.security_sla_hours = 72".to_string());
     }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
         && cfg.compatibility.v1.rc_frozen
         && !cfg.compatibility.v1.allow_legacy_config_names
-        && !(cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none");
+        && !(cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none")
+        && (!cfg.plugins.enabled
+            || !matches!(
+                readiness_profile,
+                ReadinessProfile::Strict | ReadinessProfile::Lts
+            )
+            || cfg.plugins.sandbox.profile == "isolated")
+        && (!matches!(readiness_profile, ReadinessProfile::Lts)
+            || (cfg.release.lts.active && cfg.release.lts.security_sla_hours <= 72));
     if ready {
         next_actions.push("v1 readiness checks passed.".to_string());
     }
@@ -1483,13 +1568,17 @@ fn run_policy_verify_v1(
         ready,
         policy_path: policy_path.display().to_string(),
         policy_version: cfg.policy_version,
+        readiness_profile: readiness_profile.as_str().to_string(),
         rc_frozen: cfg.compatibility.v1.rc_frozen,
         strict_compatibility: !cfg.compatibility.v1.allow_legacy_config_names,
         plugins_enabled: cfg.plugins.enabled,
         plugin_entries: cfg.plugins.entries.len(),
         plugin_sandbox_profile: cfg.plugins.sandbox.profile.clone(),
+        lts_active: cfg.release.lts.active,
+        lts_security_sla_hours: cfg.release.lts.security_sla_hours,
         warnings,
         next_actions,
+        autofix_suggestions,
     };
 
     match args.format.as_str() {
@@ -1505,6 +1594,7 @@ fn run_policy_verify_v1(
             println!("- ready: {}", report.ready);
             println!("- policy_path: {}", report.policy_path);
             println!("- policy_version: {}", report.policy_version);
+            println!("- readiness_profile: {}", report.readiness_profile);
             println!("- rc_frozen: {}", report.rc_frozen);
             println!("- strict_compatibility: {}", report.strict_compatibility);
             println!("- plugins_enabled: {}", report.plugins_enabled);
@@ -1512,6 +1602,11 @@ fn run_policy_verify_v1(
             println!(
                 "- plugin_sandbox_profile: {}",
                 report.plugin_sandbox_profile
+            );
+            println!("- lts_active: {}", report.lts_active);
+            println!(
+                "- lts_security_sla_hours: {}",
+                report.lts_security_sla_hours
             );
             if report.warnings.is_empty() {
                 println!("- warnings: none");
@@ -1524,6 +1619,14 @@ fn run_policy_verify_v1(
             println!("- next_actions:");
             for action in &report.next_actions {
                 println!("  - {action}");
+            }
+            if report.autofix_suggestions.is_empty() {
+                println!("- autofix_suggestions: none");
+            } else {
+                println!("- autofix_suggestions:");
+                for suggestion in &report.autofix_suggestions {
+                    println!("  - {suggestion}");
+                }
             }
         }
         other => {
@@ -4835,6 +4938,7 @@ allow_legacy_config_names = true
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -4868,9 +4972,85 @@ allow_legacy_config_names = false
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_strict_requires_isolated_sandbox_when_plugins_enabled() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-strict-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "restricted"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_lts_requires_lts_active() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-lts-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[release.lts]
+active = false
+security_sla_hours = 72
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "lts".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
 
         let _ = fs::remove_dir_all(repo_root);
     }

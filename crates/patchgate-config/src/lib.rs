@@ -361,7 +361,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
     validate_enum(
         "plugins.sandbox.profile",
         cfg.plugins.sandbox.profile.as_str(),
-        &["none", "restricted"],
+        &["none", "restricted", "isolated"],
     )?;
     validate_enum(
         "integrations.ci.provider",
@@ -1283,6 +1283,21 @@ mode = "skip"
             other => panic!("unexpected error: {other}"),
         }
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_accepts_isolated_plugin_sandbox_profile() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.sandbox]
+profile = "isolated"
+"#,
+        );
+
+        let loaded = load_from_typed(&path).expect("isolated profile should pass");
+        assert_eq!(loaded.plugins.sandbox.profile, "isolated");
         let _ = fs::remove_file(path);
     }
 

@@ -172,7 +172,7 @@ enabled = false
 entries = []
 
 [plugins.sandbox]
-profile = "restricted" # none | restricted
+profile = "restricted" # none | restricted | isolated (Linux + bwrap)
 allow_network = false
 env_allowlist = []
 max_stdout_kib = 256

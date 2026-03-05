@@ -20,6 +20,7 @@
 - 実行結果は `Report.plugin_invocations[]` に保存
 - sandbox制約:
   - `plugins.sandbox.profile = restricted` で最小環境変数のみ許可
+  - `plugins.sandbox.profile = isolated` で Linux `bwrap` によるOS隔離実行
   - `timeout_ms` と `max_stdout_kib` を強制
   - `fail_mode = fail_open|fail_closed`
 
@@ -60,7 +61,7 @@
 
 ## v1 compatibility boundary (Phase91-93)
 
-- `patchgate policy verify-v1` で移行準備を検証
+- `patchgate policy verify-v1 --readiness-profile <standard|strict|lts>` で移行準備を検証
 - v1 GA前提:
   - `policy_version = 2`
   - `compatibility.v1.rc_frozen = true`

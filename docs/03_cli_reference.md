@@ -90,6 +90,7 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
+- `--readiness-profile <standard|strict|lts>`
 - v1 RC/GA前提の移行準備状態を検証
 
 ### `patchgate plugin init`
