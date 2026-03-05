@@ -14,6 +14,14 @@ patchgate scan \
 
 `policy.toml` 側で `plugins.enabled = true` と `plugins.entries[]` を設定します。
 
+### Pluginテンプレートを生成
+
+```bash
+patchgate plugin init --lang python --plugin-id sample --output ./plugins/sample
+patchgate plugin init --lang node --plugin-id sample-node --output ./plugins/sample-node
+patchgate plugin init --lang rust --plugin-id sample-rust --output ./plugins/sample-rust
+```
+
 ### Generic CI provider payloadを出力
 
 ```bash

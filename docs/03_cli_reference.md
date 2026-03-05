@@ -92,6 +92,14 @@ Provider/Webhook/Notification options:
 - `--format <text|json>`
 - v1 RC/GA前提の移行準備状態を検証
 
+### `patchgate plugin init`
+
+- `--lang <python|node|rust>`
+- `--plugin-id <id>`
+- `--output <path>`
+- `--force`
+- `patchgate.plugin.v1` 準拠の最小pluginテンプレートを生成
+
 ## JSON contract (`scan --format json`)
 
 主要キー:

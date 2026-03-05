@@ -40,7 +40,9 @@ patchgate policy verify-v1 --path policy.toml --format text
 
 ## 7) SDK template
 
-- `sdk/templates/python-plugin` をコピーして plugin を作成
+- `patchgate plugin init --lang python --plugin-id sample --output ./sample-plugin`
+- `patchgate plugin init --lang node --plugin-id sample-node --output ./sample-node-plugin`
+- `patchgate plugin init --lang rust --plugin-id sample-rust --output ./sample-rust-plugin`
 
 ## 8) CI template
 
