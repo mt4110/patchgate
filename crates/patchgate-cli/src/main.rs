@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
@@ -799,6 +799,10 @@ struct DeadLetterRecord {
     idempotency_key: String,
     error: String,
     payload: Value,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    payload_raw: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -918,11 +922,28 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
         anyhow::bail!("--plugin-id must be non-empty");
     }
 
+    let repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize repo root {}", repo_root.display()))?;
     let output_dir = if args.output.is_absolute() {
-        args.output
+        args.output.clone()
     } else {
-        repo_root.join(args.output)
+        repo_root.join(args.output.as_path())
     };
+    let output_dir = normalize_absolute_path(output_dir.as_path());
+    if !output_dir.starts_with(repo_root.as_path()) {
+        anyhow::bail!(
+            "--output must be inside repository root: {}",
+            repo_root.display()
+        );
+    }
+    if output_dir == repo_root {
+        anyhow::bail!("--output must not point to repository root");
+    }
+    if output_dir.file_name().is_some_and(|name| name == ".git") || output_dir.join(".git").exists()
+    {
+        anyhow::bail!("--output must not target a git repository path");
+    }
 
     if output_dir.exists() {
         if !args.force {
@@ -953,6 +974,22 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
         output_dir.display()
     );
     Ok(())
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn render_plugin_template(
@@ -2980,6 +3017,16 @@ struct NotificationDispatchOptions<'a> {
     dead_letter_path: Option<&'a Path>,
 }
 
+struct DeadLetterWriteOptions<'a> {
+    transport: &'a str,
+    endpoint: &'a str,
+    idempotency_key: &'a str,
+    error: &'a str,
+    payload: &'a Value,
+    headers: Option<&'a BTreeMap<String, String>>,
+    payload_raw: Option<&'a str>,
+}
+
 fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> String {
     let mut hasher = Sha256::new();
     hasher.update(telemetry_repo.as_bytes());
@@ -2993,25 +3040,20 @@ fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> Stri
     format!("pgv1-{}", encode_hex(digest.as_slice()))
 }
 
-fn append_dead_letter(
-    path: Option<&Path>,
-    transport: &str,
-    endpoint: &str,
-    idempotency_key: &str,
-    error: &str,
-    payload: &Value,
-) -> Result<()> {
+fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
     let record = DeadLetterRecord {
         schema_version: 1,
         unix_ts: current_unix_ts(),
-        transport: transport.to_string(),
-        endpoint: endpoint.to_string(),
-        idempotency_key: idempotency_key.to_string(),
-        error: error.to_string(),
-        payload: payload.clone(),
+        transport: options.transport.to_string(),
+        endpoint: options.endpoint.to_string(),
+        idempotency_key: options.idempotency_key.to_string(),
+        error: options.error.to_string(),
+        payload: options.payload.clone(),
+        headers: options.headers.cloned().unwrap_or_default(),
+        payload_raw: options.payload_raw.map(ToOwned::to_owned),
     };
     append_jsonl(path, &record).context("failed to append dead-letter record")
 }
@@ -3075,18 +3117,29 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
             continue;
         }
 
-        let body = serde_json::to_vec(&record.payload).context("encode dead-letter payload")?;
+        let body = match record.payload_raw.as_ref() {
+            Some(raw) => raw.as_bytes().to_vec(),
+            None => serde_json::to_vec(&record.payload).context("encode dead-letter payload")?,
+        };
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
-            let response = client
+            let mut request = client
                 .post(record.endpoint.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .header(
                     "X-Patchgate-Idempotency-Key",
                     record.idempotency_key.as_str(),
-                )
-                .body(body.clone())
-                .send();
+                );
+            for (header_name, header_value) in &record.headers {
+                let name = HeaderName::from_bytes(header_name.as_bytes()).with_context(|| {
+                    format!("invalid dead-letter header name for replay: {header_name}")
+                })?;
+                let value = HeaderValue::from_str(header_value).with_context(|| {
+                    format!("invalid dead-letter header value for replay: {header_name}")
+                })?;
+                request = request.header(name, value);
+            }
+            let response = request.body(body.clone()).send();
             match response {
                 Ok(resp) if resp.status().is_success() => {
                     last_error = None;
@@ -3142,7 +3195,8 @@ fn dispatch_signed_webhooks(
         report: &sanitized_report,
     };
     let payload_value = serde_json::to_value(&envelope)?;
-    let body = mask_sensitive(serde_json::to_string(&envelope)?.as_str()).into_bytes();
+    let payload_raw = mask_sensitive(serde_json::to_string(&envelope)?.as_str());
+    let body = payload_raw.as_bytes().to_vec();
     let timestamp = unix_ts.to_string();
     let signature =
         resolve_webhook_signature(options.secret_env, timestamp.as_bytes(), body.as_slice())?;
@@ -3171,6 +3225,13 @@ fn dispatch_signed_webhooks(
             HeaderName::from_static("x-patchgate-idempotency-key"),
             HeaderValue::from_str(options.idempotency_key)?,
         );
+        let mut replay_headers = BTreeMap::new();
+        replay_headers.insert(
+            "X-Patchgate-Event".to_string(),
+            "scan.completed".to_string(),
+        );
+        replay_headers.insert("X-Patchgate-Timestamp".to_string(), timestamp.clone());
+        replay_headers.insert("X-Patchgate-Signature".to_string(), signature.clone());
 
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
@@ -3207,11 +3268,15 @@ fn dispatch_signed_webhooks(
             let error_message = format!("{err:#}");
             if let Err(dead_err) = append_dead_letter(
                 options.dead_letter_path,
-                "webhook",
-                url,
-                options.idempotency_key,
-                error_message.as_str(),
-                &payload_value,
+                DeadLetterWriteOptions {
+                    transport: "webhook",
+                    endpoint: url,
+                    idempotency_key: options.idempotency_key,
+                    error: error_message.as_str(),
+                    payload: &payload_value,
+                    headers: Some(&replay_headers),
+                    payload_raw: Some(payload_raw.as_str()),
+                },
             ) {
                 eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
             }
@@ -3255,7 +3320,8 @@ fn dispatch_notifications(
                 Value::String(options.idempotency_key.to_string()),
             );
         }
-        let body = mask_sensitive(serde_json::to_string(&payload)?.as_str()).into_bytes();
+        let payload_raw = mask_sensitive(serde_json::to_string(&payload)?.as_str());
+        let body = payload_raw.as_bytes().to_vec();
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
             let response = client
@@ -3295,11 +3361,15 @@ fn dispatch_notifications(
             let error_message = format!("{err:#}");
             if let Err(dead_err) = append_dead_letter(
                 options.dead_letter_path,
-                "notification",
-                target.url.as_str(),
-                options.idempotency_key,
-                error_message.as_str(),
-                &payload,
+                DeadLetterWriteOptions {
+                    transport: "notification",
+                    endpoint: target.url.as_str(),
+                    idempotency_key: options.idempotency_key,
+                    error: error_message.as_str(),
+                    payload: &payload,
+                    headers: None,
+                    payload_raw: Some(payload_raw.as_str()),
+                },
             ) {
                 eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
             }
@@ -4147,8 +4217,8 @@ mod tests {
         resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
         resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
         run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
-        DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource, PluginInitArgs,
-        PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
+        DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource,
+        PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
         ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
         ScopeMode,
     };
@@ -5461,18 +5531,31 @@ security_sla_hours = 72
         let dir = std::env::temp_dir().join(format!("patchgate-dead-letter-{seq}"));
         fs::create_dir_all(&dir).expect("create dead-letter dir");
         let path = dir.join("dead-letter.jsonl");
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "X-Patchgate-Signature".to_string(),
+            "sha256=testsignature".to_string(),
+        );
         append_dead_letter(
             Some(path.as_path()),
-            "webhook",
-            "https://hooks.example.com/***",
-            "pgv1-key",
-            "test error",
-            &serde_json::json!({ "event": "scan.completed" }),
+            DeadLetterWriteOptions {
+                transport: "webhook",
+                endpoint: "https://hooks.example.com/***",
+                idempotency_key: "pgv1-key",
+                error: "test error",
+                payload: &serde_json::json!({ "event": "scan.completed" }),
+                headers: Some(&headers),
+                payload_raw: Some("{\"event\":\"scan.completed\"}"),
+            },
         )
         .expect("append dead-letter");
         let content = fs::read_to_string(&path).expect("read dead-letter file");
         assert!(content.contains("\"transport\":\"webhook\""));
         assert!(content.contains("\"idempotency_key\":\"pgv1-key\""));
+        assert!(
+            content.contains("\"headers\":{\"X-Patchgate-Signature\":\"sha256=testsignature\"}")
+        );
+        assert!(content.contains("\"payload_raw\":\"{\\\"event\\\":\\\"scan.completed\\\"}\""));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5484,11 +5567,15 @@ security_sla_hours = 72
         let input = dir.join("dead-letter.jsonl");
         append_dead_letter(
             Some(input.as_path()),
-            "notification",
-            "https://example.internal/hook",
-            "pgv1-replay-key",
-            "network timeout",
-            &serde_json::json!({ "event": "scan.completed.notification", "summary": { "score": 90 } }),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: "https://example.internal/hook",
+                idempotency_key: "pgv1-replay-key",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification", "summary": { "score": 90 } }),
+                headers: None,
+                payload_raw: None,
+            },
         )
         .expect("seed dead-letter");
 
@@ -5753,6 +5840,50 @@ security_sla_hours = 72
         )
         .expect_err("must fail");
         assert!(format!("{err:#}").contains("already exists"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_repo_root_output_even_with_force() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-root-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "python".to_string(),
+                plugin_id: "sample-plugin".to_string(),
+                output: PathBuf::from("."),
+                force: true,
+            },
+        )
+        .expect_err("must reject repo root");
+        assert!(format!("{err:#}").contains("must not point to repository root"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_output_outside_repo_root() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-outside-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("../outside"),
+                force: false,
+            },
+        )
+        .expect_err("must reject outside path");
+        assert!(format!("{err:#}").contains("must be inside repository root"));
 
         let _ = fs::remove_dir_all(repo_root);
     }

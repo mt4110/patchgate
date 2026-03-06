@@ -89,29 +89,57 @@ jobs:
 
       - name: Attempt auto backport
         env:
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
           SOURCE_PR: ${{ github.event.pull_request.number }}
           TARGET_BRANCH: lts/v1
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          short_sha="${SOURCE_SHA:0:7}"
-          backport_branch="backport/pr-${SOURCE_PR}-${short_sha}"
           mkdir -p artifacts
+          commits_api="${{ github.api_url }}/repos/${{ github.repository }}/pulls/${SOURCE_PR}/commits?per_page=100"
+          commits_file="artifacts/pr-commits.txt"
+          : > "$commits_file"
+          page=1
+          while :; do
+            response=$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${commits_api}&page=${page}")
+            count=$(echo "$response" | jq 'length')
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+            echo "$response" | jq -r '.[].sha' >> "$commits_file"
+            if [ "$count" -lt 100 ]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+          if ! [ -s "$commits_file" ]; then
+            echo "No commits found for PR #${SOURCE_PR}"
+            exit 1
+          fi
+          source_sha="$(tail -n1 "$commits_file")"
+          short_sha="${source_sha:0:7}"
+          backport_branch="backport/pr-${SOURCE_PR}-${short_sha}"
           git fetch origin "$TARGET_BRANCH"
           git checkout -B "$backport_branch" "origin/$TARGET_BRANCH"
-          if ! git cherry-pick -x "$SOURCE_SHA"; then
-            git cherry-pick --abort || true
-            git diff --name-only --diff-filter=U > artifacts/conflict-files.txt || true
-            cat > artifacts/backport-conflict-report.md <<EOF
+          while IFS= read -r commit_sha; do
+            if ! git cherry-pick -x "$commit_sha"; then
+              failed_sha="$commit_sha"
+              git cherry-pick --abort || true
+              git diff --name-only --diff-filter=U > artifacts/conflict-files.txt || true
+              cat > artifacts/backport-conflict-report.md <<EOF
           # LTS Backport Conflict Report
 
           - source_pr: ${SOURCE_PR}
-          - source_sha: ${SOURCE_SHA}
+          - source_sha: ${source_sha}
+          - failed_commit_sha: ${failed_sha}
           - target_branch: ${TARGET_BRANCH}
           - status: conflict
           EOF
-            exit 1
-          fi
+              exit 1
+            fi
+          done < "$commits_file"
           git push origin "$backport_branch" --force
           echo "BACKPORT_BRANCH=$backport_branch" >> "$GITHUB_ENV"
 
