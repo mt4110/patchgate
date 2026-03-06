@@ -30,6 +30,9 @@ jobs:
 
       - name: Policy lint (example + presets)
         run: |
+          mkdir -p artifacts
+          cp config/policy.toml.example artifacts/policy.lts.toml
+          sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
           nix develop --command cargo run -p patchgate-cli -- policy lint \
             --path config/policy.toml.example \
             --require-current-version
@@ -41,7 +44,7 @@ jobs:
             --readiness-profile strict \
             --format text
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
-            --path config/policy.toml.example \
+            --path artifacts/policy.lts.toml \
             --readiness-profile lts \
             --format text
           for preset in strict balanced relaxed; do

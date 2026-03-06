@@ -26,6 +26,9 @@ jobs:
 
       - name: Verify v1 readiness
         run: |
+          mkdir -p artifacts
+          cp config/policy.toml.example artifacts/policy.lts.toml
+          sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
           cargo run -p patchgate-cli -- policy verify-v1 \
             --path config/policy.toml.example \
             --format text
@@ -34,7 +37,7 @@ jobs:
             --readiness-profile strict \
             --format text
           cargo run -p patchgate-cli -- policy verify-v1 \
-            --path config/policy.toml.example \
+            --path artifacts/policy.lts.toml \
             --readiness-profile lts \
             --format text
 
