@@ -1657,6 +1657,23 @@ fn run_policy_verify_v1(
         );
         autofix_suggestions.push("plugins.sandbox.profile = \"isolated\"".to_string());
     }
+    if cfg.plugins.enabled
+        && matches!(
+            readiness_profile,
+            ReadinessProfile::Strict | ReadinessProfile::Lts
+        )
+        && cfg.plugins.sandbox.profile == "isolated"
+        && !cfg!(target_os = "linux")
+    {
+        warnings.push(
+            "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
+                .to_string(),
+        );
+        next_actions.push(
+            "Run strict/lts readiness verification on Linux where isolated plugin sandbox is supported."
+                .to_string(),
+        );
+    }
     if matches!(readiness_profile, ReadinessProfile::Lts) && !cfg.release.lts.active {
         warnings.push("lts readiness requires release.lts.active=true".to_string());
         next_actions
@@ -1683,6 +1700,13 @@ fn run_policy_verify_v1(
                 ReadinessProfile::Strict | ReadinessProfile::Lts
             )
             || cfg.plugins.sandbox.profile == "isolated")
+        && (!cfg.plugins.enabled
+            || !matches!(
+                readiness_profile,
+                ReadinessProfile::Strict | ReadinessProfile::Lts
+            )
+            || cfg.plugins.sandbox.profile != "isolated"
+            || cfg!(target_os = "linux"))
         && (!matches!(readiness_profile, ReadinessProfile::Lts)
             || (cfg.release.lts.active && cfg.release.lts.security_sla_hours <= 72));
     if ready {
@@ -3084,6 +3108,11 @@ fn load_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
 fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
     let mut records = load_dead_letter_jsonl(&args.input)?;
     if let Some(transport) = args.transport.as_deref() {
+        if transport != "webhook" && transport != "notification" {
+            anyhow::bail!(
+                "invalid --transport value `{transport}` (expected: webhook|notification)"
+            );
+        }
         records.retain(|r| r.transport == transport);
     }
     if let Some(limit) = args.max_records {
@@ -5471,6 +5500,47 @@ security_sla_hours = 72
         let _ = fs::remove_dir_all(repo_root);
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn policy_verify_v1_strict_requires_linux_runtime_for_isolated_plugins() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!(
+            "patchgate-cli-policy-verify-v1-strict-runtime-{seq}"
+        ));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "isolated"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
     #[test]
     fn resolve_ci_provider_prefers_cli_value() {
         let provider = resolve_ci_provider(Some("generic"), Some("github")).expect("provider");
@@ -5588,6 +5658,38 @@ security_sla_hours = 72
             dry_run: true,
         })
         .expect("replay dry-run");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_rejects_unknown_transport() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-transport-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: "https://example.internal/hook",
+                idempotency_key: "pgv1-replay-key",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification" }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed dead-letter");
+        let err = run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("webhhok".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            dry_run: true,
+        })
+        .expect_err("must reject unknown transport");
+        assert!(format!("{err:#}").contains("invalid --transport value"));
         let _ = fs::remove_dir_all(dir);
     }
 
