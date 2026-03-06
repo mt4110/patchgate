@@ -1289,10 +1289,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        aggregate_failure_code_counts, average_duration_for_summary,
-        build_verify_v1_calibration, canonical_repo_path, checklist_box, load_jsonl_records,
-        percentile_u128, run_ga_readiness, validate_workload_identity, AuditLogRecord,
-        BenchSample, MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
+        aggregate_failure_code_counts, average_duration_for_summary, build_verify_v1_calibration,
+        canonical_repo_path, checklist_box, load_jsonl_records, percentile_u128, run_ga_readiness,
+        validate_workload_identity, AuditLogRecord, BenchSample, MetricLogRecord, OpsOptions,
+        OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {

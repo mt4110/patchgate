@@ -1022,7 +1022,7 @@ fn render_plugin_template(
             (
                 "Cargo.toml",
                 format!(
-                    "[package]\nname = \"{plugin_id}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\n"
+                    "[package]\nname = \"{plugin_id}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = {{ version = \"1\", features = [\"derive\"] }}\nserde_json = \"1\"\n\n[workspace]\n"
                 ),
             ),
             (
@@ -5701,6 +5701,33 @@ security_sla_hours = 72
         let main_py = fs::read_to_string(output.join("main.py")).expect("main.py");
         assert!(main_py.contains("plugin_id=sample-plugin"));
         assert!(output.join("README.md").exists());
+        assert!(output.join("sample-input.json").exists());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_generates_rust_template_with_workspace_boundary() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-rust-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let output = repo_root.join("generated-rust-plugin");
+
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "rust".to_string(),
+                plugin_id: "sample-rust-plugin".to_string(),
+                output: PathBuf::from("generated-rust-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate rust template");
+
+        let cargo_toml = fs::read_to_string(output.join("Cargo.toml")).expect("Cargo.toml");
+        assert!(cargo_toml.contains("[workspace]"));
+        assert!(output.join("src/main.rs").exists());
         assert!(output.join("sample-input.json").exists());
 
         let _ = fs::remove_dir_all(repo_root);
