@@ -126,8 +126,8 @@ jobs:
           while IFS= read -r commit_sha; do
             if ! git cherry-pick -x "$commit_sha"; then
               failed_sha="$commit_sha"
-              git cherry-pick --abort || true
               git diff --name-only --diff-filter=U > artifacts/conflict-files.txt || true
+              git cherry-pick --abort || true
               cat > artifacts/backport-conflict-report.md <<EOF
           # LTS Backport Conflict Report
 
