@@ -335,11 +335,12 @@ fn execute_plugin(
     mode: &str,
     plugin: &patchgate_config::PluginEntry,
 ) -> Result<PluginInvocation> {
+    let start = Instant::now();
     if let Err(err) = verify_plugin_signature(policy, ctx, plugin) {
         return Ok(PluginInvocation {
             plugin_id: plugin.id.clone(),
             status: PluginInvocationStatus::Error,
-            duration_ms: 0,
+            duration_ms: start.elapsed().as_millis(),
             sandbox_profile: policy.plugins.sandbox.profile.clone(),
             findings: Vec::new(),
             diagnostics: vec![format!("signature verification failed: {err:#}")],
@@ -370,7 +371,6 @@ fn execute_plugin(
     let sandbox_profile = policy.plugins.sandbox.profile.as_str();
     let timeout = Duration::from_millis(plugin.timeout_ms);
 
-    let start = Instant::now();
     let mut command = match sandbox_profile {
         "isolated" => match build_isolated_plugin_command(policy, ctx, plugin) {
             Ok(command) => command,
