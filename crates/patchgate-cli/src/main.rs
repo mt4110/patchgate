@@ -937,6 +937,7 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
             repo_root.display()
         );
     }
+    ensure_output_dir_has_no_symlink_components(repo_root.as_path(), output_dir.as_path())?;
     if output_dir == repo_root {
         anyhow::bail!("--output must not point to repository root");
     }
@@ -957,9 +958,18 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
     }
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("create output directory {}", output_dir.display()))?;
+    let canonical_output_dir = output_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize output directory {}", output_dir.display()))?;
+    if !canonical_output_dir.starts_with(repo_root.as_path()) {
+        anyhow::bail!(
+            "--output must not resolve outside repository root: {}",
+            repo_root.display()
+        );
+    }
 
     for (relative, content) in render_plugin_template(lang, plugin_id) {
-        let path = output_dir.join(relative);
+        let path = canonical_output_dir.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create parent directory {}", parent.display()))?;
@@ -971,8 +981,34 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
         "plugin template generated: lang={} plugin_id={} output={}",
         args.lang,
         plugin_id,
-        output_dir.display()
+        canonical_output_dir.display()
     );
+    Ok(())
+}
+
+fn ensure_output_dir_has_no_symlink_components(repo_root: &Path, output_dir: &Path) -> Result<()> {
+    let relative = output_dir
+        .strip_prefix(repo_root)
+        .with_context(|| format!("strip repo root prefix from {}", output_dir.display()))?;
+    let mut current = repo_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "--output must not traverse symlinked paths: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspect output path component {}", current.display())
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -6060,6 +6096,40 @@ profile = "isolated"
         assert!(format!("{err:#}").contains("must be inside repository root"));
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_init_rejects_symlinked_output_components() {
+        use std::os::unix::fs::symlink;
+
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-symlink-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut outside_root = std::env::temp_dir();
+        outside_root.push(format!("patchgate-plugin-init-symlink-target-{seq}"));
+        fs::create_dir_all(&outside_root).expect("create outside root");
+
+        let link_path = repo_root.join("linked");
+        symlink(&outside_root, &link_path).expect("create symlink");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("linked/generated"),
+                force: false,
+            },
+        )
+        .expect_err("must reject symlink traversal");
+        assert!(format!("{err:#}").contains("must not traverse symlinked paths"));
+
+        let _ = fs::remove_file(&link_path);
+        let _ = fs::remove_dir_all(&outside_root);
+        let _ = fs::remove_dir_all(&repo_root);
     }
 
     #[test]

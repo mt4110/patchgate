@@ -378,7 +378,7 @@ fn execute_plugin(
                 return Ok(PluginInvocation {
                     plugin_id: plugin.id.clone(),
                     status: PluginInvocationStatus::Error,
-                    duration_ms: 0,
+                    duration_ms: start.elapsed().as_millis(),
                     sandbox_profile: sandbox_profile.to_string(),
                     findings: Vec::new(),
                     diagnostics: vec![message.clone()],
