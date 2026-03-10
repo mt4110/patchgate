@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -365,6 +366,8 @@ struct PluginInitArgs {
     #[arg(long)]
     force: bool,
 }
+
+static DEAD_LETTER_ENDPOINT_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommand {
@@ -921,6 +924,7 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
     if plugin_id.is_empty() {
         anyhow::bail!("--plugin-id must be non-empty");
     }
+    validate_plugin_id(plugin_id)?;
 
     let repo_root = repo_root
         .canonicalize()
@@ -984,6 +988,44 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
         canonical_output_dir.display()
     );
     Ok(())
+}
+
+fn validate_plugin_id(plugin_id: &str) -> Result<()> {
+    if plugin_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("--plugin-id must contain only ASCII letters, digits, '.', '_' or '-'");
+}
+
+fn derive_project_name(plugin_id: &str) -> String {
+    let mut name = String::new();
+    let mut last_was_separator = false;
+    for ch in plugin_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            name.push('-');
+            last_was_separator = true;
+        }
+    }
+    let name = name.trim_matches('-');
+    let mut name = if name.is_empty() {
+        "plugin-template".to_string()
+    } else {
+        name.to_string()
+    };
+    if name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_digit())
+    {
+        name = format!("plugin-{name}");
+    }
+    name
 }
 
 fn ensure_output_dir_has_no_symlink_components(repo_root: &Path, output_dir: &Path) -> Result<()> {
@@ -1073,6 +1115,7 @@ fn render_plugin_template(
     lang: PluginTemplateLang,
     plugin_id: &str,
 ) -> Vec<(&'static str, String)> {
+    let project_name = derive_project_name(plugin_id);
     match lang {
         PluginTemplateLang::Python => vec![
             (
@@ -1107,7 +1150,7 @@ fn render_plugin_template(
                 "package.json",
                 render_embedded_template(
                     NODE_TEMPLATE_PACKAGE_JSON,
-                    &[("patchgate-node-plugin-template", plugin_id)],
+                    &[("patchgate-node-plugin-template", project_name.as_str())],
                 ),
             ),
             (
@@ -1131,7 +1174,7 @@ fn render_plugin_template(
                 "Cargo.toml",
                 render_embedded_template(
                     RUST_TEMPLATE_CARGO_TOML,
-                    &[("patchgate-rust-plugin-template", plugin_id)],
+                    &[("patchgate-rust-plugin-template", project_name.as_str())],
                 ),
             ),
             (
@@ -3141,6 +3184,15 @@ fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) 
     let Some(path) = path else {
         return Ok(());
     };
+    let safe_endpoint = redacted_endpoint(options.endpoint);
+    if safe_endpoint != options.endpoint
+        && !DEAD_LETTER_ENDPOINT_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "warning: dead-letter records persist raw endpoint URLs; treat {} as secret material",
+            path.display()
+        );
+    }
     let record = DeadLetterRecord {
         schema_version: 1,
         unix_ts: current_unix_ts(),
@@ -3213,7 +3265,9 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
         if args.dry_run {
             println!(
                 "dry-run replay: transport={} endpoint={} idempotency_key={}",
-                record.transport, record.endpoint, record.idempotency_key
+                record.transport,
+                redacted_endpoint(record.endpoint.as_str()),
+                record.idempotency_key
             );
             replayed += 1;
             continue;
@@ -6000,6 +6054,45 @@ profile = "isolated"
     }
 
     #[test]
+    fn plugin_init_sanitizes_project_names_for_package_manifests() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-project-name-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let node_output = repo_root.join("generated-node-plugin");
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "Sample.Plugin_01".to_string(),
+                output: PathBuf::from("generated-node-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate node template");
+        let node_package =
+            fs::read_to_string(node_output.join("package.json")).expect("package.json");
+        assert!(node_package.contains("\"name\": \"sample-plugin-01\""));
+
+        let rust_output = repo_root.join("generated-rust-plugin");
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "rust".to_string(),
+                plugin_id: "Sample.Plugin_01".to_string(),
+                output: PathBuf::from("generated-rust-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate rust template");
+        let cargo_toml = fs::read_to_string(rust_output.join("Cargo.toml")).expect("Cargo.toml");
+        assert!(cargo_toml.contains("name = \"sample-plugin-01\""));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
     fn plugin_init_generates_rust_template_with_workspace_boundary() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut repo_root = std::env::temp_dir();
@@ -6026,6 +6119,28 @@ profile = "isolated"
         assert!(main_rs.contains("unwrap_or(\"sample-rust-plugin\")"));
         assert!(output.join("src/main.rs").exists());
         assert!(output.join("sample-input.json").exists());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_invalid_plugin_id_characters() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-invalid-plugin-id-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "bad id".to_string(),
+                output: PathBuf::from("generated-node-plugin"),
+                force: false,
+            },
+        )
+        .expect_err("must reject invalid plugin id");
+        assert!(format!("{err:#}").contains("must contain only ASCII letters"));
 
         let _ = fs::remove_dir_all(repo_root);
     }

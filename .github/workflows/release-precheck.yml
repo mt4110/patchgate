@@ -121,10 +121,14 @@ jobs:
       - name: Verify SBOM and provenance metadata contract
         run: |
           nix develop --command cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
-          cp artifacts/sbom.cargo-metadata.json artifacts/sbom.spdx.json
           nix develop --command cargo install cargo-cyclonedx --locked
           nix develop --command cargo cyclonedx --manifest-path Cargo.toml --format json --override-filename sbom.cyclonedx
-          find crates -name 'sbom.cyclonedx.json' -exec cp {} artifacts/ \;
+          find crates -name 'sbom.cyclonedx.json' -exec sh -c '
+            for f do
+              crate="$(basename "$(dirname "$f")")"
+              cp "$f" "artifacts/${crate}.sbom.cyclonedx.json"
+            done
+          ' sh {} +
           jq -e '.packages | length > 0' artifacts/sbom.cargo-metadata.json
           jq -n --arg commit "$(git rev-parse HEAD)" \
             '{schema_version:1,predicate_type:"https://slsa.dev/provenance/v1",commit:$commit}' \

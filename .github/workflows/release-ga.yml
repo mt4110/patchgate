@@ -32,10 +32,14 @@ jobs:
         run: |
           sha256sum "artifacts/patchgate-${RELEASE_VERSION}-linux-amd64" > artifacts/SHA256SUMS
           cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
-          cp artifacts/sbom.cargo-metadata.json artifacts/sbom.spdx.json
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --manifest-path Cargo.toml --format json --override-filename sbom.cyclonedx
-          find crates -name 'sbom.cyclonedx.json' -exec cp {} artifacts/ \;
+          find crates -name 'sbom.cyclonedx.json' -exec sh -c '
+            for f do
+              crate="$(basename "$(dirname "$f")")"
+              cp "$f" "artifacts/${crate}.sbom.cyclonedx.json"
+            done
+          ' sh {} +
 
       - name: Sign release artifact (cosign keyless)
         run: |

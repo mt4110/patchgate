@@ -119,8 +119,7 @@ jobs:
             exit 1
           fi
           source_sha="$(tail -n1 "$commits_file")"
-          short_sha="${source_sha:0:7}"
-          backport_branch="backport/pr-${SOURCE_PR}-${short_sha}"
+          backport_branch="backport/pr-${SOURCE_PR}"
           git fetch origin "$TARGET_BRANCH"
           git checkout -B "$backport_branch" "origin/$TARGET_BRANCH"
           while IFS= read -r commit_sha; do
