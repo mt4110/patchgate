@@ -361,7 +361,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
     validate_enum(
         "plugins.sandbox.profile",
         cfg.plugins.sandbox.profile.as_str(),
-        &["none", "restricted"],
+        &["none", "restricted", "isolated"],
     )?;
     validate_enum(
         "integrations.ci.provider",
@@ -618,6 +618,13 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
+    if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "plugins.signature.public_key_env",
+            "must be non-empty when `plugins.signature.required = true`",
+        ));
+    }
 
     for (idx, plugin) in cfg.plugins.entries.iter().enumerate() {
         if plugin.id.trim().is_empty() {
@@ -649,6 +656,15 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             100,
             600_000,
         )?;
+        if cfg.plugins.signature.required && plugin.signature_path.trim().is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.entries",
+                format!(
+                    "entry[{idx}] signature_path must be non-empty when plugins.signature.required=true"
+                ),
+            ));
+        }
     }
 
     for (idx, url) in cfg.integrations.webhook.urls.iter().enumerate() {
@@ -1283,6 +1299,67 @@ mode = "skip"
             other => panic!("unexpected error: {other}"),
         }
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_accepts_isolated_plugin_sandbox_profile() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.sandbox]
+profile = "isolated"
+"#,
+        );
+
+        let loaded = load_from_typed(&path).expect("isolated profile should pass");
+        assert_eq!(loaded.plugins.sandbox.profile, "isolated");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_empty_plugin_public_key_env_when_signature_required() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.signature]
+required = true
+public_key_env = "   "
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("must reject empty public_key_env");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "plugins.signature.public_key_env")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_missing_plugin_signature_path_when_required() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins]
+enabled = true
+entries = [{ id = "sample", command = "plugin.sh", args = [], timeout_ms = 1000, fail_mode = "fail_open" }]
+[plugins.signature]
+required = true
+public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("must reject missing signature_path");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, message, .. } => {
+                assert_eq!(field, "plugins.entries");
+                assert!(message.contains("signature_path"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
         let _ = fs::remove_file(path);
     }
 

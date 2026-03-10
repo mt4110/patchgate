@@ -20,8 +20,10 @@
 - 実行結果は `Report.plugin_invocations[]` に保存
 - sandbox制約:
   - `plugins.sandbox.profile = restricted` で最小環境変数のみ許可
+  - `plugins.sandbox.profile = isolated` で Linux `bwrap` によるOS隔離実行
   - `timeout_ms` と `max_stdout_kib` を強制
   - `fail_mode = fail_open|fail_closed`
+  - `plugins.signature.required = true` の場合、plugin実行前にed25519署名を検証
 
 ## Provider / Integration contract (Phase85-87)
 
@@ -31,9 +33,11 @@
 - Webhook:
   - `scan.completed` イベントを JSON 送信
   - 署名ヘッダ `X-Patchgate-Signature: sha256=...`
+  - 冪等ヘッダ `X-Patchgate-Idempotency-Key` を付与
 - Notification adapter:
   - `slack|teams|generic` の共通送信契約
   - retry/backoff で一時障害を吸収
+  - 失敗payloadは dead-letter(JSONL) に退避可能
 
 ## Observability model (Phase61-70, 95)
 
@@ -60,7 +64,7 @@
 
 ## v1 compatibility boundary (Phase91-93)
 
-- `patchgate policy verify-v1` で移行準備を検証
+- `patchgate policy verify-v1 --readiness-profile <standard|strict|lts>` で移行準備を検証
 - v1 GA前提:
   - `policy_version = 2`
   - `compatibility.v1.rc_frozen = true`
@@ -77,4 +81,4 @@
   - `cargo run -p xtask -- ops ga-readiness`
 - Release artifacts:
   - `.github/workflows/release-ga.yml`
-  - checksum + SBOM相当（cargo metadata）
+  - checksum + SBOM相当 + provenance metadata

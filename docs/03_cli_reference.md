@@ -56,10 +56,12 @@ Provider/Webhook/Notification options:
 - `--webhook-url <https://...>` (repeatable)
 - `--webhook-secret-env <env_name>`
 - `--webhook-timeout-ms <ms>`
+- `--webhook-retry-max-attempts <n>`
 - `--notify-target <kind=url>` (kind: `slack|teams|generic`)
 - `--notify-retry-max-attempts <n>`
 - `--notify-retry-backoff-ms <ms>`
 - `--notify-timeout-ms <ms>`
+- `--dead-letter-output <path>` (配信失敗ペイロードをJSONL保存)
 
 ### `patchgate history summary`
 
@@ -71,6 +73,15 @@ Provider/Webhook/Notification options:
 
 - `--input <metrics.jsonl>`
 - `--format <text|json>`
+
+### `patchgate delivery replay`
+
+- `--input <dead-letter.jsonl>`
+- `--transport <webhook|notification>`
+- `--max-records <n>`
+- `--retry-max-attempts <n>`
+- `--retry-backoff-ms <ms>`
+- `--dry-run`
 
 ### `patchgate policy lint`
 
@@ -90,7 +101,16 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
+- `--readiness-profile <standard|strict|lts>`
 - v1 RC/GA前提の移行準備状態を検証
+
+### `patchgate plugin init`
+
+- `--lang <python|node|rust>`
+- `--plugin-id <id>`
+- `--output <path>`
+- `--force`
+- `patchgate.plugin.v1` 準拠の最小pluginテンプレートを生成
 
 ## JSON contract (`scan --format json`)
 

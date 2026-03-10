@@ -48,6 +48,24 @@ jobs:
           set -e
           test "$code" -eq 13
 
+      - name: Scenario 4 - dead-letter replay dry-run
+        run: |
+          mkdir -p artifacts
+          cat > artifacts/dead-letter.jsonl <<'EOF'
+          {"schema_version":1,"unix_ts":1700000000,"transport":"notification","endpoint":"https://example.internal/hook","idempotency_key":"pgv1-drill","error":"timeout","payload":{"event":"scan.completed.notification","summary":{"score":90}}}
+          EOF
+          cargo run -p patchgate-cli -- delivery replay \
+            --input artifacts/dead-letter.jsonl \
+            --dry-run \
+            --max-records 1
+
+      - name: Scenario 5 - strict readiness with isolated sandbox
+        run: |
+          cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile strict \
+            --format text
+
       - name: Publish drill report
         run: |
           mkdir -p artifacts
@@ -57,6 +75,8 @@ jobs:
           - Scenario 1: invalid CLI option -> exit 2
           - Scenario 2: publish input failure -> exit 6
           - Scenario 3: expired waiver -> exit 13
+          - Scenario 4: dead-letter replay dry-run -> success
+          - Scenario 5: strict readiness profile check -> success
           EOF
 
       - uses: actions/upload-artifact@v4

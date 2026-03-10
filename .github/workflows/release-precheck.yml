@@ -30,11 +30,22 @@ jobs:
 
       - name: Policy lint (example + presets)
         run: |
+          mkdir -p artifacts
+          cp config/policy.toml.example artifacts/policy.lts.toml
+          sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
           nix develop --command cargo run -p patchgate-cli -- policy lint \
             --path config/policy.toml.example \
             --require-current-version
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
             --path config/policy.toml.example \
+            --format text
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path config/policy.toml.example \
+            --readiness-profile strict \
+            --format text
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path artifacts/policy.lts.toml \
+            --readiness-profile lts \
             --format text
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
@@ -93,6 +104,36 @@ jobs:
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/ga-readiness.md
+          nix develop --command cargo run -p xtask -- ops verify-v1-calibrate \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --output artifacts/verify-v1-calibration.md
+
+      - name: Dead-letter replay dry-run smoke test
+        run: |
+          cat > artifacts/dead-letter.jsonl <<'EOF'
+          {"schema_version":1,"unix_ts":1700000000,"transport":"notification","endpoint":"https://example.internal/hook","idempotency_key":"pgv1-precheck","error":"timeout","payload":{"event":"scan.completed.notification","summary":{"score":88}}}
+          EOF
+          nix develop --command cargo run -p patchgate-cli -- delivery replay \
+            --input artifacts/dead-letter.jsonl \
+            --dry-run \
+            --max-records 1
+
+      - name: Verify SBOM and provenance metadata contract
+        run: |
+          nix develop --command cargo metadata --format-version 1 > artifacts/sbom.cargo-metadata.json
+          nix develop --command cargo install cargo-cyclonedx --locked
+          nix develop --command cargo cyclonedx --manifest-path Cargo.toml --format json --override-filename sbom.cyclonedx
+          find crates -name 'sbom.cyclonedx.json' -exec sh -c '
+            for f do
+              crate="$(basename "$(dirname "$f")")"
+              cp "$f" "artifacts/${crate}.sbom.cyclonedx.json"
+            done
+          ' sh {} +
+          jq -e '.packages | length > 0' artifacts/sbom.cargo-metadata.json
+          jq -n --arg commit "$(git rev-parse HEAD)" \
+            '{schema_version:1,predicate_type:"https://slsa.dev/provenance/v1",commit:$commit}' \
+            > artifacts/provenance.intoto.jsonl
+          jq -e '.predicate_type == "https://slsa.dev/provenance/v1"' artifacts/provenance.intoto.jsonl
 
       - name: Upload performance artifacts
         uses: actions/upload-artifact@v4

@@ -1,5 +1,6 @@
 /target
 **/*.rs.bk
+crates/*/sbom.cyclonedx.json
 .DS_Store
 .env
 .direnv
@@ -11,4 +12,3 @@ result-*
 # macOS clutter
 ._*
 __MACOSX/
-

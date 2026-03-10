@@ -30,6 +30,27 @@
 - M3: リリース監査性（署名・SBOM・GA判定artifactを再現可能化）
 - M4: LTS実効化（backport SLAをワークフローで追跡）
 
+## Phase101-120 実装後の逆算（2026-03-05, 仮定シナリオ）
+
+Phase101-120 を一括実装した前提で、残タスクは「クロスプラットフォーム統一」と「信頼運用の自動化」に集約されます。
+
+### 残タスク（優先順）
+
+1. sandbox隔離のクロスプラットフォーム統一（macOS/Windows）
+2. 非GitHub CI providerの実運用テンプレート化（GitLab/Jenkins等）
+3. plugin配布信頼基盤の拡張（鍵ローテーション/失効/revocation）
+4. `verify-v1` 推奨修正の自動提案（autofix/PR提案）
+5. 配信障害の自動復旧ループ（dead-letter再処理の定期ジョブ化）
+6. 監査連携の標準化（SIEM向けエクスポート契約）
+7. v1.1スコープ凍結とv2互換戦略準備
+
+### ゴール逆算マイルストーン
+
+- M5: Cross-platform実行一貫性（Linux/macOS/Windows）
+- M6: Ecosystem信頼性（配布署名検証 + 鍵運用 + 失効対応）
+- M7: Self-healing運用（配信失敗検知から再処理まで自動化）
+- M8: v1.1 GA readiness（互換性・性能・監査性の判定確立）
+
 ## 逆算した「最初に実装すること」
 
 Phase1-20 で先に固める対象:
