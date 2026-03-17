@@ -13,6 +13,15 @@ patchgate scan \
 ```
 
 `policy.toml` 側で `plugins.enabled = true` と `plugins.entries[]` を設定します。
+署名検証を有効にする場合は `[plugins.signature] required = true` と `entries[].signature_path` を設定します。
+
+### Pluginテンプレートを生成
+
+```bash
+patchgate plugin init --lang python --plugin-id sample --output ./plugins/sample
+patchgate plugin init --lang node --plugin-id sample-node --output ./plugins/sample-node
+patchgate plugin init --lang rust --plugin-id sample-rust --output ./plugins/sample-rust
+```
 
 ### Generic CI provider payloadを出力
 
@@ -35,7 +44,9 @@ patchgate scan \
   --mode warn \
   --format json \
   --webhook-url https://example.internal/hooks/patchgate \
-  --webhook-secret-env PATCHGATE_WEBHOOK_SECRET
+  --webhook-secret-env PATCHGATE_WEBHOOK_SECRET \
+  --webhook-retry-max-attempts 3 \
+  --dead-letter-output artifacts/dead-letter.jsonl
 ```
 
 ### Slack/Teams通知
@@ -46,7 +57,17 @@ patchgate scan \
   --mode warn \
   --format json \
   --notify-target slack=https://hooks.slack.com/services/... \
-  --notify-target teams=https://outlook.office.com/webhook/...
+  --notify-target teams=https://outlook.office.com/webhook/... \
+  --dead-letter-output artifacts/dead-letter.jsonl
+```
+
+### dead-letterを再送
+
+```bash
+patchgate delivery replay \
+  --input artifacts/dead-letter.jsonl \
+  --transport notification \
+  --retry-max-attempts 3
 ```
 
 ### 履歴サマリとトレンド

@@ -58,7 +58,7 @@ jobs:
           fi
 
       - name: Require `policy-approved` label for policy changes
-        if: github.event_name == 'pull_request' && steps.policy_scope.outputs.needs_policy_label == 'true'
+        if: github.event_name == 'pull_request' && steps.policy_scope.outputs.needs_policy_label == 'true' && github.event.pull_request.user.login != github.repository_owner
         env:
           API_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels
           GH_TOKEN: ${{ github.token }}
@@ -72,3 +72,8 @@ jobs:
             echo "Missing required label: policy-approved"
             exit 1
           fi
+
+      - name: Owner PR bypass note
+        if: github.event_name == 'pull_request' && steps.policy_scope.outputs.needs_policy_label == 'true' && github.event.pull_request.user.login == github.repository_owner
+        run: |
+          echo "policy scope changed, but label requirement is bypassed for repository owner PR."

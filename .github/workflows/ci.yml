@@ -105,3 +105,41 @@ jobs:
         with:
           name: windows-scan-profile
           path: artifacts/scan-profile-windows.json
+
+  sdk-contract:
+    name: sdk-contract (${{ matrix.lang }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [python, node, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        if: matrix.lang == 'node'
+        with:
+          node-version: '20'
+
+      - name: Generate plugin template
+        run: |
+          cargo run -p patchgate-cli -- plugin init \
+            --lang ${{ matrix.lang }} \
+            --plugin-id ci-${{ matrix.lang }} \
+            --output artifacts/sdk-${{ matrix.lang }}
+
+      - name: Run generated python plugin
+        if: matrix.lang == 'python'
+        run: |
+          python3 artifacts/sdk-python/main.py < artifacts/sdk-python/sample-input.json
+
+      - name: Run generated node plugin
+        if: matrix.lang == 'node'
+        run: |
+          node artifacts/sdk-node/index.js < artifacts/sdk-node/sample-input.json
+
+      - name: Build and run generated rust plugin
+        if: matrix.lang == 'rust'
+        run: |
+          cargo run --manifest-path artifacts/sdk-rust/Cargo.toml --release < artifacts/sdk-rust/sample-input.json

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +63,12 @@ enum Command {
 
     /// Validate and migrate policy files
     Policy(PolicyArgs),
+
+    /// Manage external plugin templates
+    Plugin(PluginArgs),
+
+    /// Replay delivery dead-letter records
+    Delivery(DeliveryArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -218,6 +225,10 @@ struct ScanArgs {
     #[arg(long)]
     webhook_timeout_ms: Option<u64>,
 
+    /// Webhook retry max attempts
+    #[arg(long)]
+    webhook_retry_max_attempts: Option<u8>,
+
     /// Notification target in `kind=url` format (kind: slack|teams|generic)
     #[arg(long = "notify-target")]
     notify_targets: Vec<String>,
@@ -233,6 +244,10 @@ struct ScanArgs {
     /// Notification request timeout (ms)
     #[arg(long)]
     notify_timeout_ms: Option<u64>,
+
+    /// JSONL output path for failed delivery payloads
+    #[arg(long)]
+    dead_letter_output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -281,6 +296,78 @@ struct PolicyArgs {
     #[command(subcommand)]
     cmd: PolicyCommand,
 }
+
+#[derive(Args, Debug)]
+struct PluginArgs {
+    #[command(subcommand)]
+    cmd: PluginCommand,
+}
+
+#[derive(Args, Debug)]
+struct DeliveryArgs {
+    #[command(subcommand)]
+    cmd: DeliveryCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DeliveryCommand {
+    /// Replay dead-letter records to their original endpoints
+    Replay(DeliveryReplayArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DeliveryReplayArgs {
+    /// Dead-letter JSONL input path
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Filter by transport kind: webhook|notification
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// Max records to replay
+    #[arg(long)]
+    max_records: Option<usize>,
+
+    /// Retry max attempts per record
+    #[arg(long, default_value_t = 2)]
+    retry_max_attempts: u8,
+
+    /// Retry backoff milliseconds
+    #[arg(long, default_value_t = 500)]
+    retry_backoff_ms: u64,
+
+    /// Print target records but do not send requests
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginCommand {
+    /// Generate a plugin template project
+    Init(PluginInitArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct PluginInitArgs {
+    /// Template language: python|node|rust
+    #[arg(long, default_value = "python")]
+    lang: String,
+
+    /// Plugin id used by template defaults
+    #[arg(long)]
+    plugin_id: String,
+
+    /// Output directory for generated plugin
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Overwrite output directory if it already exists
+    #[arg(long)]
+    force: bool,
+}
+
+static DEAD_LETTER_ENDPOINT_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommand {
@@ -341,6 +428,10 @@ struct PolicyVerifyV1Args {
     /// Output format: text|json
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Readiness profile: standard|strict|lts
+    #[arg(long, default_value = "standard")]
+    readiness_profile: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -651,6 +742,17 @@ struct ScanProfile {
     publish_ms: u128,
     output_ms: u128,
     check_durations_ms: BTreeMap<String, u128>,
+    delivery: DeliveryStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DeliveryStats {
+    webhook_attempted: usize,
+    webhook_succeeded: usize,
+    webhook_failed: usize,
+    notification_attempted: usize,
+    notification_succeeded: usize,
+    notification_failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +791,21 @@ struct AuditLogRecord {
     threshold: Option<u8>,
     changed_files: Option<usize>,
     diagnostic_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeadLetterRecord {
+    schema_version: u8,
+    unix_ts: u64,
+    transport: String,
+    endpoint: String,
+    idempotency_key: String,
+    error: String,
+    payload: Value,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    payload_raw: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -747,6 +864,327 @@ fn main() -> Result<()> {
             let code = execute_policy(&repo_root, cli.config.as_deref(), policy);
             std::process::exit(code);
         }
+        Command::Plugin(plugin) => {
+            let code = execute_plugin(&repo_root, plugin);
+            std::process::exit(code);
+        }
+        Command::Delivery(delivery) => {
+            let code = execute_delivery(delivery);
+            std::process::exit(code);
+        }
+    }
+}
+
+fn execute_plugin(repo_root: &Path, plugin: PluginArgs) -> i32 {
+    match plugin.cmd {
+        PluginCommand::Init(args) => match run_plugin_init(repo_root, args) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("patchgate plugin init error: {err:#}");
+                2
+            }
+        },
+    }
+}
+
+fn execute_delivery(delivery: DeliveryArgs) -> i32 {
+    match delivery.cmd {
+        DeliveryCommand::Replay(args) => match run_dead_letter_replay(args) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("patchgate delivery replay error: {err:#}");
+                6
+            }
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginTemplateLang {
+    Python,
+    Node,
+    Rust,
+}
+
+impl PluginTemplateLang {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "python" => Ok(Self::Python),
+            "node" => Ok(Self::Node),
+            "rust" => Ok(Self::Rust),
+            other => Err(format!("`{other}` (expected: python|node|rust)")),
+        }
+    }
+}
+
+fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
+    let lang = PluginTemplateLang::parse(args.lang.as_str())
+        .map_err(|err| anyhow!("invalid --lang value: {err}"))?;
+    let plugin_id = args.plugin_id.trim();
+    if plugin_id.is_empty() {
+        anyhow::bail!("--plugin-id must be non-empty");
+    }
+    validate_plugin_id(plugin_id)?;
+
+    let repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize repo root {}", repo_root.display()))?;
+    let output_dir = if args.output.is_absolute() {
+        args.output.clone()
+    } else {
+        repo_root.join(args.output.as_path())
+    };
+    let output_dir = normalize_absolute_path(output_dir.as_path());
+    if !output_dir.starts_with(repo_root.as_path()) {
+        anyhow::bail!(
+            "--output must be inside repository root: {}",
+            repo_root.display()
+        );
+    }
+    ensure_output_dir_has_no_symlink_components(repo_root.as_path(), output_dir.as_path())?;
+    if output_dir == repo_root {
+        anyhow::bail!("--output must not point to repository root");
+    }
+    if output_dir.file_name().is_some_and(|name| name == ".git") || output_dir.join(".git").exists()
+    {
+        anyhow::bail!("--output must not target a git repository path");
+    }
+
+    if output_dir.exists() {
+        if !args.force {
+            anyhow::bail!(
+                "output directory already exists: {} (use --force to overwrite)",
+                output_dir.display()
+            );
+        }
+        fs::remove_dir_all(&output_dir)
+            .with_context(|| format!("remove existing output {}", output_dir.display()))?;
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("create output directory {}", output_dir.display()))?;
+    let canonical_output_dir = output_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize output directory {}", output_dir.display()))?;
+    if !canonical_output_dir.starts_with(repo_root.as_path()) {
+        anyhow::bail!(
+            "--output must not resolve outside repository root: {}",
+            repo_root.display()
+        );
+    }
+
+    for (relative, content) in render_plugin_template(lang, plugin_id) {
+        let path = canonical_output_dir.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create parent directory {}", parent.display()))?;
+        }
+        fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    }
+
+    println!(
+        "plugin template generated: lang={} plugin_id={} output={}",
+        args.lang,
+        plugin_id,
+        canonical_output_dir.display()
+    );
+    Ok(())
+}
+
+fn validate_plugin_id(plugin_id: &str) -> Result<()> {
+    if plugin_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("--plugin-id must contain only ASCII letters, digits, '.', '_' or '-'");
+}
+
+fn derive_project_name(plugin_id: &str) -> String {
+    let mut name = String::new();
+    let mut last_was_separator = false;
+    for ch in plugin_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            name.push('-');
+            last_was_separator = true;
+        }
+    }
+    let name = name.trim_matches('-');
+    let mut name = if name.is_empty() {
+        "plugin-template".to_string()
+    } else {
+        name.to_string()
+    };
+    if name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_digit())
+    {
+        name = format!("plugin-{name}");
+    }
+    name
+}
+
+fn ensure_output_dir_has_no_symlink_components(repo_root: &Path, output_dir: &Path) -> Result<()> {
+    let relative = output_dir
+        .strip_prefix(repo_root)
+        .with_context(|| format!("strip repo root prefix from {}", output_dir.display()))?;
+    let mut current = repo_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "--output must not traverse symlinked paths: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspect output path component {}", current.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+const NODE_TEMPLATE_README: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/node-plugin/README.md"
+));
+const NODE_TEMPLATE_SAMPLE_INPUT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/node-plugin/sample-input.json"
+));
+const NODE_TEMPLATE_PACKAGE_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/node-plugin/package.json"
+));
+const NODE_TEMPLATE_INDEX_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/node-plugin/index.js"
+));
+const RUST_TEMPLATE_README: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/rust-plugin/README.md"
+));
+const RUST_TEMPLATE_SAMPLE_INPUT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/rust-plugin/sample-input.json"
+));
+const RUST_TEMPLATE_CARGO_TOML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/rust-plugin/Cargo.toml"
+));
+const RUST_TEMPLATE_MAIN_RS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/rust-plugin/src/main.rs"
+));
+
+fn render_embedded_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = template.to_string();
+    for (from, to) in replacements {
+        rendered = rendered.replace(from, to);
+    }
+    rendered
+}
+
+fn render_plugin_template(
+    lang: PluginTemplateLang,
+    plugin_id: &str,
+) -> Vec<(&'static str, String)> {
+    let project_name = derive_project_name(plugin_id);
+    match lang {
+        PluginTemplateLang::Python => vec![
+            (
+                "README.md",
+                format!(
+                    "# {plugin_id} (Python plugin)\n\nGenerated by `patchgate plugin init`.\n\nRun:\n\n```bash\npython3 main.py < sample-input.json\n```\n"
+                ),
+            ),
+            (
+                "sample-input.json",
+                format!(
+                    "{{\"schema_version\":1,\"api_version\":\"patchgate.plugin.v1\",\"plugin_id\":\"{plugin_id}\",\"repo_root\":\".\",\"mode\":\"warn\",\"scope\":\"worktree\",\"changed_files\":[]}}\n"
+                ),
+            ),
+            (
+                "main.py",
+                format!(
+                    "#!/usr/bin/env python3\nimport json\nimport sys\n\n\ndef main() -> int:\n    raw = sys.stdin.read()\n    if not raw.strip():\n        print(json.dumps({{\"findings\": [], \"diagnostics\": [\"empty input\"]}}))\n        return 0\n\n    payload = json.loads(raw)\n    diagnostics = [\n        \"plugin_id={plugin_id}\",\n        f\"changed_files={{len(payload.get('changed_files', []))}}\",\n    ]\n    print(json.dumps({{\"findings\": [], \"diagnostics\": diagnostics}}))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"
+                ),
+            ),
+        ],
+        PluginTemplateLang::Node => vec![
+            ("README.md", NODE_TEMPLATE_README.to_string()),
+            (
+                "sample-input.json",
+                render_embedded_template(
+                    NODE_TEMPLATE_SAMPLE_INPUT,
+                    &[("\"plugin_id\":\"sample\"", &format!("\"plugin_id\":\"{plugin_id}\""))],
+                ),
+            ),
+            (
+                "package.json",
+                render_embedded_template(
+                    NODE_TEMPLATE_PACKAGE_JSON,
+                    &[("patchgate-node-plugin-template", project_name.as_str())],
+                ),
+            ),
+            (
+                "index.js",
+                render_embedded_template(
+                    NODE_TEMPLATE_INDEX_JS,
+                    &[("\"sample\"", &format!("\"{plugin_id}\""))],
+                ),
+            ),
+        ],
+        PluginTemplateLang::Rust => vec![
+            ("README.md", RUST_TEMPLATE_README.to_string()),
+            (
+                "sample-input.json",
+                render_embedded_template(
+                    RUST_TEMPLATE_SAMPLE_INPUT,
+                    &[("\"plugin_id\":\"sample\"", &format!("\"plugin_id\":\"{plugin_id}\""))],
+                ),
+            ),
+            (
+                "Cargo.toml",
+                render_embedded_template(
+                    RUST_TEMPLATE_CARGO_TOML,
+                    &[("patchgate-rust-plugin-template", project_name.as_str())],
+                ),
+            ),
+            (
+                "src/main.rs",
+                render_embedded_template(
+                    RUST_TEMPLATE_MAIN_RS,
+                    &[("\"sample\"", &format!("\"{plugin_id}\""))],
+                ),
+            ),
+        ],
     }
 }
 
@@ -1208,13 +1646,43 @@ struct V1ReadinessReport {
     ready: bool,
     policy_path: String,
     policy_version: u32,
+    readiness_profile: String,
     rc_frozen: bool,
     strict_compatibility: bool,
     plugins_enabled: bool,
     plugin_entries: usize,
     plugin_sandbox_profile: String,
+    lts_active: bool,
+    lts_security_sla_hours: u16,
     warnings: Vec<String>,
     next_actions: Vec<String>,
+    autofix_suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessProfile {
+    Standard,
+    Strict,
+    Lts,
+}
+
+impl ReadinessProfile {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "standard" => Ok(Self::Standard),
+            "strict" => Ok(Self::Strict),
+            "lts" => Ok(Self::Lts),
+            other => Err(format!("`{other}` (expected: standard|strict|lts)")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+            Self::Lts => "lts",
+        }
+    }
 }
 
 fn run_policy_verify_v1(
@@ -1237,6 +1705,13 @@ fn run_policy_verify_v1(
             return PolicyExitCode::ReadOrParse;
         }
     };
+    let readiness_profile = match ReadinessProfile::parse(args.readiness_profile.as_str()) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v1 error: invalid --readiness-profile: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
 
     let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
         Ok(loaded) => loaded,
@@ -1248,6 +1723,7 @@ fn run_policy_verify_v1(
 
     let mut warnings = loaded.compatibility_warnings.clone();
     let mut next_actions = Vec::new();
+    let mut autofix_suggestions = Vec::new();
     let cfg = loaded.config;
 
     if policy_path
@@ -1264,24 +1740,91 @@ fn run_policy_verify_v1(
         warnings.push("compatibility.v1.rc_frozen=false".to_string());
         next_actions
             .push("Set `compatibility.v1.rc_frozen = true` after RC review freeze.".to_string());
+        autofix_suggestions.push("compatibility.v1.rc_frozen = true".to_string());
     }
     if cfg.compatibility.v1.allow_legacy_config_names {
         warnings.push("compatibility.v1.allow_legacy_config_names=true".to_string());
         next_actions.push(
             "Set `compatibility.v1.allow_legacy_config_names = false` before GA.".to_string(),
         );
+        autofix_suggestions.push("compatibility.v1.allow_legacy_config_names = false".to_string());
     }
     if cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none" {
         warnings.push("plugins enabled with sandbox.profile=none".to_string());
         next_actions.push(
             "Use `plugins.sandbox.profile = \"restricted\"` for v1 secure baseline.".to_string(),
         );
+        autofix_suggestions.push("plugins.sandbox.profile = \"restricted\"".to_string());
+    }
+    if cfg.plugins.enabled
+        && matches!(
+            readiness_profile,
+            ReadinessProfile::Strict | ReadinessProfile::Lts
+        )
+        && cfg.plugins.sandbox.profile != "isolated"
+    {
+        warnings.push(
+            "strict readiness requires plugins.sandbox.profile=isolated when plugins are enabled"
+                .to_string(),
+        );
+        next_actions.push(
+            "Set `plugins.sandbox.profile = \"isolated\"` and verify `bwrap` is available."
+                .to_string(),
+        );
+        autofix_suggestions.push("plugins.sandbox.profile = \"isolated\"".to_string());
+    }
+    if cfg.plugins.enabled
+        && matches!(
+            readiness_profile,
+            ReadinessProfile::Strict | ReadinessProfile::Lts
+        )
+        && cfg.plugins.sandbox.profile == "isolated"
+        && !cfg!(target_os = "linux")
+    {
+        warnings.push(
+            "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
+                .to_string(),
+        );
+        next_actions.push(
+            "Run strict/lts readiness verification on Linux where isolated plugin sandbox is supported."
+                .to_string(),
+        );
+    }
+    if matches!(readiness_profile, ReadinessProfile::Lts) && !cfg.release.lts.active {
+        warnings.push("lts readiness requires release.lts.active=true".to_string());
+        next_actions
+            .push("Enable `[release.lts] active = true` before LTS readiness gate.".to_string());
+        autofix_suggestions.push("release.lts.active = true".to_string());
+    }
+    if matches!(readiness_profile, ReadinessProfile::Lts) && cfg.release.lts.security_sla_hours > 72
+    {
+        warnings.push("lts readiness expects release.lts.security_sla_hours <= 72".to_string());
+        next_actions.push(
+            "Set `release.lts.security_sla_hours` to 72 or lower for default LTS policy."
+                .to_string(),
+        );
+        autofix_suggestions.push("release.lts.security_sla_hours = 72".to_string());
     }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
         && cfg.compatibility.v1.rc_frozen
         && !cfg.compatibility.v1.allow_legacy_config_names
-        && !(cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none");
+        && !(cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none")
+        && (!cfg.plugins.enabled
+            || !matches!(
+                readiness_profile,
+                ReadinessProfile::Strict | ReadinessProfile::Lts
+            )
+            || cfg.plugins.sandbox.profile == "isolated")
+        && (!cfg.plugins.enabled
+            || !matches!(
+                readiness_profile,
+                ReadinessProfile::Strict | ReadinessProfile::Lts
+            )
+            || cfg.plugins.sandbox.profile != "isolated"
+            || cfg!(target_os = "linux"))
+        && (!matches!(readiness_profile, ReadinessProfile::Lts)
+            || (cfg.release.lts.active && cfg.release.lts.security_sla_hours <= 72));
     if ready {
         next_actions.push("v1 readiness checks passed.".to_string());
     }
@@ -1290,13 +1833,17 @@ fn run_policy_verify_v1(
         ready,
         policy_path: policy_path.display().to_string(),
         policy_version: cfg.policy_version,
+        readiness_profile: readiness_profile.as_str().to_string(),
         rc_frozen: cfg.compatibility.v1.rc_frozen,
         strict_compatibility: !cfg.compatibility.v1.allow_legacy_config_names,
         plugins_enabled: cfg.plugins.enabled,
         plugin_entries: cfg.plugins.entries.len(),
         plugin_sandbox_profile: cfg.plugins.sandbox.profile.clone(),
+        lts_active: cfg.release.lts.active,
+        lts_security_sla_hours: cfg.release.lts.security_sla_hours,
         warnings,
         next_actions,
+        autofix_suggestions,
     };
 
     match args.format.as_str() {
@@ -1312,6 +1859,7 @@ fn run_policy_verify_v1(
             println!("- ready: {}", report.ready);
             println!("- policy_path: {}", report.policy_path);
             println!("- policy_version: {}", report.policy_version);
+            println!("- readiness_profile: {}", report.readiness_profile);
             println!("- rc_frozen: {}", report.rc_frozen);
             println!("- strict_compatibility: {}", report.strict_compatibility);
             println!("- plugins_enabled: {}", report.plugins_enabled);
@@ -1319,6 +1867,11 @@ fn run_policy_verify_v1(
             println!(
                 "- plugin_sandbox_profile: {}",
                 report.plugin_sandbox_profile
+            );
+            println!("- lts_active: {}", report.lts_active);
+            println!(
+                "- lts_security_sla_hours: {}",
+                report.lts_security_sla_hours
             );
             if report.warnings.is_empty() {
                 println!("- warnings: none");
@@ -1331,6 +1884,14 @@ fn run_policy_verify_v1(
             println!("- next_actions:");
             for action in &report.next_actions {
                 println!("  - {action}");
+            }
+            if report.autofix_suggestions.is_empty() {
+                println!("- autofix_suggestions: none");
+            } else {
+                println!("- autofix_suggestions:");
+                for suggestion in &report.autofix_suggestions {
+                    println!("  - {suggestion}");
+                }
             }
         }
         other => {
@@ -1472,10 +2033,12 @@ fn execute_scan(
         webhook_urls,
         webhook_secret_env,
         webhook_timeout_ms,
+        webhook_retry_max_attempts,
         notify_targets,
         notify_retry_max_attempts,
         notify_retry_backoff_ms,
         notify_timeout_ms,
+        dead_letter_output,
     } = scan;
     let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
     let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
@@ -1562,7 +2125,7 @@ fn execute_scan(
         })
     };
 
-    let report = if profile.changed_files > cfg.scope.max_changed_files as usize {
+    let mut report = if profile.changed_files > cfg.scope.max_changed_files as usize {
         match cfg.scope.on_exceed.as_str() {
             "fail_open" => {
                 eprintln!(
@@ -1842,18 +2405,30 @@ fn execute_scan(
         profile.publish_ms = publish_start.elapsed().as_millis();
     }
 
+    let dead_letter_path = dead_letter_output
+        .as_ref()
+        .map(|p| resolve_repo_relative_path(repo_root, p.clone()));
+    let idempotency_key = build_delivery_idempotency_key(telemetry_repo.as_str(), &report);
+
     let webhook_targets = resolve_webhook_targets(&cfg, &webhook_urls);
     if !webhook_targets.is_empty() {
         let timeout_ms = webhook_timeout_ms.unwrap_or(cfg.integrations.webhook.timeout_ms);
         let secret_env = webhook_secret_env
             .as_deref()
             .unwrap_or(cfg.integrations.webhook.secret_env.as_str());
+        let retry_max_attempts = webhook_retry_max_attempts.unwrap_or(3);
         dispatch_signed_webhooks(
             telemetry_repo.as_str(),
             &report,
             &webhook_targets,
-            timeout_ms,
-            secret_env,
+            WebhookDispatchOptions {
+                timeout_ms,
+                retry_max_attempts,
+                secret_env,
+                idempotency_key: idempotency_key.as_str(),
+                dead_letter_path: dead_letter_path.as_deref(),
+            },
+            &mut profile.delivery,
         )
         .map_err(|err| {
             ScanError::with_hint(
@@ -1878,9 +2453,16 @@ fn execute_scan(
             telemetry_repo.as_str(),
             &report,
             notification_targets.as_slice(),
-            notify_retry_max_attempts.unwrap_or(cfg.integrations.notifications.retry_max_attempts),
-            notify_retry_backoff_ms.unwrap_or(cfg.integrations.notifications.retry_backoff_ms),
-            notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
+            NotificationDispatchOptions {
+                retry_max_attempts: notify_retry_max_attempts
+                    .unwrap_or(cfg.integrations.notifications.retry_max_attempts),
+                retry_backoff_ms: notify_retry_backoff_ms
+                    .unwrap_or(cfg.integrations.notifications.retry_backoff_ms),
+                timeout_ms: notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
+                idempotency_key: idempotency_key.as_str(),
+                dead_letter_path: dead_letter_path.as_deref(),
+            },
+            &mut profile.delivery,
         )
         .map_err(|err| {
             ScanError::with_hint(
@@ -1891,6 +2473,20 @@ fn execute_scan(
             )
         })?;
     }
+
+    if profile.delivery.webhook_failed > 0 || profile.delivery.notification_failed > 0 {
+        report.diagnostic_hints.push(format!(
+            "delivery failures: webhook_failed={}, notification_failed={}",
+            profile.delivery.webhook_failed, profile.delivery.notification_failed
+        ));
+    }
+    report.diagnostic_hints.push(format!(
+        "delivery stats: webhook {}/{}, notification {}/{}",
+        profile.delivery.webhook_succeeded,
+        profile.delivery.webhook_attempted,
+        profile.delivery.notification_succeeded,
+        profile.delivery.notification_attempted
+    ));
 
     let output_start = Instant::now();
     match opts.format.as_str() {
@@ -2545,16 +3141,243 @@ fn resolve_notification_targets(
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct WebhookDispatchOptions<'a> {
+    timeout_ms: u64,
+    retry_max_attempts: u8,
+    secret_env: &'a str,
+    idempotency_key: &'a str,
+    dead_letter_path: Option<&'a Path>,
+}
+
+struct NotificationDispatchOptions<'a> {
+    retry_max_attempts: u8,
+    retry_backoff_ms: u64,
+    timeout_ms: u64,
+    idempotency_key: &'a str,
+    dead_letter_path: Option<&'a Path>,
+}
+
+struct DeadLetterWriteOptions<'a> {
+    transport: &'a str,
+    endpoint: &'a str,
+    idempotency_key: &'a str,
+    error: &'a str,
+    payload: &'a Value,
+    headers: Option<&'a BTreeMap<String, String>>,
+    payload_raw: Option<&'a str>,
+}
+
+fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(telemetry_repo.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.fingerprint.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.mode.as_bytes());
+    hasher.update(b":");
+    hasher.update(report.scope.as_bytes());
+    let digest = hasher.finalize();
+    format!("pgv1-{}", encode_hex(digest.as_slice()))
+}
+
+fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let safe_endpoint = redacted_endpoint(options.endpoint);
+    if safe_endpoint != options.endpoint
+        && !DEAD_LETTER_ENDPOINT_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "warning: dead-letter records persist raw endpoint URLs; treat {} as secret material",
+            path.display()
+        );
+    }
+    let record = DeadLetterRecord {
+        schema_version: 1,
+        unix_ts: current_unix_ts(),
+        transport: options.transport.to_string(),
+        endpoint: options.endpoint.to_string(),
+        idempotency_key: options.idempotency_key.to_string(),
+        error: options.error.to_string(),
+        payload: options.payload.clone(),
+        headers: options.headers.cloned().unwrap_or_default(),
+        payload_raw: options.payload_raw.map(ToOwned::to_owned),
+    };
+    append_jsonl(path, &record).context("failed to append dead-letter record")
+}
+
+fn load_dead_letter_jsonl(
+    path: &Path,
+    transport_filter: Option<&str>,
+    max_records: Option<usize>,
+) -> Result<Vec<DeadLetterRecord>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("open dead-letter: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} from {}", idx + 1, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<DeadLetterRecord>(&line).with_context(|| {
+            format!(
+                "decode dead-letter line {} from {}",
+                idx + 1,
+                path.display()
+            )
+        })?;
+        validate_dead_letter_record(&row, path, idx + 1)?;
+        if let Some(filter) = transport_filter {
+            if row.transport != filter {
+                continue;
+            }
+        }
+        rows.push(row);
+        if let Some(limit) = max_records {
+            if rows.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn validate_dead_letter_record(
+    record: &DeadLetterRecord,
+    path: &Path,
+    line_number: usize,
+) -> Result<()> {
+    if record.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported dead-letter schema_version {} in line {} from {}",
+            record.schema_version,
+            line_number,
+            path.display()
+        );
+    }
+    if record.transport != "webhook" && record.transport != "notification" {
+        anyhow::bail!(
+            "unsupported dead-letter transport `{}` in line {} from {}",
+            record.transport,
+            line_number,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
+    let transport_filter = args.transport.as_deref();
+    if let Some(transport) = transport_filter {
+        if transport != "webhook" && transport != "notification" {
+            anyhow::bail!(
+                "invalid --transport value `{transport}` (expected: webhook|notification)"
+            );
+        }
+    }
+    let records = load_dead_letter_jsonl(&args.input, transport_filter, args.max_records)?;
+    if records.is_empty() {
+        println!("no dead-letter records to replay");
+        return Ok(());
+    }
+
+    let attempts = args.retry_max_attempts.max(1);
+    let client = Client::builder()
+        .timeout(Duration::from_millis(5_000))
+        .build()
+        .context("failed to build replay client")?;
+    let mut replayed = 0usize;
+    for record in records {
+        if record.endpoint.contains("***") {
+            eprintln!(
+                "skip replay (redacted endpoint): transport={} endpoint={}",
+                record.transport, record.endpoint
+            );
+            continue;
+        }
+        if args.dry_run {
+            println!(
+                "dry-run replay: transport={} endpoint={} idempotency_key={}",
+                record.transport,
+                redacted_endpoint(record.endpoint.as_str()),
+                record.idempotency_key
+            );
+            replayed += 1;
+            continue;
+        }
+
+        let body = match record.payload_raw.as_ref() {
+            Some(raw) => raw.as_bytes().to_vec(),
+            None => serde_json::to_vec(&record.payload).context("encode dead-letter payload")?,
+        };
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=attempts {
+            let mut request = client
+                .post(record.endpoint.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    "X-Patchgate-Idempotency-Key",
+                    record.idempotency_key.as_str(),
+                );
+            for (header_name, header_value) in &record.headers {
+                let name = HeaderName::from_bytes(header_name.as_bytes()).with_context(|| {
+                    format!("invalid dead-letter header name for replay: {header_name}")
+                })?;
+                let value = HeaderValue::from_str(header_value).with_context(|| {
+                    format!("invalid dead-letter header value for replay: {header_name}")
+                })?;
+                request = request.header(name, value);
+            }
+            let response = request.body(body.clone()).send();
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    last_error = None;
+                    break;
+                }
+                Ok(resp) => {
+                    last_error = Some(anyhow!(
+                        "replay target returned status {} for {}",
+                        resp.status(),
+                        redacted_endpoint(record.endpoint.as_str())
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(anyhow!(err).context(format!(
+                        "replay request failed for {}",
+                        redacted_endpoint(record.endpoint.as_str())
+                    )));
+                }
+            }
+            if attempt < attempts {
+                let delay = args
+                    .retry_backoff_ms
+                    .saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err).context("dead-letter replay failed");
+        }
+        replayed += 1;
+    }
+    println!("dead-letter replay completed: replayed_records={replayed}");
+    Ok(())
+}
+
 fn dispatch_signed_webhooks(
     telemetry_repo: &str,
     report: &Report,
     urls: &[String],
-    timeout_ms: u64,
-    secret_env: &str,
+    options: WebhookDispatchOptions<'_>,
+    delivery: &mut DeliveryStats,
 ) -> Result<()> {
     if urls.is_empty() {
         return Ok(());
     }
+    let attempts = options.retry_max_attempts.max(1);
     let sanitized_report = sanitize_report_for_external(report)?;
     let unix_ts = current_unix_ts();
     let envelope = WebhookEnvelope {
@@ -2563,14 +3386,18 @@ fn dispatch_signed_webhooks(
         repo: telemetry_repo,
         report: &sanitized_report,
     };
-    let body = mask_sensitive(serde_json::to_string(&envelope)?.as_str()).into_bytes();
+    let payload_value = serde_json::to_value(&envelope)?;
+    let payload_raw = mask_sensitive(serde_json::to_string(&envelope)?.as_str());
+    let body = payload_raw.as_bytes().to_vec();
     let timestamp = unix_ts.to_string();
-    let signature = resolve_webhook_signature(secret_env, timestamp.as_bytes(), body.as_slice())?;
+    let signature =
+        resolve_webhook_signature(options.secret_env, timestamp.as_bytes(), body.as_slice())?;
     let client = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(Duration::from_millis(options.timeout_ms))
         .build()
         .context("failed to build webhook client")?;
     for url in urls {
+        delivery.webhook_attempted += 1;
         let safe_url = redacted_endpoint(url.as_str());
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -2586,18 +3413,66 @@ fn dispatch_signed_webhooks(
             HeaderName::from_static("x-patchgate-signature"),
             HeaderValue::from_str(signature.as_str())?,
         );
-        let response = client
-            .post(url)
-            .headers(headers)
-            .body(body.clone())
-            .send()
-            .with_context(|| format!("webhook request failed: {safe_url}"))?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "webhook endpoint returned {} for {}",
-                response.status(),
-                safe_url
-            ));
+        headers.insert(
+            HeaderName::from_static("x-patchgate-idempotency-key"),
+            HeaderValue::from_str(options.idempotency_key)?,
+        );
+        let mut replay_headers = BTreeMap::new();
+        replay_headers.insert(
+            "X-Patchgate-Event".to_string(),
+            "scan.completed".to_string(),
+        );
+        replay_headers.insert("X-Patchgate-Timestamp".to_string(), timestamp.clone());
+        replay_headers.insert("X-Patchgate-Signature".to_string(), signature.clone());
+
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=attempts {
+            let response = client
+                .post(url)
+                .headers(headers.clone())
+                .body(body.clone())
+                .send();
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    delivery.webhook_succeeded += 1;
+                    last_error = None;
+                    break;
+                }
+                Ok(resp) => {
+                    last_error = Some(anyhow!(
+                        "webhook endpoint returned {} for {}",
+                        resp.status(),
+                        safe_url
+                    ));
+                }
+                Err(err) => {
+                    last_error =
+                        Some(anyhow!(err).context(format!("webhook request failed: {safe_url}")));
+                }
+            }
+            if attempt < attempts {
+                let delay = 250u64.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        if let Some(err) = last_error {
+            delivery.webhook_failed += 1;
+            let error_message = format!("{err:#}");
+            if let Err(dead_err) = append_dead_letter(
+                options.dead_letter_path,
+                DeadLetterWriteOptions {
+                    transport: "webhook",
+                    endpoint: url,
+                    idempotency_key: options.idempotency_key,
+                    error: error_message.as_str(),
+                    payload: &payload_value,
+                    headers: Some(&replay_headers),
+                    payload_raw: Some(payload_raw.as_str()),
+                },
+            ) {
+                eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
+            }
+            return Err(err);
         }
     }
     Ok(())
@@ -2618,20 +3493,27 @@ fn dispatch_notifications(
     telemetry_repo: &str,
     report: &Report,
     targets: &[ResolvedNotificationTarget],
-    retry_max_attempts: u8,
-    retry_backoff_ms: u64,
-    timeout_ms: u64,
+    options: NotificationDispatchOptions<'_>,
+    delivery: &mut DeliveryStats,
 ) -> Result<()> {
-    let attempts = retry_max_attempts.max(1);
+    let attempts = options.retry_max_attempts.max(1);
     let client = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(Duration::from_millis(options.timeout_ms))
         .build()
         .context("failed to build notifications client")?;
 
     for target in targets {
+        delivery.notification_attempted += 1;
         let safe_url = redacted_endpoint(target.url.as_str());
-        let payload = notification_payload(target.kind, telemetry_repo, report)?;
-        let body = mask_sensitive(serde_json::to_string(&payload)?.as_str()).into_bytes();
+        let mut payload = notification_payload(target.kind, telemetry_repo, report)?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "idempotency_key".to_string(),
+                Value::String(options.idempotency_key.to_string()),
+            );
+        }
+        let payload_raw = mask_sensitive(serde_json::to_string(&payload)?.as_str());
+        let body = payload_raw.as_bytes().to_vec();
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
             let response = client
@@ -2660,14 +3542,32 @@ fn dispatch_notifications(
                 }
             }
             if attempt < attempts {
-                let delay =
-                    retry_backoff_ms.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+                let delay = options
+                    .retry_backoff_ms
+                    .saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
                 thread::sleep(Duration::from_millis(delay.min(10_000)));
             }
         }
         if let Some(err) = last_error {
+            delivery.notification_failed += 1;
+            let error_message = format!("{err:#}");
+            if let Err(dead_err) = append_dead_letter(
+                options.dead_letter_path,
+                DeadLetterWriteOptions {
+                    transport: "notification",
+                    endpoint: target.url.as_str(),
+                    idempotency_key: options.idempotency_key,
+                    error: error_message.as_str(),
+                    payload: &payload,
+                    headers: None,
+                    payload_raw: Some(payload_raw.as_str()),
+                },
+            ) {
+                eprintln!("warning: failed to write dead-letter record: {dead_err:#}");
+            }
             return Err(err);
         }
+        delivery.notification_succeeded += 1;
     }
     Ok(())
 }
@@ -3497,18 +4397,20 @@ mod tests {
     use patchgate_github::PublishAuth;
 
     use super::{
-        append_scan_failure_records, apply_changed_file_overrides, apply_threshold_override,
-        build_cache_key, build_history_summary, build_history_trend,
-        changed_file_limit_fail_open_report, detect_head_sha_from_env, detect_pr_number_from_env,
-        gate_exit_code, is_likely_cache_corruption, notification_payload, parse_mode,
+        append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
+        apply_threshold_override, build_cache_key, build_delivery_idempotency_key,
+        build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
+        detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
+        is_likely_cache_corruption, load_dead_letter_jsonl, notification_payload, parse_mode,
         parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
         pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
         recover_cache_db, redacted_endpoint, render_github_comment, resolve_audit_actor,
         resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
         resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_policy_lint, run_policy_verify_v1,
-        sign_webhook_payload, sorted_findings_for_comment, CiProvider, FailureCode,
-        NotificationKind, OptionSource, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        run_policy_lint, run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment,
+        CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
+        OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
         PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
         ScanMetricRecord, ScopeMode,
     };
@@ -3602,10 +4504,12 @@ mod tests {
             webhook_urls: Vec::new(),
             webhook_secret_env: None,
             webhook_timeout_ms: None,
+            webhook_retry_max_attempts: None,
             notify_targets: Vec::new(),
             notify_retry_max_attempts: None,
             notify_retry_backoff_ms: None,
             notify_timeout_ms: None,
+            dead_letter_output: None,
         }
     }
 
@@ -4642,6 +5546,7 @@ allow_legacy_config_names = true
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -4675,9 +5580,126 @@ allow_legacy_config_names = false
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_strict_requires_isolated_sandbox_when_plugins_enabled() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-strict-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "restricted"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_lts_requires_lts_active() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-lts-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[release.lts]
+active = false
+security_sla_hours = 72
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "lts".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn policy_verify_v1_strict_requires_linux_runtime_for_isolated_plugins() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!(
+            "patchgate-cli-policy-verify-v1-strict-runtime-{seq}"
+        ));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "isolated"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -4708,6 +5730,191 @@ allow_legacy_config_names = false
             sign_webhook_payload(b"secret", b"1700000000", br#"{"ok":true}"#).expect("signature");
         assert!(sig.starts_with("sha256="));
         assert_eq!(sig.len(), "sha256=".len() + 64);
+    }
+
+    #[test]
+    fn delivery_idempotency_key_is_stable_for_same_report() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let key1 = build_delivery_idempotency_key("example/repo", &report);
+        let key2 = build_delivery_idempotency_key("example/repo", &report);
+        assert_eq!(key1, key2);
+        assert!(key1.starts_with("pgv1-"));
+    }
+
+    #[test]
+    fn append_dead_letter_writes_jsonl_record() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-dead-letter-{seq}"));
+        fs::create_dir_all(&dir).expect("create dead-letter dir");
+        let path = dir.join("dead-letter.jsonl");
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "X-Patchgate-Signature".to_string(),
+            "sha256=testsignature".to_string(),
+        );
+        append_dead_letter(
+            Some(path.as_path()),
+            DeadLetterWriteOptions {
+                transport: "webhook",
+                endpoint: "https://hooks.example.com/***",
+                idempotency_key: "pgv1-key",
+                error: "test error",
+                payload: &serde_json::json!({ "event": "scan.completed" }),
+                headers: Some(&headers),
+                payload_raw: Some("{\"event\":\"scan.completed\"}"),
+            },
+        )
+        .expect("append dead-letter");
+        let content = fs::read_to_string(&path).expect("read dead-letter file");
+        assert!(content.contains("\"transport\":\"webhook\""));
+        assert!(content.contains("\"idempotency_key\":\"pgv1-key\""));
+        assert!(
+            content.contains("\"headers\":{\"X-Patchgate-Signature\":\"sha256=testsignature\"}")
+        );
+        assert!(content.contains("\"payload_raw\":\"{\\\"event\\\":\\\"scan.completed\\\"}\""));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_dry_run_succeeds() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-dry-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: "https://example.internal/hook",
+                idempotency_key: "pgv1-replay-key",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification", "summary": { "score": 90 } }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed dead-letter");
+
+        run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            dry_run: true,
+        })
+        .expect("replay dry-run");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_rejects_unknown_transport() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-transport-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: "https://example.internal/hook",
+                idempotency_key: "pgv1-replay-key",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification" }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed dead-letter");
+        let err = run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("webhhok".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            dry_run: true,
+        })
+        .expect_err("must reject unknown transport");
+        assert!(format!("{err:#}").contains("invalid --transport value"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_applies_filter_and_limit_while_reading() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-filter-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            concat!(
+                "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+                "{\"schema_version\":1,\"unix_ts\":2,\"transport\":\"webhook\",\"endpoint\":\"https://example.invalid/two\",\"idempotency_key\":\"k2\",\"error\":\"timeout\",\"payload\":{\"event\":\"two\"},\"headers\":{},\"payload_raw\":null}\n",
+                "{\"schema_version\":1,\"unix_ts\":3,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/three\",\"idempotency_key\":\"k3\",\"error\":\"timeout\",\"payload\":{\"event\":\"three\"},\"headers\":{},\"payload_raw\":null}\n"
+            ),
+        )
+        .expect("seed dead-letter");
+
+        let rows = load_dead_letter_jsonl(&input, Some("notification"), Some(1))
+            .expect("load filtered dead-letter");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, "notification");
+        assert_eq!(rows[0].idempotency_key, "k1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_rejects_unknown_schema_version() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-schema-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            "{\"schema_version\":2,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        let err = load_dead_letter_jsonl(&input, None, None).expect_err("must reject schema");
+        assert!(format!("{err:#}").contains("unsupported dead-letter schema_version 2"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_rejects_unknown_transport_rows() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-row-transport-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"email\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        let err = load_dead_letter_jsonl(&input, None, None).expect_err("must reject transport");
+        assert!(format!("{err:#}").contains("unsupported dead-letter transport `email`"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4883,6 +6090,258 @@ allow_legacy_config_names = false
         assert!(written.contains("bearer ***"), "payload should be masked");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plugin_init_generates_python_template_files() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-python-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let output = repo_root.join("generated-plugin");
+
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "python".to_string(),
+                plugin_id: "sample-plugin".to_string(),
+                output: PathBuf::from("generated-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate template");
+
+        let main_py = fs::read_to_string(output.join("main.py")).expect("main.py");
+        assert!(main_py.contains("plugin_id=sample-plugin"));
+        assert!(output.join("README.md").exists());
+        assert!(output.join("sample-input.json").exists());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_generates_node_template_from_sdk_assets() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-node-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let output = repo_root.join("generated-node-plugin");
+
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("generated-node-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate node template");
+
+        let package_json = fs::read_to_string(output.join("package.json")).expect("package.json");
+        let index_js = fs::read_to_string(output.join("index.js")).expect("index.js");
+        let sample_input =
+            fs::read_to_string(output.join("sample-input.json")).expect("sample-input.json");
+        assert!(package_json.contains("\"name\": \"sample-node-plugin\""));
+        assert!(index_js.contains("invalid json input:"));
+        assert!(index_js.contains("payload.plugin_id ?? \"sample-node-plugin\""));
+        assert!(sample_input.contains("\"plugin_id\":\"sample-node-plugin\""));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_sanitizes_project_names_for_package_manifests() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-project-name-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let node_output = repo_root.join("generated-node-plugin");
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "Sample.Plugin_01".to_string(),
+                output: PathBuf::from("generated-node-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate node template");
+        let node_package =
+            fs::read_to_string(node_output.join("package.json")).expect("package.json");
+        assert!(node_package.contains("\"name\": \"sample-plugin-01\""));
+
+        let rust_output = repo_root.join("generated-rust-plugin");
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "rust".to_string(),
+                plugin_id: "Sample.Plugin_01".to_string(),
+                output: PathBuf::from("generated-rust-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate rust template");
+        let cargo_toml = fs::read_to_string(rust_output.join("Cargo.toml")).expect("Cargo.toml");
+        assert!(cargo_toml.contains("name = \"sample-plugin-01\""));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_generates_rust_template_with_workspace_boundary() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-rust-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let output = repo_root.join("generated-rust-plugin");
+
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "rust".to_string(),
+                plugin_id: "sample-rust-plugin".to_string(),
+                output: PathBuf::from("generated-rust-plugin"),
+                force: false,
+            },
+        )
+        .expect("generate rust template");
+
+        let cargo_toml = fs::read_to_string(output.join("Cargo.toml")).expect("Cargo.toml");
+        let main_rs = fs::read_to_string(output.join("src/main.rs")).expect("src/main.rs");
+        assert!(cargo_toml.contains("[workspace]"));
+        assert!(cargo_toml.contains("name = \"sample-rust-plugin\""));
+        assert!(main_rs.contains("invalid json input:"));
+        assert!(main_rs.contains("unwrap_or(\"sample-rust-plugin\")"));
+        assert!(output.join("src/main.rs").exists());
+        assert!(output.join("sample-input.json").exists());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_invalid_plugin_id_characters() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-invalid-plugin-id-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "bad id".to_string(),
+                output: PathBuf::from("generated-node-plugin"),
+                force: false,
+            },
+        )
+        .expect_err("must reject invalid plugin id");
+        assert!(format!("{err:#}").contains("must contain only ASCII letters"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_refuses_existing_output_without_force() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-force-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let output = repo_root.join("existing");
+        fs::create_dir_all(&output).expect("create output dir");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "node-plugin".to_string(),
+                output: PathBuf::from("existing"),
+                force: false,
+            },
+        )
+        .expect_err("must fail");
+        assert!(format!("{err:#}").contains("already exists"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_repo_root_output_even_with_force() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-root-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "python".to_string(),
+                plugin_id: "sample-plugin".to_string(),
+                output: PathBuf::from("."),
+                force: true,
+            },
+        )
+        .expect_err("must reject repo root");
+        assert!(format!("{err:#}").contains("must not point to repository root"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_output_outside_repo_root() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-outside-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("../outside"),
+                force: false,
+            },
+        )
+        .expect_err("must reject outside path");
+        assert!(format!("{err:#}").contains("must be inside repository root"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_init_rejects_symlinked_output_components() {
+        use std::os::unix::fs::symlink;
+
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-symlink-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut outside_root = std::env::temp_dir();
+        outside_root.push(format!("patchgate-plugin-init-symlink-target-{seq}"));
+        fs::create_dir_all(&outside_root).expect("create outside root");
+
+        let link_path = repo_root.join("linked");
+        symlink(&outside_root, &link_path).expect("create symlink");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("linked/generated"),
+                force: false,
+            },
+        )
+        .expect_err("must reject symlink traversal");
+        assert!(format!("{err:#}").contains("must not traverse symlinked paths"));
+
+        let _ = fs::remove_file(&link_path);
+        let _ = fs::remove_dir_all(&outside_root);
+        let _ = fs::remove_dir_all(&repo_root);
     }
 
     #[test]

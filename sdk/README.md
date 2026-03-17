@@ -5,12 +5,16 @@
 ## Quickstart
 
 ```bash
-cp -R sdk/templates/python-plugin my-plugin
-cd my-plugin
-python3 main.py <<'JSON'
-{"schema_version":1,"api_version":"patchgate.plugin.v1","plugin_id":"sample","repo_root":".","mode":"warn","scope":"worktree","changed_files":[]}
-JSON
+patchgate plugin init --lang python --plugin-id sample --output ./my-plugin
+patchgate plugin init --lang node --plugin-id sample-node --output ./my-node-plugin
+patchgate plugin init --lang rust --plugin-id sample-rust --output ./my-rust-plugin
 ```
+
+Templates:
+
+- `sdk/templates/python-plugin`
+- `sdk/templates/node-plugin`
+- `sdk/templates/rust-plugin`
 
 ## Contract
 

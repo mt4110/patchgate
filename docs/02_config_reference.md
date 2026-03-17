@@ -32,10 +32,13 @@
   - `enabled`
   - `entries = [{ id, command, args, timeout_ms, fail_mode }]`
 - `[plugins.sandbox]`
-  - `profile = "none" | "restricted"`
+  - `profile = "none" | "restricted" | "isolated"`（`isolated` は Linux + `bwrap` 前提）
   - `allow_network`
   - `env_allowlist`
   - `max_stdout_kib`
+- `[plugins.signature]`
+  - `required`
+  - `public_key_env`（ed25519 public key を base64 で渡す環境変数名）
 
 ## Integration sections (Phase85-87)
 

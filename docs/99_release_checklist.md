@@ -21,6 +21,8 @@ CI/Workflowで自動化済み:
 
 - [ ] **Policy Compatibility**: `patchgate policy lint --path config/policy.toml.example --require-current-version`
 - [ ] **v1 Readiness**: `patchgate policy verify-v1 --path config/policy.toml.example`
+  - [ ] strict profile: `--readiness-profile strict`
+  - [ ] lts profile: `--readiness-profile lts`
 - [ ] **Plugin/Sandbox**:
   - [ ] `plugins.sandbox.profile = "restricted"`
   - [ ] plugin timeout / fail_mode が設定済み
@@ -28,6 +30,8 @@ CI/Workflowで自動化済み:
 - [ ] **Webhook/Notification**:
   - [ ] 署名secret設定確認
   - [ ] 通知先疎通確認
+  - [ ] `--dead-letter-output` の保存先確認
+  - [ ] dead-letter replay: `patchgate delivery replay --input artifacts/dead-letter.jsonl --dry-run`
 - [ ] **Observability Contract**:
   - [ ] `scan-metrics.jsonl` 出力
   - [ ] `scan-audit.jsonl` (`patchgate.audit.v1`) 出力
@@ -44,6 +48,7 @@ CI/Workflowで自動化済み:
 - [ ] **Tag**: `git tag -s vX.Y.Z -m "Release vX.Y.Z"`
 - [ ] **Artifact**: release binary + `SHA256SUMS`
 - [ ] **SBOM-like metadata**: `sbom.cargo-metadata.json`（`cargo metadata` 出力）を生成・添付
+- [ ] **Provenance metadata**: `provenance.intoto.jsonl` を生成・添付
 
 ## Post-Release
 
