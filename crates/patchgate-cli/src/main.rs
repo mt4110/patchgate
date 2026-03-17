@@ -945,8 +945,7 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
     if output_dir == repo_root {
         anyhow::bail!("--output must not point to repository root");
     }
-    if output_dir.file_name().is_some_and(|name| name == ".git") || output_dir.join(".git").exists()
-    {
+    if has_git_component(output_dir.as_path()) || output_dir.join(".git").exists() {
         anyhow::bail!("--output must not target a git repository path");
     }
 
@@ -988,6 +987,11 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
         canonical_output_dir.display()
     );
     Ok(())
+}
+
+fn has_git_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
 }
 
 fn validate_plugin_id(plugin_id: &str) -> Result<()> {
@@ -1725,6 +1729,7 @@ fn run_policy_verify_v1(
     let mut next_actions = Vec::new();
     let mut autofix_suggestions = Vec::new();
     let cfg = loaded.config;
+    let isolated_runtime_supported = isolated_sandbox_runtime_supported();
 
     if policy_path
         .file_name()
@@ -1790,6 +1795,24 @@ fn run_policy_verify_v1(
                 .to_string(),
         );
     }
+    if cfg.plugins.enabled
+        && matches!(
+            readiness_profile,
+            ReadinessProfile::Strict | ReadinessProfile::Lts
+        )
+        && cfg.plugins.sandbox.profile == "isolated"
+        && cfg!(target_os = "linux")
+        && !isolated_runtime_supported
+    {
+        warnings.push(
+            "strict/lts readiness with plugins.sandbox.profile=isolated requires bwrap on Linux"
+                .to_string(),
+        );
+        next_actions.push(
+            "Install `bwrap` (bubblewrap) before relying on isolated plugin sandbox readiness."
+                .to_string(),
+        );
+    }
     if matches!(readiness_profile, ReadinessProfile::Lts) && !cfg.release.lts.active {
         warnings.push("lts readiness requires release.lts.active=true".to_string());
         next_actions
@@ -1822,7 +1845,7 @@ fn run_policy_verify_v1(
                 ReadinessProfile::Strict | ReadinessProfile::Lts
             )
             || cfg.plugins.sandbox.profile != "isolated"
-            || cfg!(target_os = "linux"))
+            || isolated_runtime_supported)
         && (!matches!(readiness_profile, ReadinessProfile::Lts)
             || (cfg.release.lts.active && cfg.release.lts.security_sla_hours <= 72));
     if ready {
@@ -1906,6 +1929,30 @@ fn run_policy_verify_v1(
         PolicyExitCode::Ok
     } else {
         PolicyExitCode::MigrationRequired
+    }
+}
+
+fn isolated_sandbox_runtime_supported() -> bool {
+    #[cfg(test)]
+    match BWRAP_AVAILABLE_OVERRIDE.load(Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ProcessCommand::new("bwrap")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -3166,6 +3213,9 @@ struct DeadLetterWriteOptions<'a> {
     headers: Option<&'a BTreeMap<String, String>>,
     payload_raw: Option<&'a str>,
 }
+
+#[cfg(test)]
+static BWRAP_AVAILABLE_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> String {
     let mut hasher = Sha256::new();
@@ -5704,6 +5754,48 @@ profile = "isolated"
         let _ = fs::remove_dir_all(repo_root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_verify_v1_strict_requires_bwrap_for_isolated_plugins() {
+        let _guard = env_lock();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v1-strict-bwrap-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "isolated"
+"#,
+        )
+        .expect("write policy");
+
+        super::BWRAP_AVAILABLE_OVERRIDE.store(0, Ordering::Relaxed);
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+            },
+        );
+        super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
     #[test]
     fn resolve_ci_provider_prefers_cli_value() {
         let provider = resolve_ci_provider(Some("generic"), Some("github")).expect("provider");
@@ -6306,6 +6398,28 @@ profile = "isolated"
         )
         .expect_err("must reject outside path");
         assert!(format!("{err:#}").contains("must be inside repository root"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_rejects_git_internal_output_paths() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-plugin-init-git-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let err = run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from(".git/hooks/my-plugin"),
+                force: false,
+            },
+        )
+        .expect_err("must reject .git internal path");
+        assert!(format!("{err:#}").contains("must not target a git repository path"));
 
         let _ = fs::remove_dir_all(repo_root);
     }
