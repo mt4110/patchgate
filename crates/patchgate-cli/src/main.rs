@@ -945,7 +945,15 @@ fn run_plugin_init(repo_root: &Path, args: PluginInitArgs) -> Result<()> {
     if output_dir == repo_root {
         anyhow::bail!("--output must not point to repository root");
     }
-    if has_git_component(output_dir.as_path()) || output_dir.join(".git").exists() {
+    let relative_output_dir = output_dir
+        .strip_prefix(repo_root.as_path())
+        .with_context(|| {
+            format!(
+                "strip repo root prefix from output directory {}",
+                output_dir.display()
+            )
+        })?;
+    if has_git_component(relative_output_dir) || output_dir.join(".git").exists() {
         anyhow::bail!("--output must not target a git repository path");
     }
 
@@ -6422,6 +6430,29 @@ profile = "isolated"
         assert!(format!("{err:#}").contains("must not target a git repository path"));
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_init_allows_repo_under_dot_git_parent_directory() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_parent = std::env::temp_dir();
+        repo_parent.push(format!("patchgate-plugin-init-parent-dot-git-{seq}"));
+        let repo_root = repo_parent.join(".git").join("repo");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        run_plugin_init(
+            &repo_root,
+            PluginInitArgs {
+                lang: "node".to_string(),
+                plugin_id: "sample-node-plugin".to_string(),
+                output: PathBuf::from("generated/plugin"),
+                force: false,
+            },
+        )
+        .expect("repo under .git parent should be allowed");
+
+        assert!(repo_root.join("generated/plugin/package.json").exists());
+        let _ = fs::remove_dir_all(repo_parent);
     }
 
     #[cfg(unix)]
