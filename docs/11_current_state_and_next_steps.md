@@ -10,10 +10,10 @@
    - PR101-102/108/112相当: sandbox `isolated` profile + `verify-v1 --readiness-profile`
    - PR106/113/114相当: delivery idempotency key + dead-letter fallback
    - PR109/117/118相当: release provenance artifact + precheck検証 + LTS SLA age check
-2. 設計済み（未完了）:
+2. 設計済み（フォローアップ管理用）:
    - [PR Plan: Phase101-110](../phase101_110.md)
    - [PR Plan: Phase111-120](../phase111_120.md)
-3. したがって現時点は「Phase101-120のベースライン実装中盤」
+3. したがって現時点は「Phase101-120のベースライン実装完了（運用ループ整備フェーズ）」
 
 ## ソフトウェアのゴール（現フェーズ）
 

@@ -620,11 +620,14 @@ fn resolve_signed_plugin_artifact_path(
     ctx: &Context,
     plugin: &patchgate_config::PluginEntry,
 ) -> PathBuf {
-    if !PathBuf::from(plugin.command.as_str()).is_absolute() {
-        let repo_local_command = ctx.repo_root.join(plugin.command.as_str());
-        if repo_local_command.is_file() {
-            return repo_local_command;
-        }
+    let command_candidate = PathBuf::from(plugin.command.as_str());
+    let resolved_command = if command_candidate.is_absolute() {
+        command_candidate
+    } else {
+        ctx.repo_root.join(plugin.command.as_str())
+    };
+    if resolved_command.is_file() {
+        return resolved_command;
     }
 
     for arg in &plugin.args {
@@ -639,11 +642,62 @@ fn resolve_signed_plugin_artifact_path(
         }
     }
 
-    if PathBuf::from(plugin.command.as_str()).is_absolute() {
-        PathBuf::from(plugin.command.as_str())
-    } else {
-        ctx.repo_root.join(plugin.command.as_str())
+    resolved_command
+}
+
+#[cfg(target_os = "linux")]
+fn append_isolated_runtime_mounts(command: &mut Command, allow_network: bool) {
+    let mut mounted_paths = BTreeSet::new();
+    for raw in [
+        "/usr",
+        "/usr/local",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/nix",
+        "/run/current-system",
+        "/run/current-system/sw",
+    ] {
+        maybe_append_readonly_bind(command, &mut mounted_paths, std::path::Path::new(raw));
     }
+    if let Some(path) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path) {
+            maybe_append_readonly_bind(command, &mut mounted_paths, entry.as_path());
+        }
+    }
+
+    if allow_network {
+        command.arg("--share-net");
+        command.arg("--dir").arg("/etc");
+        for raw in [
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/ssl",
+            "/etc/pki",
+            "/etc/ca-certificates",
+        ] {
+            maybe_append_readonly_bind(command, &mut mounted_paths, std::path::Path::new(raw));
+        }
+    } else {
+        command.arg("--unshare-net");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_append_readonly_bind(
+    command: &mut Command,
+    mounted_paths: &mut BTreeSet<PathBuf>,
+    path: &std::path::Path,
+) {
+    if !path.is_absolute() || !path.exists() {
+        return;
+    }
+    if !mounted_paths.insert(path.to_path_buf()) {
+        return;
+    }
+    command.arg("--ro-bind").arg(path).arg(path);
 }
 
 fn build_isolated_plugin_command(
@@ -676,11 +730,7 @@ fn build_isolated_plugin_command(
             .arg(repo.as_str())
             .arg("--chdir")
             .arg(repo.as_str());
-        if policy.plugins.sandbox.allow_network {
-            command.arg("--share-net");
-        } else {
-            command.arg("--unshare-net");
-        }
+        append_isolated_runtime_mounts(&mut command, policy.plugins.sandbox.allow_network);
         command.arg("--").arg(plugin.command.as_str());
         command.args(&plugin.args);
         Ok(command)
@@ -3161,6 +3211,110 @@ mod tests {
 
         std::env::remove_var(public_key_env);
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_signature_verification_prefers_executable_over_file_args() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_EXECUTABLE_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-signature-executable-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        let config_path = temp_root.join("rules.json");
+        let signature_path = temp_root.join("plugin.sig");
+        std::fs::write(
+            &plugin_path,
+            "#!/usr/bin/env sh\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
+        )
+        .expect("write plugin script");
+        std::fs::write(&config_path, "{\"mode\":\"strict\"}\n").expect("write config");
+        let mut perms = std::fs::metadata(&plugin_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).expect("chmod +x");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let command_bytes = std::fs::read(&plugin_path).expect("read plugin");
+        let signature = signing_key.sign(command_bytes.as_slice());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        std::fs::write(&signature_path, signature_b64).expect("write signature");
+
+        policy.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: vec![config_path.to_string_lossy().to_string()],
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        });
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 1,
+                deleted: 0,
+                added_lines: vec!["let q = 1;".to_string()],
+                removed_lines: vec![],
+            }],
+            fingerprint: "absolute-command-signature".to_string(),
+        };
+        let runner = Runner::new(policy);
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .plugin_invocations
+            .iter()
+            .any(|i| i.plugin_id == "sample" && i.status == PluginInvocationStatus::Pass));
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_runtime_mounts_include_common_host_paths() {
+        let mut command = Command::new("bwrap");
+        append_isolated_runtime_mounts(&mut command, true);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"--share-net".to_string()));
+        if std::path::Path::new("/usr").exists() {
+            assert!(args.windows(3).any(|window| {
+                window
+                    == [
+                        "--ro-bind".to_string(),
+                        "/usr".to_string(),
+                        "/usr".to_string(),
+                    ]
+            }));
+        }
     }
 
     #[cfg(not(windows))]

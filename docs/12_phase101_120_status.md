@@ -42,11 +42,11 @@
 
 ## 残タスク
 
-- Phase101-120 の実装残タスクは 0 件（本リポジトリ内コード/CI定義ベース）。
+- 本ドキュメントは「本リポジトリ内のコード/CI 定義として計画した Phase101-120 実装タスク」の消化状況を対象としており、この範囲の残タスクは 0 件です。
+- ただし、Phase101-120 に紐づく運用定着・ドキュメント整備・他リポジトリ連携などのフォローアップ作業は継続中であり、そのステータスは `docs/ROADMAP.md` および `docs/11_current_state_and_next_steps.md` 側で管理します。
 
 ## 検証結果
 
 - `cargo fmt --all`: pass
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass
 - `cargo test --workspace`: pass
-

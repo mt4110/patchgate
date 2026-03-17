@@ -3207,7 +3207,11 @@ fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) 
     append_jsonl(path, &record).context("failed to append dead-letter record")
 }
 
-fn load_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
+fn load_dead_letter_jsonl(
+    path: &Path,
+    transport_filter: Option<&str>,
+    max_records: Option<usize>,
+) -> Result<Vec<DeadLetterRecord>> {
     let file =
         fs::File::open(path).with_context(|| format!("open dead-letter: {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -3225,24 +3229,31 @@ fn load_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
                 path.display()
             )
         })?;
+        if let Some(filter) = transport_filter {
+            if row.transport != filter {
+                continue;
+            }
+        }
         rows.push(row);
+        if let Some(limit) = max_records {
+            if rows.len() >= limit {
+                break;
+            }
+        }
     }
     Ok(rows)
 }
 
 fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
-    let mut records = load_dead_letter_jsonl(&args.input)?;
-    if let Some(transport) = args.transport.as_deref() {
+    let transport_filter = args.transport.as_deref();
+    if let Some(transport) = transport_filter {
         if transport != "webhook" && transport != "notification" {
             anyhow::bail!(
                 "invalid --transport value `{transport}` (expected: webhook|notification)"
             );
         }
-        records.retain(|r| r.transport == transport);
     }
-    if let Some(limit) = args.max_records {
-        records.truncate(limit);
-    }
+    let records = load_dead_letter_jsonl(&args.input, transport_filter, args.max_records)?;
     if records.is_empty() {
         println!("no dead-letter records to replay");
         return Ok(());
@@ -4365,18 +4376,18 @@ mod tests {
         apply_threshold_override, build_cache_key, build_delivery_idempotency_key,
         build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
         detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
-        is_likely_cache_corruption, notification_payload, parse_mode, parse_policy_preset,
-        parse_scope, pr_head_sha_from_event_payload, pr_number_from_event_payload,
-        pr_number_from_ref, publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
-        render_github_comment, resolve_audit_actor, resolve_ci_provider,
-        resolve_ci_provider_for_publish, resolve_comment_suppression_reason, resolve_config_path,
-        resolve_policy_path, resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
-        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
-        DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource,
-        PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
-        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
-        ScopeMode,
+        is_likely_cache_corruption, load_dead_letter_jsonl, notification_payload, parse_mode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        run_policy_lint, run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment,
+        CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
+        OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
+        ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5817,6 +5828,31 @@ profile = "isolated"
         })
         .expect_err("must reject unknown transport");
         assert!(format!("{err:#}").contains("invalid --transport value"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_applies_filter_and_limit_while_reading() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-filter-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            concat!(
+                "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+                "{\"schema_version\":1,\"unix_ts\":2,\"transport\":\"webhook\",\"endpoint\":\"https://example.invalid/two\",\"idempotency_key\":\"k2\",\"error\":\"timeout\",\"payload\":{\"event\":\"two\"},\"headers\":{},\"payload_raw\":null}\n",
+                "{\"schema_version\":1,\"unix_ts\":3,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/three\",\"idempotency_key\":\"k3\",\"error\":\"timeout\",\"payload\":{\"event\":\"three\"},\"headers\":{},\"payload_raw\":null}\n"
+            ),
+        )
+        .expect("seed dead-letter");
+
+        let rows = load_dead_letter_jsonl(&input, Some("notification"), Some(1))
+            .expect("load filtered dead-letter");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, "notification");
+        assert_eq!(rows[0].idempotency_key, "k1");
+
         let _ = fs::remove_dir_all(dir);
     }
 
