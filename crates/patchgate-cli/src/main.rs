@@ -3229,6 +3229,7 @@ fn load_dead_letter_jsonl(
                 path.display()
             )
         })?;
+        validate_dead_letter_record(&row, path, idx + 1)?;
         if let Some(filter) = transport_filter {
             if row.transport != filter {
                 continue;
@@ -3242,6 +3243,30 @@ fn load_dead_letter_jsonl(
         }
     }
     Ok(rows)
+}
+
+fn validate_dead_letter_record(
+    record: &DeadLetterRecord,
+    path: &Path,
+    line_number: usize,
+) -> Result<()> {
+    if record.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported dead-letter schema_version {} in line {} from {}",
+            record.schema_version,
+            line_number,
+            path.display()
+        );
+    }
+    if record.transport != "webhook" && record.transport != "notification" {
+        anyhow::bail!(
+            "unsupported dead-letter transport `{}` in line {} from {}",
+            record.transport,
+            line_number,
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
@@ -5852,6 +5877,42 @@ profile = "isolated"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].transport, "notification");
         assert_eq!(rows[0].idempotency_key, "k1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_rejects_unknown_schema_version() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-schema-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            "{\"schema_version\":2,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        let err = load_dead_letter_jsonl(&input, None, None).expect_err("must reject schema");
+        assert!(format!("{err:#}").contains("unsupported dead-letter schema_version 2"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_dead_letter_jsonl_rejects_unknown_transport_rows() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-row-transport-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"email\",\"endpoint\":\"https://example.invalid/one\",\"idempotency_key\":\"k1\",\"error\":\"timeout\",\"payload\":{\"event\":\"one\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        let err = load_dead_letter_jsonl(&input, None, None).expect_err("must reject transport");
+        assert!(format!("{err:#}").contains("unsupported dead-letter transport `email`"));
 
         let _ = fs::remove_dir_all(dir);
     }

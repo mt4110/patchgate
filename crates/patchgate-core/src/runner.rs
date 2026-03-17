@@ -626,6 +626,9 @@ fn resolve_signed_plugin_artifact_path(
     } else {
         ctx.repo_root.join(plugin.command.as_str())
     };
+    if let Some(script_artifact) = resolve_interpreter_script_artifact_path(ctx, plugin) {
+        return script_artifact;
+    }
     if resolved_command.is_file() {
         return resolved_command;
     }
@@ -643,6 +646,90 @@ fn resolve_signed_plugin_artifact_path(
     }
 
     resolved_command
+}
+
+fn resolve_interpreter_script_artifact_path(
+    ctx: &Context,
+    plugin: &patchgate_config::PluginEntry,
+) -> Option<PathBuf> {
+    if !command_looks_like_interpreter(plugin.command.as_str()) {
+        return None;
+    }
+
+    for arg in &plugin.args {
+        let candidate = PathBuf::from(arg);
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            ctx.repo_root.join(arg)
+        };
+        if resolved.is_file() && is_probably_script_artifact(resolved.as_path()) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn command_looks_like_interpreter(command: &str) -> bool {
+    let command_name = PathBuf::from(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    matches!(
+        command_name.as_str(),
+        "python"
+            | "python3"
+            | "python3.11"
+            | "python3.12"
+            | "node"
+            | "nodejs"
+            | "deno"
+            | "bun"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "env"
+            | "ruby"
+            | "perl"
+            | "pwsh"
+            | "powershell"
+    )
+}
+
+fn is_probably_script_artifact(path: &std::path::Path) -> bool {
+    let looks_like_script_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "py" | "pyw"
+                    | "js"
+                    | "cjs"
+                    | "mjs"
+                    | "ts"
+                    | "tsx"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "rb"
+                    | "pl"
+                    | "ps1"
+            )
+        })
+        .unwrap_or(false);
+    if looks_like_script_extension {
+        return true;
+    }
+
+    fs::read(path)
+        .map(|bytes| bytes.starts_with(b"#!"))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -3282,6 +3369,88 @@ mod tests {
                 removed_lines: vec![],
             }],
             fingerprint: "absolute-command-signature".to_string(),
+        };
+        let runner = Runner::new(policy);
+        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        assert!(report
+            .plugin_invocations
+            .iter()
+            .any(|i| i.plugin_id == "sample" && i.status == PluginInvocationStatus::Pass));
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_signature_verification_uses_script_arg_for_absolute_interpreter_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_ABSOLUTE_INTERPRETER_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-signature-absolute-interpreter-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.py");
+        let signature_path = temp_root.join("plugin.sig");
+        std::fs::write(
+            &plugin_path,
+            "#!/usr/bin/env python3\nimport json, sys\njson.load(sys.stdin)\nprint('{\"findings\":[],\"diagnostics\":[\"ok\"]}')\n",
+        )
+        .expect("write plugin script");
+        let mut perms = std::fs::metadata(&plugin_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).expect("chmod +x");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let command_bytes = std::fs::read(&plugin_path).expect("read plugin");
+        let signature = signing_key.sign(command_bytes.as_slice());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        std::fs::write(&signature_path, signature_b64).expect("write signature");
+
+        policy.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: "/usr/bin/env".to_string(),
+            args: vec![
+                "python3".to_string(),
+                plugin_path.to_string_lossy().to_string(),
+            ],
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        });
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 1,
+                deleted: 0,
+                added_lines: vec!["let w = 1;".to_string()],
+                removed_lines: vec![],
+            }],
+            fingerprint: "absolute-interpreter-signature".to_string(),
         };
         let runner = Runner::new(policy);
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
