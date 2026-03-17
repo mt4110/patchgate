@@ -3157,7 +3157,7 @@ mod tests {
         let signature_path = temp_root.join("plugin.sig");
         std::fs::write(
             &plugin_path,
-            "#!/usr/bin/env sh\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
+            "#!/usr/bin/env sh\ncat >/dev/null\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
         )
         .expect("write plugin script");
         let mut perms = std::fs::metadata(&plugin_path)
@@ -3237,7 +3237,7 @@ mod tests {
         let signature_path = temp_root.join("plugin.sig");
         std::fs::write(
             &plugin_path,
-            "#!/usr/bin/env sh\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
+            "#!/usr/bin/env sh\ncat >/dev/null\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
         )
         .expect("write plugin script");
         std::fs::write(&config_path, "{\"mode\":\"strict\"}\n").expect("write config");
