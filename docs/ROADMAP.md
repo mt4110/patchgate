@@ -21,6 +21,8 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase101-110](../phase101_110.md)
 - [PR Plan: Phase111-120](../phase111_120.md)
 - [PR Plan: Phase121-130](../phase121_130.md)
+- [PR Plan: Phase131-140](../phase131_140.md)
+- [PR Plan: Phase141-150](../phase141_150.md)
 
 ## Active planning horizon (updated 2026-03-20)
 
@@ -28,10 +30,11 @@ This roadmap tracks the patchgate pivot.
 - Phase101-120: baseline implementation completed
 - Phase101-120 follow-up: docs / cross-repo rollout / ops settlement continue
 - Phase121-130: implementation started
+- Phase131-150: design started
 - Next execution focus:
-  - PR124 `verify-v1` safe autofix output/apply
-  - PR125 dead-letter replay self-healing loop + scheduled workflow
-  - PR121/122 cross-platform sandbox capability matrix + non-GitHub CI template planning
+  - PR121 sandbox capability surfacing
+  - PR122 non-GitHub CI template pack
+  - PR123 plugin trust lifecycle
 
 ## v0.3.9 (Phase81-90 baseline delivered)
 
@@ -70,7 +73,8 @@ This roadmap tracks the patchgate pivot.
 1. `policy verify-v1` に safe autofix の出力/適用を追加
 2. `delivery replay` に残件書き戻し・summary 出力を追加
 3. scheduled workflow で dead-letter 再処理を定期実行できるようにする
-4. sandbox capability matrix / non-GitHub CI template は PR121/122 計画で固定する
+4. sandbox capability matrix を doctor / readiness に surfacing
+5. GitLab / Jenkins 向け generic CI template を追加
 
 ## Non-goals (current phase)
 

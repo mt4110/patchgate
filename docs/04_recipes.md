@@ -35,6 +35,16 @@ patchgate scan \
   --ci-generic-output artifacts/ci-generic.json
 ```
 
+### GitLab CI から generic provider を使う
+
+`docs/patchgate-gitlab-ci.yml` をベースに、
+`artifacts/ci-generic.json` を artifact として回収します。
+
+### Jenkins から generic provider を使う
+
+`docs/Jenkinsfile.patchgate` をベースに、
+`artifacts/ci-generic.json` を archive します。
+
 ### 署名付きWebhook配信
 
 ```bash

@@ -8,6 +8,13 @@
 
 環境情報と設定読込診断を表示します。
 
+主な診断項目:
+
+- Git / config / cache の状態
+- host OS
+- plugin sandbox capability (`none` / `restricted` / `isolated`)
+- CI template catalog (`github` / `gitlab` / `jenkins`)
+
 ### `patchgate scan`
 
 Core options:

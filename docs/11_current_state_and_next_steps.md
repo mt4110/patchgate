@@ -52,6 +52,9 @@
      - `docs/patchgate-action.yml`
    - 完了判定:
      - OS別sandbox capability と generic CI template の前提差分が明文化される
+   - 進捗:
+     - `doctor` / `verify-v1` への capability surfacing 着手
+     - GitLab / Jenkins template 追加に着手
 
 4. Priority 4: PR123（plugin鍵 rotation / revocation）
    - 理由: 署名検証は入ったが、鍵運用 lifecycle を持たないと OSS 配布品質として弱い

@@ -1242,56 +1242,107 @@ fn render_plugin_template(
 
 fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
     let config_path = resolve_config_path(repo_root, config_override);
-    println!("patchgate doctor");
-    println!("- repo_root: {}", repo_root.display());
-    println!(
-        "- config_path: {}",
-        config_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<default only>".to_string())
-    );
-    println!("- rust: {}", env!("CARGO_PKG_RUST_VERSION"));
+    let mut lines = vec![
+        "patchgate doctor".to_string(),
+        format!("- repo_root: {}", repo_root.display()),
+        format!(
+            "- config_path: {}",
+            config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<default only>".to_string())
+        ),
+        format!("- rust: {}", env!("CARGO_PKG_RUST_VERSION")),
+        format!("- host_os: {}", current_host_os_label()),
+        "- sandbox_capabilities:".to_string(),
+    ];
+    for capability in detect_sandbox_capabilities() {
+        lines.push(format!(
+            "  - {}: {} ({})",
+            capability.profile,
+            if capability.supported {
+                "supported"
+            } else {
+                "unavailable"
+            },
+            capability.enforcement
+        ));
+        if let Some(requirement) = capability.requirement.as_ref() {
+            lines.push(format!("    - requirement: {}", requirement));
+        }
+        for note in capability.notes {
+            lines.push(format!("    - note: {}", note));
+        }
+    }
+    lines.push("- ci_templates:".to_string());
+    for (provider, path) in ci_template_catalog() {
+        lines.push(format!("  - {}: {}", provider, path));
+    }
 
     match diagnose_git(repo_root) {
         Ok((head, dirty)) => {
-            println!("- git: ok (head: {}, dirty_files: {})", head, dirty);
+            lines.push(format!(
+                "- git: ok (head: {}, dirty_files: {})",
+                head, dirty
+            ));
         }
         Err(err) => {
-            println!("- git: error ({err})");
+            lines.push(format!("- git: error ({err})"));
         }
     }
 
     let loaded_cfg = match load_policy_config(config_path.as_deref(), None) {
         Ok(cfg) => {
-            println!("- config: ok");
+            lines.push("- config: ok".to_string());
             cfg
         }
         Err(err) => {
-            println!("- config: error ({err:#})");
-            println!("- cache: unknown (skipping cache diagnostics because config failed to load)");
+            lines.push(format!("- config: error ({err:#})"));
+            lines.push(
+                "- cache: unknown (skipping cache diagnostics because config failed to load)"
+                    .to_string(),
+            );
+            for line in lines {
+                println!("{line}");
+            }
             return Ok(());
         }
     };
-    println!("- policy_version: {}", loaded_cfg.config.policy_version);
+    lines.push(format!(
+        "- policy_version: {}",
+        loaded_cfg.config.policy_version
+    ));
     for warning in &loaded_cfg.compatibility_warnings {
-        println!("- compatibility: warning ({warning})");
+        lines.push(format!("- compatibility: warning ({warning})"));
     }
 
     let effective_cfg = loaded_cfg.config;
+    lines.push(format!(
+        "- plugin_sandbox_profile: {}",
+        effective_cfg.plugins.sandbox.profile
+    ));
 
     if !effective_cfg.cache.enabled {
-        println!("- cache: disabled (cache.enabled=false)");
+        lines.push("- cache: disabled (cache.enabled=false)".to_string());
+        for line in lines {
+            println!("{line}");
+        }
         return Ok(());
     }
 
     let db_full_path = repo_root.join(&effective_cfg.cache.db_path);
     match diagnose_cache(repo_root, &effective_cfg.cache.db_path) {
-        Ok(CacheDoctorStatus::Ok) => println!("- cache: ok ({})", db_full_path.display()),
-        Ok(CacheDoctorStatus::Missing) => {
-            println!("- cache: missing ({})", db_full_path.display())
+        Ok(CacheDoctorStatus::Ok) => {
+            lines.push(format!("- cache: ok ({})", db_full_path.display()))
         }
-        Err(err) => println!("- cache: error ({:#})", err),
+        Ok(CacheDoctorStatus::Missing) => {
+            lines.push(format!("- cache: missing ({})", db_full_path.display()))
+        }
+        Err(err) => lines.push(format!("- cache: error ({:#})", err)),
+    }
+
+    for line in lines {
+        println!("{line}");
     }
 
     Ok(())
@@ -1714,6 +1765,7 @@ struct V1ReadinessReport {
     plugins_enabled: bool,
     plugin_entries: usize,
     plugin_sandbox_profile: String,
+    sandbox_capabilities: Vec<SandboxCapability>,
     lts_active: bool,
     lts_security_sla_hours: u16,
     warnings: Vec<String>,
@@ -1746,6 +1798,16 @@ impl ReadinessProfile {
             Self::Lts => "lts",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SandboxCapability {
+    profile: String,
+    supported: bool,
+    enforcement: String,
+    host_os: String,
+    requirement: Option<String>,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2077,6 +2139,7 @@ fn build_v1_readiness_report(
         plugins_enabled: cfg.plugins.enabled,
         plugin_entries: cfg.plugins.entries.len(),
         plugin_sandbox_profile: cfg.plugins.sandbox.profile.clone(),
+        sandbox_capabilities: detect_sandbox_capabilities(),
         lts_active: cfg.release.lts.active,
         lts_security_sla_hours: cfg.release.lts.security_sla_hours,
         warnings: assessment.warnings,
@@ -2110,6 +2173,26 @@ fn print_v1_readiness_report(
                 "- plugin_sandbox_profile: {}",
                 report.plugin_sandbox_profile
             );
+            println!("- sandbox_capabilities:");
+            for capability in &report.sandbox_capabilities {
+                println!(
+                    "  - {}: {} ({})",
+                    capability.profile,
+                    if capability.supported {
+                        "supported"
+                    } else {
+                        "unavailable"
+                    },
+                    capability.enforcement
+                );
+                println!("    - host_os: {}", capability.host_os);
+                if let Some(requirement) = capability.requirement.as_ref() {
+                    println!("    - requirement: {}", requirement);
+                }
+                for note in &capability.notes {
+                    println!("    - note: {}", note);
+                }
+            }
             println!("- lts_active: {}", report.lts_active);
             println!(
                 "- lts_security_sla_hours: {}",
@@ -2277,6 +2360,79 @@ fn isolated_sandbox_runtime_supported() -> bool {
     {
         false
     }
+}
+
+fn detect_sandbox_capabilities() -> Vec<SandboxCapability> {
+    let host_os = current_host_os_label().to_string();
+    let mut capabilities = Vec::with_capacity(3);
+    capabilities.push(SandboxCapability {
+        profile: "none".to_string(),
+        supported: true,
+        enforcement: "no isolation".to_string(),
+        host_os: host_os.clone(),
+        requirement: None,
+        notes: vec!["available on every supported host".to_string()],
+    });
+    capabilities.push(SandboxCapability {
+        profile: "restricted".to_string(),
+        supported: true,
+        enforcement: "env allowlist + process limits".to_string(),
+        host_os: host_os.clone(),
+        requirement: None,
+        notes: vec!["portable baseline profile for plugin execution".to_string()],
+    });
+
+    let isolated_supported = isolated_sandbox_runtime_supported();
+    let (requirement, notes) = if cfg!(target_os = "linux") {
+        if isolated_supported {
+            (
+                Some("Linux host with `bwrap` available".to_string()),
+                vec!["OS-level process/fs isolation is active".to_string()],
+            )
+        } else {
+            (
+                Some("Install `bwrap` (bubblewrap) on Linux".to_string()),
+                vec!["strict/lts readiness stays blocked until bubblewrap is present".to_string()],
+            )
+        }
+    } else {
+        (
+            Some("Run on Linux with `bwrap` for isolated sandbox".to_string()),
+            vec![
+                "macOS/Windows currently support `restricted` but not `isolated` enforcement"
+                    .to_string(),
+            ],
+        )
+    };
+    capabilities.push(SandboxCapability {
+        profile: "isolated".to_string(),
+        supported: isolated_supported,
+        enforcement: "bubblewrap OS isolation".to_string(),
+        host_os,
+        requirement,
+        notes,
+    });
+    capabilities
+}
+
+fn current_host_os_label() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+fn ci_template_catalog() -> [(&'static str, &'static str); 3] {
+    [
+        ("github", "docs/patchgate-action.yml"),
+        ("gitlab", "docs/patchgate-gitlab-ci.yml"),
+        ("jenkins", "docs/Jenkinsfile.patchgate"),
+    ]
 }
 
 fn map_config_error_to_policy_exit(err: &ConfigError) -> PolicyExitCode {
@@ -4900,19 +5056,20 @@ mod tests {
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
         apply_threshold_override, build_cache_key, build_delivery_idempotency_key,
         build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
-        detect_head_sha_from_env, detect_pr_number_from_env, gate_exit_code,
-        is_likely_cache_corruption, load_dead_letter_jsonl, notification_payload, parse_mode,
-        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
-        recover_cache_db, redacted_endpoint, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
-        run_policy_lint, run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment,
-        CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
-        OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
-        ScanMetricRecord, ScopeMode,
+        ci_template_catalog, detect_head_sha_from_env, detect_pr_number_from_env,
+        detect_sandbox_capabilities, gate_exit_code, is_likely_cache_corruption,
+        load_dead_letter_jsonl, notification_payload, parse_mode, parse_policy_preset, parse_scope,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        publish_generic_ci_payload, recover_cache_db, redacted_endpoint, render_github_comment,
+        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
+        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
+        DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource,
+        PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
+        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
+        ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -6420,6 +6577,41 @@ profile = "none"
         assert!(!output.contains("profile = \"restricted\""));
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn sandbox_capabilities_include_portable_profiles_and_template_catalog() {
+        #[cfg(target_os = "linux")]
+        let _guard = env_lock();
+        #[cfg(target_os = "linux")]
+        super::BWRAP_AVAILABLE_OVERRIDE.store(0, Ordering::Relaxed);
+
+        let capabilities = detect_sandbox_capabilities();
+        assert_eq!(capabilities.len(), 3);
+        assert!(capabilities
+            .iter()
+            .find(|cap| cap.profile == "none")
+            .is_some_and(|cap| cap.supported));
+        assert!(capabilities
+            .iter()
+            .find(|cap| cap.profile == "restricted")
+            .is_some_and(|cap| cap.supported));
+        let isolated = capabilities
+            .iter()
+            .find(|cap| cap.profile == "isolated")
+            .expect("isolated capability");
+        #[cfg(target_os = "linux")]
+        assert!(!isolated.supported);
+        #[cfg(not(target_os = "linux"))]
+        assert!(!isolated.supported);
+
+        #[cfg(target_os = "linux")]
+        super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
+
+        let templates = ci_template_catalog();
+        assert_eq!(templates[0], ("github", "docs/patchgate-action.yml"));
+        assert_eq!(templates[1], ("gitlab", "docs/patchgate-gitlab-ci.yml"));
+        assert_eq!(templates[2], ("jenkins", "docs/Jenkinsfile.patchgate"));
     }
 
     #[test]

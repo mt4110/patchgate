@@ -51,3 +51,8 @@ patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.
 ## 8) CI template
 
 `docs/patchgate-action.yml` を `.github/workflows/patchgate.yml` にコピーして使います。
+
+GitHub 以外では次を使います。
+
+- GitLab: `docs/patchgate-gitlab-ci.yml`
+- Jenkins: `docs/Jenkinsfile.patchgate`
