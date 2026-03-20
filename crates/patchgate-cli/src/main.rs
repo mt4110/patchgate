@@ -1955,7 +1955,7 @@ fn run_policy_verify_v1(
             }
         };
         let preview_assessment = assess_v1_readiness(
-            output_path.as_path(),
+            policy_path.as_path(),
             &preview_loaded.config,
             preview_loaded.compatibility_warnings.clone(),
             readiness_profile,
@@ -5182,11 +5182,12 @@ mod tests {
 
     use super::{
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
-        apply_threshold_override, build_cache_key, build_delivery_idempotency_key,
-        build_history_summary, build_history_trend, changed_file_limit_fail_open_report,
-        ci_template_catalog, detect_head_sha_from_env, detect_pr_number_from_env,
-        detect_sandbox_capabilities, gate_exit_code, is_likely_cache_corruption,
-        load_dead_letter_jsonl, notification_payload, parse_mode, parse_policy_preset, parse_scope,
+        apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
+        build_delivery_idempotency_key, build_history_summary, build_history_trend,
+        changed_file_limit_fail_open_report, ci_template_catalog, detect_head_sha_from_env,
+        detect_pr_number_from_env, detect_sandbox_capabilities, gate_exit_code,
+        is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
+        notification_payload, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
         publish_generic_ci_payload, recover_cache_db, redacted_endpoint, render_github_comment,
         resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
@@ -5195,9 +5196,9 @@ mod tests {
         resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
         run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, write_text_atomic,
         CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
-        OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
-        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
-        ScanMetricRecord, ScopeMode,
+        OptionSource, PluginInitArgs, PolicyAutofix, PolicyExitCode, PolicyLintArgs,
+        PolicyVerifyV1Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
+        RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -6619,6 +6620,56 @@ allow_legacy_config_names = true
             },
         );
         assert_eq!(recheck, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_autofix_output_uses_source_filename_for_preview_warnings() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-preview-name-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("artifacts/policy.autofix.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = false
+allow_legacy_config_names = true
+"#,
+        )
+        .expect("write policy");
+
+        apply_policy_autofixes(
+            policy_path.as_path(),
+            output_path.as_path(),
+            &[
+                PolicyAutofix::SetRcFrozen,
+                PolicyAutofix::DisableLegacyConfigNames,
+            ],
+        )
+        .expect("write preview policy");
+
+        let loaded = load_policy_config(Some(output_path.as_path()), None).expect("load preview");
+        let assessment = assess_v1_readiness(
+            policy_path.as_path(),
+            &loaded.config,
+            loaded.compatibility_warnings,
+            ReadinessProfile::Standard,
+            false,
+        );
+
+        assert!(
+            !assessment
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("legacy policy filename")),
+            "preview warnings should reflect the source policy filename"
+        );
 
         let _ = fs::remove_dir_all(repo_root);
     }
