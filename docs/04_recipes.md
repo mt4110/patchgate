@@ -83,6 +83,7 @@ patchgate delivery replay \
 ```
 
 成功したレコードは queue から除去され、失敗したレコードだけが `artifacts/dead-letter.jsonl` に残ります。
+`.github/workflows/dead-letter-replay.yml` は、この queue を `dead-letter-queue` branch に永続化する前提です。
 
 ### `verify-v1` の safe autofix preview を出力
 

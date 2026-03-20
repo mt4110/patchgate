@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use toml_edit::{value, DocumentMut, Item, Table};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 use patchgate_config::{
     Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
@@ -2314,6 +2318,17 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    let temp_path = temp_path_for(path);
+    fs::write(&temp_path, content)
+        .with_context(|| format!("write temp file {}", temp_path.display()))?;
+    if let Err(err) = replace_file(temp_path.as_path(), path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2322,14 +2337,39 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let temp_path = path.with_file_name(format!(".{file_name}.tmp-{nonce}"));
-    fs::write(&temp_path, content)
-        .with_context(|| format!("write temp file {}", temp_path.display()))?;
-    if let Err(err) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
+    path.with_file_name(format!(".{file_name}.tmp-{nonce}"))
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp_path: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp_path, path).with_context(|| {
+        format!(
+            "rename temp file {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_file(temp_path: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn encode_wide_null(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let temp = encode_wide_null(temp_path);
+    let dest = encode_wide_null(path);
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let result = unsafe { MoveFileExW(temp.as_ptr(), dest.as_ptr(), flags) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
-                "rename temp file {} -> {}",
+                "replace temp file {} -> {}",
                 temp_path.display(),
                 path.display()
             )
@@ -3760,6 +3800,7 @@ fn load_dead_letter_jsonl(
     Ok(filtered)
 }
 
+#[cfg(test)]
 fn load_all_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
     let file =
         fs::File::open(path).with_context(|| format!("open dead-letter: {}", path.display()))?;
@@ -3817,7 +3858,6 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
             );
         }
     }
-    let records = load_all_dead_letter_jsonl(&args.input)?;
     let attempts = args.retry_max_attempts.max(1);
     let client = Client::builder()
         .timeout(Duration::from_millis(5_000))
@@ -3836,106 +3876,132 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
         rewrite_input: args.rewrite_input,
         failures: Vec::new(),
     };
-    if records.is_empty() {
-        write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
-        println!("no dead-letter records to replay");
-        return Ok(());
-    }
+    let mut rewrite_state = if args.rewrite_input && !args.dry_run {
+        Some(create_dead_letter_rewrite_state(args.input.as_path())?)
+    } else {
+        None
+    };
+    let replay_result = (|| -> Result<()> {
+        let file = fs::File::open(&args.input)
+            .with_context(|| format!("open dead-letter: {}", args.input.display()))?;
+        let reader = BufReader::new(file);
+        let mut matched_records = 0usize;
+        let mut saw_record = false;
 
-    let mut remaining = Vec::with_capacity(records.len());
-    let mut matched_records = 0usize;
-    for record in records {
-        let matches_transport = transport_filter
-            .map(|transport| record.transport == transport)
-            .unwrap_or(true);
-        let within_limit = args
-            .max_records
-            .map(|limit| matched_records < limit)
-            .unwrap_or(true);
-        if !matches_transport || !within_limit {
-            remaining.push(record);
-            continue;
-        }
-        matched_records += 1;
-        summary.selected_records += 1;
-
-        if record.endpoint.contains("***") {
-            let error = "redacted endpoint cannot be replayed".to_string();
-            eprintln!(
-                "skip replay (redacted endpoint): transport={} endpoint={}",
-                record.transport, record.endpoint
-            );
-            summary.skipped_records += 1;
-            summary.failed_records += 1;
-            summary.failures.push(DeadLetterReplayFailure {
-                transport: record.transport.clone(),
-                endpoint: record.endpoint.clone(),
-                idempotency_key: record.idempotency_key.clone(),
-                error: error.clone(),
-            });
-            let mut retained = record;
-            retained.error = error;
-            retained.unix_ts = current_unix_ts();
-            remaining.push(retained);
-            continue;
-        }
-        if args.dry_run {
-            println!(
-                "dry-run replay: transport={} endpoint={} idempotency_key={}",
-                record.transport,
-                redacted_endpoint(record.endpoint.as_str()),
-                record.idempotency_key
-            );
-            summary.dry_run_records += 1;
-            remaining.push(record);
-            continue;
-        }
-
-        match replay_dead_letter_record(&client, &record, attempts, args.retry_backoff_ms) {
-            Ok(()) => {
-                summary.successful_records += 1;
-                if !args.rewrite_input {
-                    remaining.push(record);
-                }
+        for (idx, line) in reader.lines().enumerate() {
+            let line = line
+                .with_context(|| format!("read line {} from {}", idx + 1, args.input.display()))?;
+            if line.trim().is_empty() {
+                continue;
             }
-            Err(error) => {
+            saw_record = true;
+            let record = serde_json::from_str::<DeadLetterRecord>(&line).with_context(|| {
+                format!(
+                    "decode dead-letter line {} from {}",
+                    idx + 1,
+                    args.input.display()
+                )
+            })?;
+            validate_dead_letter_record(&record, args.input.as_path(), idx + 1)?;
+
+            let matches_transport = transport_filter
+                .map(|transport| record.transport == transport)
+                .unwrap_or(true);
+            let within_limit = args
+                .max_records
+                .map(|limit| matched_records < limit)
+                .unwrap_or(true);
+            if !matches_transport || !within_limit {
+                retain_dead_letter_line(rewrite_state.as_mut(), &line, &mut summary)?;
+                continue;
+            }
+
+            matched_records += 1;
+            summary.selected_records += 1;
+
+            if record.endpoint.contains("***") {
+                let error = "redacted endpoint cannot be replayed".to_string();
+                eprintln!(
+                    "skip replay (redacted endpoint): transport={} endpoint={}",
+                    record.transport, record.endpoint
+                );
+                summary.skipped_records += 1;
                 summary.failed_records += 1;
                 summary.failures.push(DeadLetterReplayFailure {
                     transport: record.transport.clone(),
-                    endpoint: redacted_endpoint(record.endpoint.as_str()),
+                    endpoint: record.endpoint.clone(),
                     idempotency_key: record.idempotency_key.clone(),
                     error: error.clone(),
                 });
                 let mut retained = record;
                 retained.error = error;
                 retained.unix_ts = current_unix_ts();
-                remaining.push(retained);
+                retain_dead_letter_record(rewrite_state.as_mut(), &retained, &mut summary)?;
+                continue;
+            }
+            if args.dry_run {
+                println!(
+                    "dry-run replay: transport={} endpoint={} idempotency_key={}",
+                    record.transport,
+                    redacted_endpoint(record.endpoint.as_str()),
+                    record.idempotency_key
+                );
+                summary.dry_run_records += 1;
+                summary.retained_records += 1;
+                continue;
+            }
+
+            match replay_dead_letter_record(&client, &record, attempts, args.retry_backoff_ms) {
+                Ok(()) => {
+                    summary.successful_records += 1;
+                    if !args.rewrite_input {
+                        summary.retained_records += 1;
+                    }
+                }
+                Err(error) => {
+                    summary.failed_records += 1;
+                    summary.failures.push(DeadLetterReplayFailure {
+                        transport: record.transport.clone(),
+                        endpoint: redacted_endpoint(record.endpoint.as_str()),
+                        idempotency_key: record.idempotency_key.clone(),
+                        error: error.clone(),
+                    });
+                    let mut retained = record;
+                    retained.error = error;
+                    retained.unix_ts = current_unix_ts();
+                    retain_dead_letter_record(rewrite_state.as_mut(), &retained, &mut summary)?;
+                }
             }
         }
-    }
 
-    if summary.selected_records == 0 {
-        summary.retained_records = remaining.len();
-        write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
-        println!("no dead-letter records to replay");
-        return Ok(());
-    }
+        if !saw_record || summary.selected_records == 0 {
+            println!("no dead-letter records to replay");
+        }
 
-    if args.rewrite_input && !args.dry_run {
-        write_dead_letter_jsonl(args.input.as_path(), &remaining)
-            .context("rewrite dead-letter input")?;
+        Ok(())
+    })();
+
+    if let Some(state) = rewrite_state.take() {
+        if replay_result.is_ok() {
+            finalize_dead_letter_rewrite(state, args.input.as_path())?;
+        } else {
+            cleanup_dead_letter_rewrite(state);
+        }
     }
-    summary.retained_records = remaining.len();
+    replay_result?;
+
     write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
-    println!(
-        "dead-letter replay completed: selected_records={} successful_records={} dry_run_records={} failed_records={} skipped_records={} retained_records={}",
-        summary.selected_records,
-        summary.successful_records,
-        summary.dry_run_records,
-        summary.failed_records,
-        summary.skipped_records,
-        summary.retained_records
-    );
+    if summary.selected_records > 0 {
+        println!(
+            "dead-letter replay completed: selected_records={} successful_records={} dry_run_records={} failed_records={} skipped_records={} retained_records={}",
+            summary.selected_records,
+            summary.successful_records,
+            summary.dry_run_records,
+            summary.failed_records,
+            summary.skipped_records,
+            summary.retained_records
+        );
+    }
     if summary.failed_records > 0 {
         anyhow::bail!(
             "dead-letter replay completed with {} failed record(s)",
@@ -3999,13 +4065,75 @@ fn replay_dead_letter_record(
     Err(last_error.unwrap_or_else(|| "dead-letter replay failed".to_string()))
 }
 
-fn write_dead_letter_jsonl(path: &Path, records: &[DeadLetterRecord]) -> Result<()> {
-    let mut encoded = String::new();
-    for record in records {
-        encoded.push_str(&serde_json::to_string(record)?);
-        encoded.push('\n');
+struct DeadLetterRewriteState {
+    temp_path: PathBuf,
+    file: fs::File,
+}
+
+fn create_dead_letter_rewrite_state(path: &Path) -> Result<DeadLetterRewriteState> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    write_text_atomic(path, encoded.as_str())
+    let temp_path = temp_path_for(path);
+    let file = fs::File::create(&temp_path)
+        .with_context(|| format!("create dead-letter rewrite file {}", temp_path.display()))?;
+    Ok(DeadLetterRewriteState { temp_path, file })
+}
+
+fn finalize_dead_letter_rewrite(mut state: DeadLetterRewriteState, path: &Path) -> Result<()> {
+    state.file.flush().with_context(|| {
+        format!(
+            "flush dead-letter rewrite file {}",
+            state.temp_path.display()
+        )
+    })?;
+    drop(state.file);
+    replace_file(state.temp_path.as_path(), path).with_context(|| {
+        format!(
+            "replace dead-letter file {} -> {}",
+            state.temp_path.display(),
+            path.display()
+        )
+    })
+}
+
+fn cleanup_dead_letter_rewrite(state: DeadLetterRewriteState) {
+    drop(state.file);
+    let _ = fs::remove_file(state.temp_path);
+}
+
+fn retain_dead_letter_line(
+    state: Option<&mut DeadLetterRewriteState>,
+    line: &str,
+    summary: &mut DeadLetterReplaySummary,
+) -> Result<()> {
+    summary.retained_records += 1;
+    if let Some(state) = state {
+        writeln!(state.file, "{line}").with_context(|| {
+            format!(
+                "append retained dead-letter line {}",
+                state.temp_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn retain_dead_letter_record(
+    state: Option<&mut DeadLetterRewriteState>,
+    record: &DeadLetterRecord,
+    summary: &mut DeadLetterReplaySummary,
+) -> Result<()> {
+    summary.retained_records += 1;
+    if let Some(state) = state {
+        writeln!(state.file, "{}", serde_json::to_string(record)?).with_context(|| {
+            format!(
+                "append retained dead-letter record {}",
+                state.temp_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn write_dead_letter_replay_summary(
@@ -5065,11 +5193,11 @@ mod tests {
         resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
         resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
         resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
-        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, CiProvider,
-        DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind, OptionSource,
-        PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args, PublishRequestInput,
-        ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord,
-        ScopeMode,
+        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, write_text_atomic,
+        CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
+        OptionSource, PluginInitArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        PublishRequestInput, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
+        ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -6533,6 +6661,22 @@ allow_legacy_config_names = true
         assert!(output.contains("allow_legacy_config_names = false"));
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn write_text_atomic_overwrites_existing_file() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-write-text-atomic-{seq}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.toml");
+        fs::write(&path, "before").expect("seed file");
+
+        write_text_atomic(&path, "after").expect("overwrite file");
+
+        let content = fs::read_to_string(&path).expect("read overwritten file");
+        assert_eq!(content, "after");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
