@@ -1,0 +1,102 @@
+name: Dead-letter Replay
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PATCHGATE_DEAD_LETTER_PATH: artifacts/dead-letter.jsonl
+  PATCHGATE_DEAD_LETTER_BRANCH: dead-letter-queue
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifacts
+
+      - name: Restore durable dead-letter queue
+        run: |
+          mkdir -p "$(dirname "$PATCHGATE_DEAD_LETTER_PATH")"
+          git fetch origin "$PATCHGATE_DEAD_LETTER_BRANCH":"refs/remotes/origin/$PATCHGATE_DEAD_LETTER_BRANCH" || true
+          if git cat-file -e "refs/remotes/origin/$PATCHGATE_DEAD_LETTER_BRANCH:$PATCHGATE_DEAD_LETTER_PATH" 2>/dev/null; then
+            git show "refs/remotes/origin/$PATCHGATE_DEAD_LETTER_BRANCH:$PATCHGATE_DEAD_LETTER_PATH" > "$PATCHGATE_DEAD_LETTER_PATH"
+            echo "Restored dead-letter queue from branch $PATCHGATE_DEAD_LETTER_BRANCH." >> "$GITHUB_STEP_SUMMARY"
+          else
+            : > "$PATCHGATE_DEAD_LETTER_PATH"
+            echo "No durable dead-letter queue found on branch $PATCHGATE_DEAD_LETTER_BRANCH. Starting empty." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Replay persisted dead-letter queue
+        run: |
+          cargo run -p patchgate-cli -- delivery replay \
+            --input "$PATCHGATE_DEAD_LETTER_PATH" \
+            --retry-max-attempts 3 \
+            --retry-backoff-ms 500 \
+            --rewrite-input \
+            --summary-output artifacts/dead-letter-replay-summary.json
+
+      - name: Persist durable dead-letter queue
+        if: always()
+        run: |
+          queue_dir="$(mktemp -d)"
+          if git show-ref --verify --quiet "refs/remotes/origin/$PATCHGATE_DEAD_LETTER_BRANCH"; then
+            git worktree add --detach "$queue_dir" "refs/remotes/origin/$PATCHGATE_DEAD_LETTER_BRANCH"
+          else
+            git worktree add --detach "$queue_dir"
+            (
+              cd "$queue_dir"
+              git checkout --orphan "$PATCHGATE_DEAD_LETTER_BRANCH"
+              git rm -rf . >/dev/null 2>&1 || true
+            )
+          fi
+
+          mkdir -p "$queue_dir/$(dirname "$PATCHGATE_DEAD_LETTER_PATH")"
+          cp "$PATCHGATE_DEAD_LETTER_PATH" "$queue_dir/$PATCHGATE_DEAD_LETTER_PATH"
+
+          (
+            cd "$queue_dir"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$PATCHGATE_DEAD_LETTER_PATH"
+            if git diff --cached --quiet; then
+              echo "No dead-letter queue changes to persist." >> "$GITHUB_STEP_SUMMARY"
+            else
+              git commit -m "chore: update dead-letter queue"
+              git push origin HEAD:$PATCHGATE_DEAD_LETTER_BRANCH
+              echo "Persisted dead-letter queue to branch $PATCHGATE_DEAD_LETTER_BRANCH." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          )
+
+          git worktree remove "$queue_dir" --force
+
+      - name: Publish replay summary
+        if: always()
+        run: |
+          if [ -f artifacts/dead-letter-replay-summary.json ]; then
+            echo "## Dead-letter replay" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- selected_records: $(jq -r '.selected_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- successful_records: $(jq -r '.successful_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- dry_run_records: $(jq -r '.dry_run_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- failed_records: $(jq -r '.failed_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- retained_records: $(jq -r '.retained_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dead-letter-replay
+          path: |
+            artifacts/dead-letter-replay-summary.json
+            artifacts/dead-letter.jsonl

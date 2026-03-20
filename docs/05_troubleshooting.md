@@ -23,6 +23,7 @@
 - 実行時エラー、cache破損、plugin fail_closed失敗
 - `patchgate scan --no-cache`
 - pluginは `fail_mode = "fail_open"` で切り分け可能
+- `patchgate doctor` で sandbox capability を確認し、`isolated` が必要な場合は Linux + `bwrap` で再確認
 
 ### `PG-PUB-SSO-001` / `PG-PUB-ORG-001`
 
@@ -54,4 +55,5 @@
 ## Recovery drill
 
 - `.github/workflows/recovery-drill.yml` を定期実行
+- `.github/workflows/dead-letter-replay.yml` で dead-letter queue の定期 replay を実行
 - 追加で `.github/workflows/ga-readiness.yml` をGA直前に実行

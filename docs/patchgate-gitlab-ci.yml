@@ -1,0 +1,17 @@
+stages:
+  - quality
+
+patchgate:
+  stage: quality
+  image: rust:1.75
+  cache:
+    key: patchgate-cargo
+    paths:
+      - target/
+      - .cargo/
+  script:
+    - cargo run -p patchgate-cli -- scan --mode enforce --scope repo --format json --publish --ci-provider generic --ci-generic-output artifacts/ci-generic.json
+  artifacts:
+    when: always
+    paths:
+      - artifacts/ci-generic.json

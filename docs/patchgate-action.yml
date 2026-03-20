@@ -1,5 +1,9 @@
 name: patchgate
 
+# Alternatives:
+# - GitLab: docs/patchgate-gitlab-ci.yml
+# - Jenkins: docs/Jenkinsfile.patchgate
+
 on:
   pull_request:
   workflow_dispatch:

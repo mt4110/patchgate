@@ -24,12 +24,14 @@
   - `timeout_ms` と `max_stdout_kib` を強制
   - `fail_mode = fail_open|fail_closed`
   - `plugins.signature.required = true` の場合、plugin実行前にed25519署名を検証
+  - `patchgate doctor` / `policy verify-v1` で host OS ごとの capability を確認可能
 
 ## Provider / Integration contract (Phase85-87)
 
 - CI provider abstraction:
   - `github`: check-run/comment publish
   - `generic`: 標準JSONペイロード出力
+  - GitLab / Jenkins など GitHub 外CIは generic payload template で接続する
 - Webhook:
   - `scan.completed` イベントを JSON 送信
   - 署名ヘッダ `X-Patchgate-Signature: sha256=...`

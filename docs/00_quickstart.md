@@ -31,6 +31,7 @@ patchgate scan --mode enforce --format json
 ```bash
 patchgate policy verify-v1 --path policy.toml --format text
 patchgate policy verify-v1 --path policy.toml --readiness-profile strict --format text
+patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.autofix.toml --format text
 ```
 
 ## 6) Optional integrations
@@ -39,7 +40,7 @@ patchgate policy verify-v1 --path policy.toml --readiness-profile strict --forma
 - Signed webhook: `--webhook-url ... --webhook-secret-env ...`
 - Notifications: `--notify-target slack=...` / `--notify-target teams=...`
 - Delivery fallback: `--dead-letter-output artifacts/dead-letter.jsonl`
-- Replay dead-letter: `patchgate delivery replay --input artifacts/dead-letter.jsonl --dry-run`
+- Replay dead-letter: `patchgate delivery replay --input artifacts/dead-letter.jsonl --rewrite-input --summary-output artifacts/dead-letter-replay-summary.json`
 
 ## 7) SDK template
 
@@ -50,3 +51,8 @@ patchgate policy verify-v1 --path policy.toml --readiness-profile strict --forma
 ## 8) CI template
 
 `docs/patchgate-action.yml` を `.github/workflows/patchgate.yml` にコピーして使います。
+
+GitHub 以外では次を使います。
+
+- GitLab: `docs/patchgate-gitlab-ci.yml`
+- Jenkins: `docs/Jenkinsfile.patchgate`
