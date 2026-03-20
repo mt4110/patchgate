@@ -1,0 +1,59 @@
+name: Dead-letter Replay
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PATCHGATE_DEAD_LETTER_PATH: artifacts/dead-letter.jsonl
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifacts
+
+      - name: Replay persisted dead-letter queue
+        run: |
+          if [ ! -f "$PATCHGATE_DEAD_LETTER_PATH" ]; then
+            cat > artifacts/dead-letter-replay-summary.json <<'EOF'
+            {"input_path":"artifacts/dead-letter.jsonl","transport_filter":null,"selected_records":0,"successful_records":0,"dry_run_records":0,"failed_records":0,"skipped_records":0,"retained_records":0,"dry_run":false,"rewrite_input":true,"failures":[]}
+            EOF
+            echo "No dead-letter queue found at $PATCHGATE_DEAD_LETTER_PATH. Skipping replay." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          cargo run -p patchgate-cli -- delivery replay \
+            --input "$PATCHGATE_DEAD_LETTER_PATH" \
+            --retry-max-attempts 3 \
+            --retry-backoff-ms 500 \
+            --rewrite-input \
+            --summary-output artifacts/dead-letter-replay-summary.json
+
+      - name: Publish replay summary
+        if: always()
+        run: |
+          if [ -f artifacts/dead-letter-replay-summary.json ]; then
+            echo "## Dead-letter replay" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- selected_records: $(jq -r '.selected_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- successful_records: $(jq -r '.successful_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- dry_run_records: $(jq -r '.dry_run_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- failed_records: $(jq -r '.failed_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- retained_records: $(jq -r '.retained_records' artifacts/dead-letter-replay-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dead-letter-replay
+          path: artifacts/dead-letter-replay-summary.json

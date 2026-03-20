@@ -32,7 +32,10 @@ jobs:
         run: |
           mkdir -p artifacts
           cp config/policy.toml.example artifacts/policy.lts.toml
+          cp config/policy.toml.example artifacts/policy.needs-autofix.toml
           sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
+          sed -i 's/^rc_frozen = true$/rc_frozen = false/' artifacts/policy.needs-autofix.toml
+          sed -i 's/^allow_legacy_config_names = false$/allow_legacy_config_names = true/' artifacts/policy.needs-autofix.toml
           nix develop --command cargo run -p patchgate-cli -- policy lint \
             --path config/policy.toml.example \
             --require-current-version
@@ -46,6 +49,17 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
             --path artifacts/policy.lts.toml \
             --readiness-profile lts \
+            --format text
+          set +e
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path artifacts/policy.needs-autofix.toml \
+            --format text \
+            --autofix-output artifacts/policy.autofix.toml
+          autofix_code=$?
+          set -e
+          test "$autofix_code" -eq 14
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path artifacts/policy.autofix.toml \
             --format text
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
@@ -116,7 +130,22 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- delivery replay \
             --input artifacts/dead-letter.jsonl \
             --dry-run \
-            --max-records 1
+            --max-records 1 \
+            --summary-output artifacts/dead-letter-replay-summary.json
+          jq -e '.dry_run_records == 1' artifacts/dead-letter-replay-summary.json
+
+      - name: Dead-letter replay rewrite smoke test
+        run: |
+          cat > artifacts/dead-letter-success.jsonl <<'EOF'
+          {"schema_version":1,"unix_ts":1700000000,"transport":"notification","endpoint":"https://example.internal/hook","idempotency_key":"pgv1-precheck-success","error":"timeout","payload":{"event":"scan.completed.notification","summary":{"score":88}}}
+          EOF
+          nix develop --command cargo run -p patchgate-cli -- delivery replay \
+            --input artifacts/dead-letter-success.jsonl \
+            --dry-run \
+            --rewrite-input \
+            --max-records 1 \
+            --summary-output artifacts/dead-letter-rewrite-summary.json
+          jq -e '.rewrite_input == true' artifacts/dead-letter-rewrite-summary.json
 
       - name: Verify SBOM and provenance metadata contract
         run: |

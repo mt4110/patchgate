@@ -21,6 +21,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use patchgate_config::{
     Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
@@ -337,6 +338,14 @@ struct DeliveryReplayArgs {
     #[arg(long, default_value_t = 500)]
     retry_backoff_ms: u64,
 
+    /// Rewrite the input JSONL so only unreplayed records remain
+    #[arg(long)]
+    rewrite_input: bool,
+
+    /// Write a machine-readable replay summary JSON file
+    #[arg(long)]
+    summary_output: Option<PathBuf>,
+
     /// Print target records but do not send requests
     #[arg(long)]
     dry_run: bool,
@@ -432,6 +441,14 @@ struct PolicyVerifyV1Args {
     /// Readiness profile: standard|strict|lts
     #[arg(long, default_value = "standard")]
     readiness_profile: String,
+
+    /// Write a policy file with safe autofixes applied
+    #[arg(long)]
+    autofix_output: Option<PathBuf>,
+
+    /// Overwrite the input policy file with safe autofixes
+    #[arg(long)]
+    autofix_write: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +823,29 @@ struct DeadLetterRecord {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     payload_raw: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterReplayFailure {
+    transport: String,
+    endpoint: String,
+    idempotency_key: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterReplaySummary {
+    input_path: String,
+    transport_filter: Option<String>,
+    selected_records: usize,
+    successful_records: usize,
+    dry_run_records: usize,
+    failed_records: usize,
+    skipped_records: usize,
+    retained_records: usize,
+    dry_run: bool,
+    rewrite_input: bool,
+    failures: Vec<DeadLetterReplayFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1654,6 +1694,16 @@ fn run_policy_migrate(
 }
 
 #[derive(Debug, Serialize)]
+struct V1AutofixResult {
+    mode: String,
+    path: String,
+    applied_changes: Vec<String>,
+    ready: bool,
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct V1ReadinessReport {
     ready: bool,
     policy_path: String,
@@ -1669,6 +1719,7 @@ struct V1ReadinessReport {
     warnings: Vec<String>,
     next_actions: Vec<String>,
     autofix_suggestions: Vec<String>,
+    autofix_result: Option<V1AutofixResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1697,6 +1748,42 @@ impl ReadinessProfile {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ReadinessAssessment {
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+    autofix_suggestions: Vec<String>,
+    autofixes: Vec<PolicyAutofix>,
+    ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyAutofix {
+    SetRcFrozen,
+    DisableLegacyConfigNames,
+    SetPluginSandboxProfile(&'static str),
+    SetLtsActive,
+    SetLtsSecuritySlaHours(u16),
+}
+
+impl PolicyAutofix {
+    fn suggestion(&self) -> String {
+        match self {
+            Self::SetRcFrozen => "compatibility.v1.rc_frozen = true".to_string(),
+            Self::DisableLegacyConfigNames => {
+                "compatibility.v1.allow_legacy_config_names = false".to_string()
+            }
+            Self::SetPluginSandboxProfile(profile) => {
+                format!("plugins.sandbox.profile = \"{profile}\"")
+            }
+            Self::SetLtsActive => "release.lts.active = true".to_string(),
+            Self::SetLtsSecuritySlaHours(hours) => {
+                format!("release.lts.security_sla_hours = {hours}")
+            }
+        }
+    }
+}
+
 fn run_policy_verify_v1(
     repo_root: &Path,
     config_override: Option<&Path>,
@@ -1717,6 +1804,12 @@ fn run_policy_verify_v1(
             return PolicyExitCode::ReadOrParse;
         }
     };
+    if args.autofix_write && args.autofix_output.is_some() {
+        eprintln!(
+            "patchgate policy verify-v1 error: --autofix-write and --autofix-output are mutually exclusive"
+        );
+        return PolicyExitCode::ReadOrParse;
+    }
     let readiness_profile = match ReadinessProfile::parse(args.readiness_profile.as_str()) {
         Ok(profile) => profile,
         Err(err) => {
@@ -1733,11 +1826,118 @@ fn run_policy_verify_v1(
         }
     };
 
-    let mut warnings = loaded.compatibility_warnings.clone();
-    let mut next_actions = Vec::new();
-    let mut autofix_suggestions = Vec::new();
-    let cfg = loaded.config;
     let isolated_runtime_supported = isolated_sandbox_runtime_supported();
+    let active_policy_path = policy_path.clone();
+    let mut active_loaded = loaded;
+    let mut active_assessment = assess_v1_readiness(
+        active_policy_path.as_path(),
+        &active_loaded.config,
+        active_loaded.compatibility_warnings.clone(),
+        readiness_profile,
+        isolated_runtime_supported,
+    );
+    let mut autofix_result = None;
+
+    if args.autofix_write {
+        let applied_changes = active_assessment.autofix_suggestions.clone();
+        if let Err(err) = apply_policy_autofixes(
+            policy_path.as_path(),
+            policy_path.as_path(),
+            &active_assessment.autofixes,
+        ) {
+            eprintln!("patchgate policy verify-v1 error: {err:#}");
+            return PolicyExitCode::IoFailed;
+        }
+        active_loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                eprintln!("patchgate policy verify-v1 error: {err:#}");
+                return map_config_error_to_policy_exit(&err);
+            }
+        };
+        active_assessment = assess_v1_readiness(
+            policy_path.as_path(),
+            &active_loaded.config,
+            active_loaded.compatibility_warnings.clone(),
+            readiness_profile,
+            isolated_runtime_supported,
+        );
+        autofix_result = Some(V1AutofixResult {
+            mode: "write".to_string(),
+            path: policy_path.display().to_string(),
+            applied_changes,
+            ready: active_assessment.ready,
+            warnings: active_assessment.warnings.clone(),
+            next_actions: active_assessment.next_actions.clone(),
+        });
+    } else if let Some(output_path) = args.autofix_output.as_ref() {
+        let output_path = resolve_repo_relative_path(repo_root, output_path.clone());
+        let applied_changes = active_assessment.autofix_suggestions.clone();
+        if let Err(err) = apply_policy_autofixes(
+            policy_path.as_path(),
+            output_path.as_path(),
+            &active_assessment.autofixes,
+        ) {
+            eprintln!("patchgate policy verify-v1 error: {err:#}");
+            return PolicyExitCode::IoFailed;
+        }
+        let preview_loaded = match load_policy_config(Some(output_path.as_path()), preset) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                eprintln!("patchgate policy verify-v1 error: {err:#}");
+                return map_config_error_to_policy_exit(&err);
+            }
+        };
+        let preview_assessment = assess_v1_readiness(
+            output_path.as_path(),
+            &preview_loaded.config,
+            preview_loaded.compatibility_warnings.clone(),
+            readiness_profile,
+            isolated_runtime_supported,
+        );
+        autofix_result = Some(V1AutofixResult {
+            mode: "output".to_string(),
+            path: output_path.display().to_string(),
+            applied_changes,
+            ready: preview_assessment.ready,
+            warnings: preview_assessment.warnings,
+            next_actions: preview_assessment.next_actions,
+        });
+    }
+
+    let report = build_v1_readiness_report(
+        active_policy_path.as_path(),
+        &active_loaded.config,
+        readiness_profile,
+        active_assessment,
+        autofix_result,
+    );
+
+    if let Err(err) = print_v1_readiness_report(&report, args.format.as_str()) {
+        eprintln!("patchgate policy verify-v1 error: {err}");
+        return if err.contains("unsupported --format") {
+            PolicyExitCode::ReadOrParse
+        } else {
+            PolicyExitCode::IoFailed
+        };
+    }
+
+    if report.ready {
+        PolicyExitCode::Ok
+    } else {
+        PolicyExitCode::MigrationRequired
+    }
+}
+
+fn assess_v1_readiness(
+    policy_path: &Path,
+    cfg: &Config,
+    mut warnings: Vec<String>,
+    readiness_profile: ReadinessProfile,
+    isolated_runtime_supported: bool,
+) -> ReadinessAssessment {
+    let mut next_actions = Vec::new();
+    let mut autofixes = Vec::new();
 
     if policy_path
         .file_name()
@@ -1753,79 +1953,65 @@ fn run_policy_verify_v1(
         warnings.push("compatibility.v1.rc_frozen=false".to_string());
         next_actions
             .push("Set `compatibility.v1.rc_frozen = true` after RC review freeze.".to_string());
-        autofix_suggestions.push("compatibility.v1.rc_frozen = true".to_string());
+        autofixes.push(PolicyAutofix::SetRcFrozen);
     }
     if cfg.compatibility.v1.allow_legacy_config_names {
         warnings.push("compatibility.v1.allow_legacy_config_names=true".to_string());
         next_actions.push(
             "Set `compatibility.v1.allow_legacy_config_names = false` before GA.".to_string(),
         );
-        autofix_suggestions.push("compatibility.v1.allow_legacy_config_names = false".to_string());
+        autofixes.push(PolicyAutofix::DisableLegacyConfigNames);
     }
-    if cfg.plugins.enabled && cfg.plugins.sandbox.profile == "none" {
-        warnings.push("plugins enabled with sandbox.profile=none".to_string());
-        next_actions.push(
-            "Use `plugins.sandbox.profile = \"restricted\"` for v1 secure baseline.".to_string(),
-        );
-        autofix_suggestions.push("plugins.sandbox.profile = \"restricted\"".to_string());
-    }
-    if cfg.plugins.enabled
-        && matches!(
+
+    if cfg.plugins.enabled {
+        if matches!(
             readiness_profile,
             ReadinessProfile::Strict | ReadinessProfile::Lts
-        )
-        && cfg.plugins.sandbox.profile != "isolated"
-    {
-        warnings.push(
-            "strict readiness requires plugins.sandbox.profile=isolated when plugins are enabled"
-                .to_string(),
-        );
-        next_actions.push(
-            "Set `plugins.sandbox.profile = \"isolated\"` and verify `bwrap` is available."
-                .to_string(),
-        );
-        autofix_suggestions.push("plugins.sandbox.profile = \"isolated\"".to_string());
+        ) {
+            if cfg.plugins.sandbox.profile != "isolated" {
+                warnings.push(
+                    "strict readiness requires plugins.sandbox.profile=isolated when plugins are enabled"
+                        .to_string(),
+                );
+                next_actions.push(
+                    "Set `plugins.sandbox.profile = \"isolated\"` and verify `bwrap` is available."
+                        .to_string(),
+                );
+                autofixes.push(PolicyAutofix::SetPluginSandboxProfile("isolated"));
+            } else if !cfg!(target_os = "linux") {
+                warnings.push(
+                    "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
+                        .to_string(),
+                );
+                next_actions.push(
+                    "Run strict/lts readiness verification on Linux where isolated plugin sandbox is supported."
+                        .to_string(),
+                );
+            } else if !isolated_runtime_supported {
+                warnings.push(
+                    "strict/lts readiness with plugins.sandbox.profile=isolated requires bwrap on Linux"
+                        .to_string(),
+                );
+                next_actions.push(
+                    "Install `bwrap` (bubblewrap) before relying on isolated plugin sandbox readiness."
+                        .to_string(),
+                );
+            }
+        } else if cfg.plugins.sandbox.profile == "none" {
+            warnings.push("plugins enabled with sandbox.profile=none".to_string());
+            next_actions.push(
+                "Use `plugins.sandbox.profile = \"restricted\"` for v1 secure baseline."
+                    .to_string(),
+            );
+            autofixes.push(PolicyAutofix::SetPluginSandboxProfile("restricted"));
+        }
     }
-    if cfg.plugins.enabled
-        && matches!(
-            readiness_profile,
-            ReadinessProfile::Strict | ReadinessProfile::Lts
-        )
-        && cfg.plugins.sandbox.profile == "isolated"
-        && !cfg!(target_os = "linux")
-    {
-        warnings.push(
-            "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
-                .to_string(),
-        );
-        next_actions.push(
-            "Run strict/lts readiness verification on Linux where isolated plugin sandbox is supported."
-                .to_string(),
-        );
-    }
-    if cfg.plugins.enabled
-        && matches!(
-            readiness_profile,
-            ReadinessProfile::Strict | ReadinessProfile::Lts
-        )
-        && cfg.plugins.sandbox.profile == "isolated"
-        && cfg!(target_os = "linux")
-        && !isolated_runtime_supported
-    {
-        warnings.push(
-            "strict/lts readiness with plugins.sandbox.profile=isolated requires bwrap on Linux"
-                .to_string(),
-        );
-        next_actions.push(
-            "Install `bwrap` (bubblewrap) before relying on isolated plugin sandbox readiness."
-                .to_string(),
-        );
-    }
+
     if matches!(readiness_profile, ReadinessProfile::Lts) && !cfg.release.lts.active {
         warnings.push("lts readiness requires release.lts.active=true".to_string());
         next_actions
             .push("Enable `[release.lts] active = true` before LTS readiness gate.".to_string());
-        autofix_suggestions.push("release.lts.active = true".to_string());
+        autofixes.push(PolicyAutofix::SetLtsActive);
     }
     if matches!(readiness_profile, ReadinessProfile::Lts) && cfg.release.lts.security_sla_hours > 72
     {
@@ -1834,7 +2020,7 @@ fn run_policy_verify_v1(
             "Set `release.lts.security_sla_hours` to 72 or lower for default LTS policy."
                 .to_string(),
         );
-        autofix_suggestions.push("release.lts.security_sla_hours = 72".to_string());
+        autofixes.push(PolicyAutofix::SetLtsSecuritySlaHours(72));
     }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
@@ -1860,8 +2046,29 @@ fn run_policy_verify_v1(
         next_actions.push("v1 readiness checks passed.".to_string());
     }
 
-    let report = V1ReadinessReport {
+    let autofix_suggestions = autofixes
+        .iter()
+        .map(PolicyAutofix::suggestion)
+        .collect::<Vec<_>>();
+
+    ReadinessAssessment {
+        warnings,
+        next_actions,
+        autofix_suggestions,
+        autofixes,
         ready,
+    }
+}
+
+fn build_v1_readiness_report(
+    policy_path: &Path,
+    cfg: &Config,
+    readiness_profile: ReadinessProfile,
+    assessment: ReadinessAssessment,
+    autofix_result: Option<V1AutofixResult>,
+) -> V1ReadinessReport {
+    V1ReadinessReport {
+        ready: assessment.ready,
         policy_path: policy_path.display().to_string(),
         policy_version: cfg.policy_version,
         readiness_profile: readiness_profile.as_str().to_string(),
@@ -1872,19 +2079,23 @@ fn run_policy_verify_v1(
         plugin_sandbox_profile: cfg.plugins.sandbox.profile.clone(),
         lts_active: cfg.release.lts.active,
         lts_security_sla_hours: cfg.release.lts.security_sla_hours,
-        warnings,
-        next_actions,
-        autofix_suggestions,
-    };
+        warnings: assessment.warnings,
+        next_actions: assessment.next_actions,
+        autofix_suggestions: assessment.autofix_suggestions,
+        autofix_result,
+    }
+}
 
-    match args.format.as_str() {
-        "json" => match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{json}"),
-            Err(err) => {
-                eprintln!("patchgate policy verify-v1 error: failed to encode json: {err}");
-                return PolicyExitCode::IoFailed;
-            }
-        },
+fn print_v1_readiness_report(
+    report: &V1ReadinessReport,
+    format: &str,
+) -> std::result::Result<(), String> {
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(report)
+                .map_err(|err| format!("failed to encode json: {err}"))?;
+            println!("{json}");
+        }
         "text" => {
             println!("patchgate policy verify-v1");
             println!("- ready: {}", report.ready);
@@ -1924,20 +2135,124 @@ fn run_policy_verify_v1(
                     println!("  - {suggestion}");
                 }
             }
+            if let Some(result) = report.autofix_result.as_ref() {
+                println!("- autofix_result:");
+                println!("  - mode: {}", result.mode);
+                println!("  - path: {}", result.path);
+                println!("  - ready: {}", result.ready);
+                if result.applied_changes.is_empty() {
+                    println!("  - applied_changes: none");
+                } else {
+                    println!("  - applied_changes:");
+                    for change in &result.applied_changes {
+                        println!("    - {change}");
+                    }
+                }
+                if result.warnings.is_empty() {
+                    println!("  - warnings: none");
+                } else {
+                    println!("  - warnings:");
+                    for warning in &result.warnings {
+                        println!("    - {warning}");
+                    }
+                }
+                println!("  - next_actions:");
+                for action in &result.next_actions {
+                    println!("    - {action}");
+                }
+            }
         }
         other => {
-            eprintln!(
-                "patchgate policy verify-v1 error: unsupported --format `{other}` (expected: text|json)"
-            );
-            return PolicyExitCode::ReadOrParse;
+            return Err(format!(
+                "unsupported --format `{other}` (expected: text|json)"
+            ));
         }
     }
+    Ok(())
+}
 
-    if ready {
-        PolicyExitCode::Ok
-    } else {
-        PolicyExitCode::MigrationRequired
+fn apply_policy_autofixes(
+    input_path: &Path,
+    output_path: &Path,
+    autofixes: &[PolicyAutofix],
+) -> Result<()> {
+    let raw = fs::read_to_string(input_path)
+        .with_context(|| format!("read policy for autofix: {}", input_path.display()))?;
+    let mut doc = raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse policy for autofix: {}", input_path.display()))?;
+    for autofix in autofixes {
+        apply_policy_autofix(&mut doc, autofix);
     }
+    write_text_atomic(output_path, doc.to_string().as_str())
+        .with_context(|| format!("write autofixed policy: {}", output_path.display()))
+}
+
+fn apply_policy_autofix(doc: &mut DocumentMut, autofix: &PolicyAutofix) {
+    match autofix {
+        PolicyAutofix::SetRcFrozen => {
+            let compatibility = ensure_table(doc.as_table_mut(), "compatibility");
+            let v1 = ensure_table(compatibility, "v1");
+            v1["rc_frozen"] = value(true);
+        }
+        PolicyAutofix::DisableLegacyConfigNames => {
+            let compatibility = ensure_table(doc.as_table_mut(), "compatibility");
+            let v1 = ensure_table(compatibility, "v1");
+            v1["allow_legacy_config_names"] = value(false);
+        }
+        PolicyAutofix::SetPluginSandboxProfile(profile) => {
+            let plugins = ensure_table(doc.as_table_mut(), "plugins");
+            let sandbox = ensure_table(plugins, "sandbox");
+            sandbox["profile"] = value(*profile);
+        }
+        PolicyAutofix::SetLtsActive => {
+            let release = ensure_table(doc.as_table_mut(), "release");
+            let lts = ensure_table(release, "lts");
+            lts["active"] = value(true);
+        }
+        PolicyAutofix::SetLtsSecuritySlaHours(hours) => {
+            let release = ensure_table(doc.as_table_mut(), "release");
+            let lts = ensure_table(release, "lts");
+            lts["security_sla_hours"] = value(i64::from(*hours));
+        }
+    }
+}
+
+fn ensure_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
+    if !table.contains_key(key) || !table[key].is_table() {
+        table[key] = Item::Table(Table::new());
+    }
+    table[key]
+        .as_table_mut()
+        .expect("table must exist after insertion")
+}
+
+fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("patchgate-policy");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = path.with_file_name(format!(".{file_name}.tmp-{nonce}"));
+    fs::write(&temp_path, content)
+        .with_context(|| format!("write temp file {}", temp_path.display()))?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "rename temp file {} -> {}",
+                temp_path.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn isolated_sandbox_runtime_supported() -> bool {
@@ -3265,11 +3580,31 @@ fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) 
     append_jsonl(path, &record).context("failed to append dead-letter record")
 }
 
+#[cfg(test)]
 fn load_dead_letter_jsonl(
     path: &Path,
     transport_filter: Option<&str>,
     max_records: Option<usize>,
 ) -> Result<Vec<DeadLetterRecord>> {
+    let rows = load_all_dead_letter_jsonl(path)?;
+    let mut filtered = Vec::new();
+    for row in rows {
+        if let Some(filter) = transport_filter {
+            if row.transport != filter {
+                continue;
+            }
+        }
+        filtered.push(row);
+        if let Some(limit) = max_records {
+            if filtered.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(filtered)
+}
+
+fn load_all_dead_letter_jsonl(path: &Path) -> Result<Vec<DeadLetterRecord>> {
     let file =
         fs::File::open(path).with_context(|| format!("open dead-letter: {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -3288,17 +3623,7 @@ fn load_dead_letter_jsonl(
             )
         })?;
         validate_dead_letter_record(&row, path, idx + 1)?;
-        if let Some(filter) = transport_filter {
-            if row.transport != filter {
-                continue;
-            }
-        }
         rows.push(row);
-        if let Some(limit) = max_records {
-            if rows.len() >= limit {
-                break;
-            }
-        }
     }
     Ok(rows)
 }
@@ -3336,24 +3661,66 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
             );
         }
     }
-    let records = load_dead_letter_jsonl(&args.input, transport_filter, args.max_records)?;
-    if records.is_empty() {
-        println!("no dead-letter records to replay");
-        return Ok(());
-    }
-
+    let records = load_all_dead_letter_jsonl(&args.input)?;
     let attempts = args.retry_max_attempts.max(1);
     let client = Client::builder()
         .timeout(Duration::from_millis(5_000))
         .build()
         .context("failed to build replay client")?;
-    let mut replayed = 0usize;
+    let mut summary = DeadLetterReplaySummary {
+        input_path: args.input.display().to_string(),
+        transport_filter: transport_filter.map(ToOwned::to_owned),
+        selected_records: 0,
+        successful_records: 0,
+        dry_run_records: 0,
+        failed_records: 0,
+        skipped_records: 0,
+        retained_records: 0,
+        dry_run: args.dry_run,
+        rewrite_input: args.rewrite_input,
+        failures: Vec::new(),
+    };
+    if records.is_empty() {
+        write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
+        println!("no dead-letter records to replay");
+        return Ok(());
+    }
+
+    let mut remaining = Vec::with_capacity(records.len());
+    let mut matched_records = 0usize;
     for record in records {
+        let matches_transport = transport_filter
+            .map(|transport| record.transport == transport)
+            .unwrap_or(true);
+        let within_limit = args
+            .max_records
+            .map(|limit| matched_records < limit)
+            .unwrap_or(true);
+        if !matches_transport || !within_limit {
+            remaining.push(record);
+            continue;
+        }
+        matched_records += 1;
+        summary.selected_records += 1;
+
         if record.endpoint.contains("***") {
+            let error = "redacted endpoint cannot be replayed".to_string();
             eprintln!(
                 "skip replay (redacted endpoint): transport={} endpoint={}",
                 record.transport, record.endpoint
             );
+            summary.skipped_records += 1;
+            summary.failed_records += 1;
+            summary.failures.push(DeadLetterReplayFailure {
+                transport: record.transport.clone(),
+                endpoint: record.endpoint.clone(),
+                idempotency_key: record.idempotency_key.clone(),
+                error: error.clone(),
+            });
+            let mut retained = record;
+            retained.error = error;
+            retained.unix_ts = current_unix_ts();
+            remaining.push(retained);
             continue;
         }
         if args.dry_run {
@@ -3363,66 +3730,137 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
                 redacted_endpoint(record.endpoint.as_str()),
                 record.idempotency_key
             );
-            replayed += 1;
+            summary.dry_run_records += 1;
+            remaining.push(record);
             continue;
         }
 
-        let body = match record.payload_raw.as_ref() {
-            Some(raw) => raw.as_bytes().to_vec(),
-            None => serde_json::to_vec(&record.payload).context("encode dead-letter payload")?,
-        };
-        let mut last_error: Option<anyhow::Error> = None;
-        for attempt in 1..=attempts {
-            let mut request = client
-                .post(record.endpoint.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .header(
-                    "X-Patchgate-Idempotency-Key",
-                    record.idempotency_key.as_str(),
-                );
-            for (header_name, header_value) in &record.headers {
-                let name = HeaderName::from_bytes(header_name.as_bytes()).with_context(|| {
-                    format!("invalid dead-letter header name for replay: {header_name}")
-                })?;
-                let value = HeaderValue::from_str(header_value).with_context(|| {
-                    format!("invalid dead-letter header value for replay: {header_name}")
-                })?;
-                request = request.header(name, value);
-            }
-            let response = request.body(body.clone()).send();
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    last_error = None;
-                    break;
-                }
-                Ok(resp) => {
-                    last_error = Some(anyhow!(
-                        "replay target returned status {} for {}",
-                        resp.status(),
-                        redacted_endpoint(record.endpoint.as_str())
-                    ));
-                }
-                Err(err) => {
-                    last_error = Some(anyhow!(err).context(format!(
-                        "replay request failed for {}",
-                        redacted_endpoint(record.endpoint.as_str())
-                    )));
+        match replay_dead_letter_record(&client, &record, attempts, args.retry_backoff_ms) {
+            Ok(()) => {
+                summary.successful_records += 1;
+                if !args.rewrite_input {
+                    remaining.push(record);
                 }
             }
-            if attempt < attempts {
-                let delay = args
-                    .retry_backoff_ms
-                    .saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
-                thread::sleep(Duration::from_millis(delay.min(10_000)));
+            Err(error) => {
+                summary.failed_records += 1;
+                summary.failures.push(DeadLetterReplayFailure {
+                    transport: record.transport.clone(),
+                    endpoint: redacted_endpoint(record.endpoint.as_str()),
+                    idempotency_key: record.idempotency_key.clone(),
+                    error: error.clone(),
+                });
+                let mut retained = record;
+                retained.error = error;
+                retained.unix_ts = current_unix_ts();
+                remaining.push(retained);
             }
         }
-        if let Some(err) = last_error {
-            return Err(err).context("dead-letter replay failed");
-        }
-        replayed += 1;
     }
-    println!("dead-letter replay completed: replayed_records={replayed}");
+
+    if summary.selected_records == 0 {
+        summary.retained_records = remaining.len();
+        write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
+        println!("no dead-letter records to replay");
+        return Ok(());
+    }
+
+    if args.rewrite_input && !args.dry_run {
+        write_dead_letter_jsonl(args.input.as_path(), &remaining)
+            .context("rewrite dead-letter input")?;
+    }
+    summary.retained_records = remaining.len();
+    write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
+    println!(
+        "dead-letter replay completed: selected_records={} successful_records={} dry_run_records={} failed_records={} skipped_records={} retained_records={}",
+        summary.selected_records,
+        summary.successful_records,
+        summary.dry_run_records,
+        summary.failed_records,
+        summary.skipped_records,
+        summary.retained_records
+    );
+    if summary.failed_records > 0 {
+        anyhow::bail!(
+            "dead-letter replay completed with {} failed record(s)",
+            summary.failed_records
+        );
+    }
     Ok(())
+}
+
+fn replay_dead_letter_record(
+    client: &Client,
+    record: &DeadLetterRecord,
+    attempts: u8,
+    retry_backoff_ms: u64,
+) -> std::result::Result<(), String> {
+    let body = match record.payload_raw.as_ref() {
+        Some(raw) => raw.as_bytes().to_vec(),
+        None => serde_json::to_vec(&record.payload)
+            .map_err(|err| format!("encode dead-letter payload: {err}"))?,
+    };
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        let mut request = client
+            .post(record.endpoint.as_str())
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                "X-Patchgate-Idempotency-Key",
+                record.idempotency_key.as_str(),
+            );
+        for (header_name, header_value) in &record.headers {
+            let name = HeaderName::from_bytes(header_name.as_bytes()).map_err(|_| {
+                format!("invalid dead-letter header name for replay: {header_name}")
+            })?;
+            let value = HeaderValue::from_str(header_value).map_err(|_| {
+                format!("invalid dead-letter header value for replay: {header_name}")
+            })?;
+            request = request.header(name, value);
+        }
+        let response = request.body(body.clone()).send();
+        match response {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                last_error = Some(format!(
+                    "replay target returned status {} for {}",
+                    resp.status(),
+                    redacted_endpoint(record.endpoint.as_str())
+                ));
+            }
+            Err(err) => {
+                last_error = Some(format!(
+                    "replay request failed for {}: {err}",
+                    redacted_endpoint(record.endpoint.as_str())
+                ));
+            }
+        }
+        if attempt < attempts {
+            let delay = retry_backoff_ms.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+            thread::sleep(Duration::from_millis(delay.min(10_000)));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "dead-letter replay failed".to_string()))
+}
+
+fn write_dead_letter_jsonl(path: &Path, records: &[DeadLetterRecord]) -> Result<()> {
+    let mut encoded = String::new();
+    for record in records {
+        encoded.push_str(&serde_json::to_string(record)?);
+        encoded.push('\n');
+    }
+    write_text_atomic(path, encoded.as_str())
+}
+
+fn write_dead_letter_replay_summary(
+    output_path: Option<&Path>,
+    summary: &DeadLetterReplaySummary,
+) -> Result<()> {
+    let Some(path) = output_path else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_string_pretty(summary)?;
+    write_text_atomic(path, encoded.as_str())
 }
 
 fn dispatch_signed_webhooks(
@@ -4445,9 +4883,13 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use patchgate_config::Config;
@@ -4481,6 +4923,31 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock poisoned")
+    }
+
+    fn spawn_http_ok_server(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept test connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set read timeout");
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        (format!("http://{}", addr), handle)
     }
 
     struct EnvSnapshot(Vec<(&'static str, Option<OsString>)>);
@@ -5605,6 +6072,8 @@ allow_legacy_config_names = true
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "standard".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -5639,6 +6108,8 @@ allow_legacy_config_names = false
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "standard".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
@@ -5677,6 +6148,8 @@ profile = "restricted"
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "strict".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -5714,6 +6187,8 @@ security_sla_hours = 72
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "lts".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -5755,6 +6230,8 @@ profile = "isolated"
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "strict".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -5796,10 +6273,151 @@ profile = "isolated"
                 policy_preset: None,
                 format: "text".to_string(),
                 readiness_profile: "strict".to_string(),
+                autofix_output: None,
+                autofix_write: false,
             },
         );
         super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
         assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_autofix_output_writes_ready_policy_preview() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-out-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("artifacts/policy.autofix.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = false
+allow_legacy_config_names = true
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path.clone()),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
+                autofix_output: Some(output_path.clone()),
+                autofix_write: false,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let output = fs::read_to_string(&output_path).expect("read autofix output");
+        assert!(output.contains("rc_frozen = true"));
+        assert!(output.contains("allow_legacy_config_names = false"));
+
+        let recheck = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(output_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
+                autofix_output: None,
+                autofix_write: false,
+            },
+        );
+        assert_eq!(recheck, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_autofix_write_updates_policy_in_place() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-write-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = false
+allow_legacy_config_names = true
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path.clone()),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
+                autofix_output: None,
+                autofix_write: true,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let output = fs::read_to_string(&policy_path).expect("read rewritten policy");
+        assert!(output.contains("rc_frozen = true"));
+        assert!(output.contains("allow_legacy_config_names = false"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_strict_autofix_prefers_isolated_profile() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-strict-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("policy.strict.autofix.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "none"
+"#,
+        )
+        .expect("write policy");
+
+        let _ = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+                autofix_output: Some(output_path.clone()),
+                autofix_write: false,
+            },
+        );
+
+        let output = fs::read_to_string(&output_path).expect("read strict autofix output");
+        assert!(output.contains("profile = \"isolated\""));
+        assert!(!output.contains("profile = \"restricted\""));
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -5918,6 +6536,8 @@ profile = "isolated"
             max_records: Some(1),
             retry_max_attempts: 1,
             retry_backoff_ms: 10,
+            rewrite_input: false,
+            summary_output: None,
             dry_run: true,
         })
         .expect("replay dry-run");
@@ -5949,10 +6569,129 @@ profile = "isolated"
             max_records: Some(1),
             retry_max_attempts: 1,
             retry_backoff_ms: 10,
+            rewrite_input: false,
+            summary_output: None,
             dry_run: true,
         })
         .expect_err("must reject unknown transport");
         assert!(format!("{err:#}").contains("invalid --transport value"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_rewrite_input_removes_successful_records_and_writes_summary() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-rewrite-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        let summary_output = dir.join("replay-summary.json");
+        let (endpoint, handle) = spawn_http_ok_server(1);
+
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: endpoint.as_str(),
+                idempotency_key: "pgv1-success",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification" }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed successful replay record");
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "webhook",
+                endpoint: "https://example.internal/webhook",
+                idempotency_key: "pgv1-unmatched",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed" }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed unmatched replay record");
+
+        run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            rewrite_input: true,
+            summary_output: Some(summary_output.clone()),
+            dry_run: false,
+        })
+        .expect("successful replay");
+        handle.join().expect("join server thread");
+
+        let remaining = fs::read_to_string(&input).expect("read rewritten dead-letter");
+        assert!(!remaining.contains("pgv1-success"));
+        assert!(remaining.contains("pgv1-unmatched"));
+
+        let summary: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&summary_output)
+                .expect("read summary")
+                .as_str(),
+        )
+        .expect("parse summary json");
+        assert_eq!(summary["successful_records"], 1);
+        assert_eq!(summary["failed_records"], 0);
+        assert_eq!(summary["retained_records"], 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_keeps_failed_records_and_reports_summary() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-failed-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        let summary_output = dir.join("replay-summary.json");
+        append_dead_letter(
+            Some(input.as_path()),
+            DeadLetterWriteOptions {
+                transport: "notification",
+                endpoint: "http://127.0.0.1:9/replay",
+                idempotency_key: "pgv1-failed",
+                error: "network timeout",
+                payload: &serde_json::json!({ "event": "scan.completed.notification" }),
+                headers: None,
+                payload_raw: None,
+            },
+        )
+        .expect("seed failed replay record");
+
+        let err = run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            rewrite_input: true,
+            summary_output: Some(summary_output.clone()),
+            dry_run: false,
+        })
+        .expect_err("replay should fail");
+        assert!(format!("{err:#}").contains("failed record"));
+
+        let remaining = fs::read_to_string(&input).expect("read retained dead-letter");
+        assert!(remaining.contains("pgv1-failed"));
+        assert!(remaining.contains("replay request failed"));
+
+        let summary: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&summary_output)
+                .expect("read summary")
+                .as_str(),
+        )
+        .expect("parse summary json");
+        assert_eq!(summary["successful_records"], 0);
+        assert_eq!(summary["failed_records"], 1);
+        assert_eq!(summary["retained_records"], 1);
+
         let _ = fs::remove_dir_all(dir);
     }
 

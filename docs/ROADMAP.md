@@ -20,14 +20,18 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase91-100](../phase91_100.md)
 - [PR Plan: Phase101-110](../phase101_110.md)
 - [PR Plan: Phase111-120](../phase111_120.md)
+- [PR Plan: Phase121-130](../phase121_130.md)
 
-## Active planning horizon (updated 2026-03-05)
+## Active planning horizon (updated 2026-03-20)
 
 - Implemented baseline: Phase1-100 (minimum viable contract)
-- Phase101-120: baseline implementation in progress (partial complete)
+- Phase101-120: baseline implementation completed
+- Phase101-120 follow-up: docs / cross-repo rollout / ops settlement continue
+- Phase121-130: implementation started
 - Next execution focus:
-  - PR103/107 contract test hardening
-  - PR111+/114+ operational automation closure
+  - PR124 `verify-v1` safe autofix output/apply
+  - PR125 dead-letter replay self-healing loop + scheduled workflow
+  - PR121/122 cross-platform sandbox capability matrix + non-GitHub CI template planning
 
 ## v0.3.9 (Phase81-90 baseline delivered)
 
@@ -43,7 +47,7 @@ This roadmap tracks the patchgate pivot.
 - SLO/GA operational report commands (`xtask ops slo-report|ga-readiness`)
 - LTS/GA/release workflows (`lts-backport.yml`, `ga-readiness.yml`, `release-ga.yml`)
 
-## v1.0.x hardening+ops (Phase101-120, partially implemented)
+## v1.0.x hardening+ops (Phase101-120 baseline delivered)
 
 1. Plugin sandboxをOSレベル隔離へ拡張（process/network/fs制限の強制）
 2. Plugin SDKを複数言語テンプレート化し、互換テストをCI化
@@ -52,7 +56,7 @@ This roadmap tracks the patchgate pivot.
 5. リリース署名/証明書連携とSBOM標準（CycloneDX/SPDX）を本実装化
 6. LTSバックポート半自動化 + SLA追跡 + 週次可視化
 
-## Hypothetical remaining work after Phase120 (from backcast 121+)
+## Active next-phase backlog (Phase121+)
 
 1. sandbox隔離のクロスプラットフォーム統一（macOS/Windows）
 2. 非GitHub CI providerの実運用テンプレート化（GitLab/Jenkins等）
@@ -60,6 +64,13 @@ This roadmap tracks the patchgate pivot.
 4. `verify-v1` 推奨修正の自動提案（autofix/PR提案）
 5. 配信障害の自動復旧ループ（dead-letter再処理の定期ジョブ化）
 6. v1.1スコープ凍結とv2互換戦略の準備
+
+## Active Phase121-130 slice
+
+1. `policy verify-v1` に safe autofix の出力/適用を追加
+2. `delivery replay` に残件書き戻し・summary 出力を追加
+3. scheduled workflow で dead-letter 再処理を定期実行できるようにする
+4. sandbox capability matrix / non-GitHub CI template は PR121/122 計画で固定する
 
 ## Non-goals (current phase)
 
