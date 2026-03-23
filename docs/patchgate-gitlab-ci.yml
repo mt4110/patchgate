@@ -4,6 +4,9 @@ stages:
 patchgate:
   stage: quality
   image: rust:1.75
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    CARGO_TARGET_DIR: $CI_PROJECT_DIR/target
   cache:
     key: patchgate-cargo
     paths:

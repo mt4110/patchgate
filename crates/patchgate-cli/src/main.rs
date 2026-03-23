@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -381,6 +381,7 @@ struct PluginInitArgs {
 }
 
 static DEAD_LETTER_ENDPOINT_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommand {
@@ -447,11 +448,11 @@ struct PolicyVerifyV1Args {
     readiness_profile: String,
 
     /// Write a policy file with safe autofixes applied
-    #[arg(long)]
+    #[arg(long, conflicts_with = "autofix_write")]
     autofix_output: Option<PathBuf>,
 
     /// Overwrite the input policy file with safe autofixes
-    #[arg(long)]
+    #[arg(long, conflicts_with = "autofix_output")]
     autofix_write: bool,
 }
 
@@ -2039,11 +2040,31 @@ fn assess_v1_readiness(
                     "strict readiness requires plugins.sandbox.profile=isolated when plugins are enabled"
                         .to_string(),
                 );
-                next_actions.push(
-                    "Set `plugins.sandbox.profile = \"isolated\"` and verify `bwrap` is available."
-                        .to_string(),
-                );
-                autofixes.push(PolicyAutofix::SetPluginSandboxProfile("isolated"));
+                if cfg!(target_os = "linux") && isolated_runtime_supported {
+                    next_actions.push(
+                        "Set `plugins.sandbox.profile = \"isolated\"` for strict/lts readiness."
+                            .to_string(),
+                    );
+                    autofixes.push(PolicyAutofix::SetPluginSandboxProfile("isolated"));
+                } else if !cfg!(target_os = "linux") {
+                    warnings.push(
+                        "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
+                            .to_string(),
+                    );
+                    next_actions.push(
+                        "Run strict/lts readiness verification on Linux before switching plugins to the isolated sandbox profile."
+                            .to_string(),
+                    );
+                } else {
+                    warnings.push(
+                        "strict/lts readiness with plugins.sandbox.profile=isolated requires bwrap on Linux"
+                            .to_string(),
+                    );
+                    next_actions.push(
+                        "Install `bwrap` (bubblewrap) before switching plugins to the isolated sandbox profile."
+                            .to_string(),
+                    );
+                }
             } else if !cfg!(target_os = "linux") {
                 warnings.push(
                     "strict/lts readiness with plugins.sandbox.profile=isolated requires Linux runtime"
@@ -2315,12 +2336,14 @@ fn ensure_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
 }
 
 fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let temp_path = temp_path_for(path);
-    fs::write(&temp_path, content)
+    let (temp_path, mut temp_file) = create_sibling_temp_file(path)?;
+    temp_file
+        .write_all(content.as_bytes())
         .with_context(|| format!("write temp file {}", temp_path.display()))?;
+    temp_file
+        .sync_all()
+        .with_context(|| format!("sync temp file {}", temp_path.display()))?;
+    drop(temp_file);
     if let Err(err) = replace_file(temp_path.as_path(), path) {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
@@ -2328,16 +2351,42 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
+fn create_sibling_temp_file(path: &Path) -> Result<(PathBuf, fs::File)> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    // `create_new(true)` avoids overwriting attacker-controlled symlinks or files.
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("patchgate-policy");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    path.with_file_name(format!(".{file_name}.tmp-{nonce}"))
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp_path = path.with_file_name(format!(".{file_name}.tmp-{pid}-{nonce}-{seq}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create temp file {}", temp_path.display()));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "failed to allocate unique temp file alongside {}",
+        path.display()
+    );
 }
 
 #[cfg(not(windows))]
@@ -4071,12 +4120,7 @@ struct DeadLetterRewriteState {
 }
 
 fn create_dead_letter_rewrite_state(path: &Path) -> Result<DeadLetterRewriteState> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let temp_path = temp_path_for(path);
-    let file = fs::File::create(&temp_path)
-        .with_context(|| format!("create dead-letter rewrite file {}", temp_path.display()))?;
+    let (temp_path, file) = create_sibling_temp_file(path)?;
     Ok(DeadLetterRewriteState { temp_path, file })
 }
 
@@ -4084,6 +4128,12 @@ fn finalize_dead_letter_rewrite(mut state: DeadLetterRewriteState, path: &Path) 
     state.file.flush().with_context(|| {
         format!(
             "flush dead-letter rewrite file {}",
+            state.temp_path.display()
+        )
+    })?;
+    state.file.sync_all().with_context(|| {
+        format!(
+            "sync dead-letter rewrite file {}",
             state.temp_path.display()
         )
     })?;
@@ -5176,6 +5226,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use clap::Parser as _;
     use patchgate_config::Config;
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
     use patchgate_github::PublishAuth;
@@ -5195,7 +5246,7 @@ mod tests {
         resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
         resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
         run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, write_text_atomic,
-        CiProvider, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
+        CiProvider, Cli, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
         OptionSource, PluginInitArgs, PolicyAutofix, PolicyExitCode, PolicyLintArgs,
         PolicyVerifyV1Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
         RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
@@ -5208,7 +5259,7 @@ mod tests {
         ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("env lock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn spawn_http_ok_server(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
@@ -6485,6 +6536,8 @@ security_sla_hours = 72
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn policy_verify_v1_strict_requires_linux_runtime_for_isolated_plugins() {
+        let _guard = env_lock();
+        super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut repo_root = std::env::temp_dir();
         repo_root.push(format!(
@@ -6715,6 +6768,21 @@ allow_legacy_config_names = true
     }
 
     #[test]
+    fn policy_verify_v1_cli_rejects_conflicting_autofix_flags() {
+        let err = Cli::try_parse_from([
+            "patchgate",
+            "policy",
+            "verify-v1",
+            "--autofix-write",
+            "--autofix-output",
+            "artifacts/policy.autofix.toml",
+        ])
+        .expect_err("conflicting autofix flags should be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn write_text_atomic_overwrites_existing_file() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("patchgate-write-text-atomic-{seq}"));
@@ -6730,8 +6798,10 @@ allow_legacy_config_names = true
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn policy_verify_v1_strict_autofix_prefers_isolated_profile() {
+        let _guard = env_lock();
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let repo_root =
             std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-strict-{seq}"));
@@ -6754,6 +6824,7 @@ profile = "none"
         )
         .expect("write policy");
 
+        super::BWRAP_AVAILABLE_OVERRIDE.store(1, Ordering::Relaxed);
         let _ = run_policy_verify_v1(
             &repo_root,
             None,
@@ -6766,9 +6837,58 @@ profile = "none"
                 autofix_write: false,
             },
         );
+        super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
 
         let output = fs::read_to_string(&output_path).expect("read strict autofix output");
         assert!(output.contains("profile = \"isolated\""));
+        assert!(!output.contains("profile = \"restricted\""));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v1_strict_autofix_skips_isolated_without_runtime_support() {
+        let _guard = env_lock();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-strict-guard-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("policy.strict.autofix.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[plugins]
+enabled = true
+[plugins.sandbox]
+profile = "none"
+"#,
+        )
+        .expect("write policy");
+
+        super::BWRAP_AVAILABLE_OVERRIDE.store(0, Ordering::Relaxed);
+        let _ = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "strict".to_string(),
+                autofix_output: Some(output_path.clone()),
+                autofix_write: false,
+            },
+        );
+        super::BWRAP_AVAILABLE_OVERRIDE.store(-1, Ordering::Relaxed);
+
+        let output = fs::read_to_string(&output_path).expect("read strict autofix output");
+        assert!(output.contains("profile = \"none\""));
+        assert!(!output.contains("profile = \"isolated\""));
         assert!(!output.contains("profile = \"restricted\""));
 
         let _ = fs::remove_dir_all(repo_root);
