@@ -8,6 +8,15 @@ This roadmap tracks the patchgate pivot.
 - [Phase Backcast (121+)](10_phase_backcast_121_plus.md)
 - [Current State and Next Steps](11_current_state_and_next_steps.md)
 - [Phase101-120 Status](12_phase101_120_status.md)
+- [Phase Backcast (151-200)](13_phase151_200_backcast.md)
+- [V2 Migration Guide Alpha](16_v2_migration_guide_alpha.md)
+- [Provider Rollout Checklist](15_provider_rollout_checklist.md)
+- [Fleet Ops Review Packet](17_fleet_ops_review_packet.md)
+- [V2 Candidate Release Checklist](18_v2_candidate_release_checklist.md)
+- [V2 Ops Handbook](19_v2_ops_handbook.md)
+- [V1 Sunset Notice](21_v1_sunset_notice.md)
+- [V2 Support Model](22_v2_support_model.md)
+- [Phase Backcast (201+)](20_phase201_plus_backcast.md)
 - [PR Plan: Phase1-10](07_pr_plan_phase1_10.md)
 - [PR Plan: Phase11-20](08_pr_plan_phase11_20.md)
 - [PR Plan: Phase21-30](../phase21_30.md)
@@ -23,18 +32,29 @@ This roadmap tracks the patchgate pivot.
 - [PR Plan: Phase121-130](../phase121_130.md)
 - [PR Plan: Phase131-140](../phase131_140.md)
 - [PR Plan: Phase141-150](../phase141_150.md)
+- [PR Plan: Phase151-160](../phase151_160.md)
+- [PR Plan: Phase161-170](../phase161_170.md)
+- [PR Plan: Phase171-180](../phase171_180.md)
+- [PR Plan: Phase181-190](../phase181_190.md)
+- [PR Plan: Phase191-200](../phase191_200.md)
 
-## Active planning horizon (updated 2026-03-20)
+## Active planning horizon (updated 2026-03-23)
 
 - Implemented baseline: Phase1-100 (minimum viable contract)
 - Phase101-120: baseline implementation completed
 - Phase101-120 follow-up: docs / cross-repo rollout / ops settlement continue
 - Phase121-130: implementation started
-- Phase131-150: design started
+- Phase131-150: design fixed / implementation follow-up ongoing
+- Phase151-200: design fixed, fleet/RC/GA artifact implementation started
 - Next execution focus:
-  - PR121 sandbox capability surfacing
-  - PR122 non-GitHub CI template pack
-  - PR123 plugin trust lifecycle
+  - PR151 compatibility evidence pack
+  - PR152 weekly/release compatibility artifact wiring
+  - PR153 v1.1 freeze evidence refresh
+  - PR156 replay evidence normalization
+  - PR161-165 bridge / verify-v2 / contract diff prototype
+  - PR171-179 fleet governance packet
+  - PR181-190 RC readiness packet
+  - PR191-199 GA/LTS/support artifacts
 
 ## v0.3.9 (Phase81-90 baseline delivered)
 
@@ -75,6 +95,15 @@ This roadmap tracks the patchgate pivot.
 3. scheduled workflow で dead-letter 再処理を定期実行できるようにする
 4. sandbox capability matrix を doctor / readiness に surfacing
 5. GitLab / Jenkins 向け generic CI template を追加
+
+## Active Phase151-160 slice
+
+1. `xtask ops compatibility-report` で freeze / seed の判断 artifact を追加
+2. weekly ops / ga-readiness / release-precheck に compatibility report を接続
+3. `xtask ops freeze-scoreboard` で v1.1 freeze / v2 seed の gate artifact を追加
+4. Phase151-200 の backcast と PR plan を固定
+5. replay evidence を release precheck artifact に含める
+6. generic provider / audit export / policy gate に v2 bridge prototype を追加
 
 ## Non-goals (current phase)
 

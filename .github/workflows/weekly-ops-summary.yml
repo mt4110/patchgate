@@ -24,7 +24,8 @@ jobs:
             --format json \
             --no-cache \
             --metrics-output artifacts/scan-metrics.jsonl \
-            --audit-log-output artifacts/scan-audit.jsonl
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl
 
       - name: Build summary and trend artifacts
         run: |
@@ -39,6 +40,27 @@ jobs:
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/weekly-ops-summary.md \
             --trend-output artifacts/weekly-ops-trend.json
+          cargo run -p xtask -- ops compatibility-report \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/compatibility-report.md
+          cargo run -p xtask -- ops freeze-scoreboard \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/v1.1-freeze-scoreboard.md
+          cargo run -p xtask -- ops audit-drift-report \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/audit-drift-report.md
+          cargo run -p xtask -- ops shadow-review \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --output artifacts/shadow-review.md
+          cargo run -p xtask -- ops fleet-review \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --cost-ceiling-minutes 30 \
+            --output artifacts/fleet-review.md
 
       - uses: actions/upload-artifact@v4
         with:

@@ -595,6 +595,10 @@ pub struct ObservabilityConfig {
     pub audit_jsonl_path: String,
     #[serde(default = "default_audit_schema_version")]
     pub audit_schema_version: u8,
+    #[serde(default)]
+    pub audit_v2_jsonl_path: String,
+    #[serde(default = "default_audit_v2_schema_version")]
+    pub audit_v2_schema_version: u8,
 }
 
 impl Default for ObservabilityConfig {
@@ -603,6 +607,8 @@ impl Default for ObservabilityConfig {
             metrics_jsonl_path: default_empty_string(),
             audit_jsonl_path: default_empty_string(),
             audit_schema_version: default_audit_schema_version(),
+            audit_v2_jsonl_path: default_empty_string(),
+            audit_v2_schema_version: default_audit_v2_schema_version(),
         }
     }
 }
@@ -613,6 +619,10 @@ fn default_empty_string() -> String {
 
 fn default_audit_schema_version() -> u8 {
     1
+}
+
+fn default_audit_v2_schema_version() -> u8 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -758,6 +768,8 @@ pub struct IntegrationConfig {
 pub struct CiIntegrationConfig {
     #[serde(default = "default_ci_provider")]
     pub provider: String, // "github" | "generic"
+    #[serde(default = "default_ci_generic_schema")]
+    pub generic_schema: String, // "v1" | "v2" | "dual"
     #[serde(default = "default_empty_string")]
     pub generic_output_path: String,
 }
@@ -766,6 +778,7 @@ impl Default for CiIntegrationConfig {
     fn default() -> Self {
         Self {
             provider: default_ci_provider(),
+            generic_schema: default_ci_generic_schema(),
             generic_output_path: default_empty_string(),
         }
     }
@@ -773,6 +786,10 @@ impl Default for CiIntegrationConfig {
 
 fn default_ci_provider() -> String {
     "github".to_string()
+}
+
+fn default_ci_generic_schema() -> String {
+    "v1".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -938,6 +955,8 @@ fn default_v1_allow_legacy_config_names() -> bool {
 pub struct CompatibilityConfig {
     #[serde(default)]
     pub v1: V1CompatibilityConfig,
+    #[serde(default)]
+    pub v2: V2CompatibilityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -953,6 +972,30 @@ impl Default for V1CompatibilityConfig {
         Self {
             rc_frozen: default_v1_rc_frozen(),
             allow_legacy_config_names: default_v1_allow_legacy_config_names(),
+        }
+    }
+}
+
+fn default_v2_bridge_mode() -> String {
+    "off".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct V2CompatibilityConfig {
+    #[serde(default = "default_false")]
+    pub shadow_mode: bool,
+    #[serde(default = "default_v2_bridge_mode")]
+    pub bridge_mode: String, // "off" | "provider" | "audit" | "full"
+    #[serde(default)]
+    pub migration_guide_path: String,
+}
+
+impl Default for V2CompatibilityConfig {
+    fn default() -> Self {
+        Self {
+            shadow_mode: default_false(),
+            bridge_mode: default_v2_bridge_mode(),
+            migration_guide_path: default_empty_string(),
         }
     }
 }

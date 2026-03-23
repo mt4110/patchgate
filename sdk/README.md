@@ -23,3 +23,8 @@ Templates:
 - stderr: 任意診断
 - timeout: `plugins.entries[].timeout_ms`
 - sandbox: `plugins.sandbox.*`
+
+## V2 shadow preview
+
+- generated template には `sample-input.v2.json` も含まれます
+- これは `patchgate.plugin.v2-shadow` の preview envelope で、現時点では migration 設計用サンプルです

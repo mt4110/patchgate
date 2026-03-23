@@ -11,6 +11,15 @@ nav:
   - Architecture: ARCHITECTURE.md
   - Security: SECURITY.md
   - Roadmap: ROADMAP.md
+  - Phase151-200 Backcast: 13_phase151_200_backcast.md
+  - V2 Migration Guide: 16_v2_migration_guide_alpha.md
+  - Provider Rollout Checklist: 15_provider_rollout_checklist.md
+  - Fleet Ops Review Packet: 17_fleet_ops_review_packet.md
+  - V2 Candidate Release Checklist: 18_v2_candidate_release_checklist.md
+  - V2 Ops Handbook: 19_v2_ops_handbook.md
+  - V1 Sunset Notice: 21_v1_sunset_notice.md
+  - V2 Support Model: 22_v2_support_model.md
+  - Phase201+ Backcast: 20_phase201_plus_backcast.md
   - Release Checklist: 99_release_checklist.md
 markdown_extensions:
   - admonition

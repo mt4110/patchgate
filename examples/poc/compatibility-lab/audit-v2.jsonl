@@ -1,0 +1,1 @@
+{"schema_version":2,"audit_format":"patchgate.audit.v2","emitted_at":1700000000,"actor":"bot","repo":"example/repo","operation":{"target":"scan","mode":"warn","scope":"worktree","result":"pass"},"gate":{"score":92,"threshold":70,"changed_files":3},"failure":{"code":null,"category":null},"diagnostics":[]}

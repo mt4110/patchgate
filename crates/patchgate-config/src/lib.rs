@@ -368,6 +368,16 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         cfg.integrations.ci.provider.as_str(),
         &["github", "generic"],
     )?;
+    validate_enum(
+        "integrations.ci.generic_schema",
+        cfg.integrations.ci.generic_schema.as_str(),
+        &["v1", "v2", "dual"],
+    )?;
+    validate_enum(
+        "compatibility.v2.bridge_mode",
+        cfg.compatibility.v2.bridge_mode.as_str(),
+        &["off", "provider", "audit", "full"],
+    )?;
 
     validate_range_u8("output.fail_threshold", cfg.output.fail_threshold, 0, 100)?;
     validate_positive_u32("scope.max_changed_files", cfg.scope.max_changed_files)?;
@@ -509,6 +519,12 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         1,
         10,
     )?;
+    validate_range_u8(
+        "observability.audit_v2_schema_version",
+        cfg.observability.audit_v2_schema_version,
+        2,
+        10,
+    )?;
     validate_positive_u32(
         "plugins.sandbox.max_stdout_kib",
         cfg.plugins.sandbox.max_stdout_kib,
@@ -600,6 +616,15 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
+    if !cfg.observability.audit_v2_jsonl_path.is_empty()
+        && cfg.observability.audit_v2_jsonl_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "observability.audit_v2_jsonl_path",
+            "must be non-empty string when provided",
+        ));
+    }
     if (cfg.integrations.webhook.enabled || !cfg.integrations.webhook.urls.is_empty())
         && cfg.integrations.webhook.secret_env.trim().is_empty()
     {
@@ -616,6 +641,36 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             ValidationCategory::Type,
             "integrations.ci.generic_output_path",
             "must be non-empty string when provided",
+        ));
+    }
+    if matches!(cfg.compatibility.v2.bridge_mode.as_str(), "audit" | "full")
+        && cfg.observability.audit_v2_jsonl_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "observability.audit_v2_jsonl_path",
+            "must be non-empty when compatibility.v2.bridge_mode includes audit output",
+        ));
+    }
+    if matches!(
+        cfg.compatibility.v2.bridge_mode.as_str(),
+        "provider" | "full"
+    ) && cfg.integrations.ci.generic_schema == "v1"
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "integrations.ci.generic_schema",
+            "must be `v2` or `dual` when compatibility.v2.bridge_mode includes provider output",
+        ));
+    }
+    if cfg.compatibility.v2.shadow_mode
+        && cfg.compatibility.v2.bridge_mode == "off"
+        && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "compatibility.v2",
+            "shadow_mode requires a bridge_mode or migration_guide_path to document the rollout",
         ));
     }
     if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {
@@ -1314,6 +1369,51 @@ profile = "isolated"
 
         let loaded = load_from_typed(&path).expect("isolated profile should pass");
         assert_eq!(loaded.plugins.sandbox.profile, "isolated");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_generic_schema() {
+        let path = write_temp_policy(
+            r#"
+[integrations.ci]
+generic_schema = "bridge"
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must fail for invalid generic schema");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "integrations.ci.generic_schema")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_v2_audit_bridge_without_v2_output_path() {
+        let path = write_temp_policy(
+            r#"
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+[integrations.ci]
+generic_schema = "dual"
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must fail without audit_v2_jsonl_path");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "observability.audit_v2_jsonl_path")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
         let _ = fs::remove_file(path);
     }
 

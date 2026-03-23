@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "plugin_id": "example/security-rules",
+      "version": "0.3.0",
+      "owner": "platform-security",
+      "provenance": "sigstore",
+      "verified": true
+    },
+    {
+      "plugin_id": "example/compliance-report",
+      "version": "0.2.1",
+      "owner": "platform-ops",
+      "provenance": "slsa",
+      "verified": true
+    }
+  ]
+}

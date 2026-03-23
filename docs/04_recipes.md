@@ -32,6 +32,7 @@ patchgate scan \
   --format json \
   --publish \
   --ci-provider generic \
+  --ci-generic-schema dual \
   --ci-generic-output artifacts/ci-generic.json
 ```
 
@@ -85,6 +86,22 @@ patchgate delivery replay \
 成功したレコードは queue から除去され、失敗したレコードだけが `artifacts/dead-letter.jsonl` に残ります。
 `.github/workflows/dead-letter-replay.yml` は、この queue を `dead-letter-queue` branch に永続化する前提です。
 
+### replay summary を evidence packet に正規化
+
+```bash
+cargo run -p xtask -- ops replay-normalize \
+  --replay-summary-input artifacts/dead-letter-replay-summary.json \
+  --output artifacts/dead-letter-evidence.json
+```
+
+### audit drift をレビュー
+
+```bash
+cargo run -p xtask -- ops audit-drift-report \
+  --audit-input artifacts/scan-audit.jsonl \
+  --output artifacts/audit-drift-report.md
+```
+
 ### `verify-v1` の safe autofix preview を出力
 
 ```bash
@@ -125,6 +142,22 @@ patchgate policy verify-v1 \
   --format text
 ```
 
+### v2 shadow / bridge 準備チェック
+
+```bash
+patchgate policy verify-v2 \
+  --path config/policy.toml.example \
+  --format text
+```
+
+### v1/v2 contract diff を確認
+
+```bash
+patchgate policy diff-contract \
+  --path config/policy.toml.example \
+  --format text
+```
+
 ### SLOレポート生成
 
 ```bash
@@ -140,4 +173,89 @@ cargo run -p xtask -- ops ga-readiness \
   --metrics-input artifacts/scan-metrics.jsonl \
   --audit-input artifacts/scan-audit.jsonl \
   --output artifacts/ga-readiness.md
+```
+
+### Compatibility report を生成
+
+```bash
+cargo run -p xtask -- ops compatibility-report \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --replay-summary-input artifacts/dead-letter-replay-summary.json \
+  --output artifacts/compatibility-report.md
+```
+
+出力は `stabilize-v1` / `hold-v1.1-line` / `start-v2-seed` の posture と、
+その判断に使った SLO / audit / replay 証跡をまとめます。
+
+### v1.1 freeze scoreboard を生成
+
+```bash
+cargo run -p xtask -- ops freeze-scoreboard \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --replay-summary-input artifacts/dead-letter-replay-summary.json \
+  --output artifacts/v1.1-readiness.md
+```
+
+`freeze_ready` は v1.1 freeze を継続できるかを示し、
+`v2_seed_ready` は replay 証跡まで含めて v2 seed を始めてよいかを示します。
+
+### v1/v2 shadow review を生成
+
+```bash
+cargo run -p xtask -- ops shadow-review \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --output artifacts/shadow-review.md
+```
+
+### fleet review packet を生成
+
+```bash
+cargo run -p xtask -- ops fleet-review \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --provider-input artifacts/provider-dual.json \
+  --bundle-catalog-input examples/poc/fleet-lab/bundle-catalog.json \
+  --registry-input examples/poc/fleet-lab/plugin-registry.json \
+  --exceptions-input examples/poc/fleet-lab/exceptions.json \
+  --cost-ceiling-minutes 30 \
+  --output artifacts/fleet-review.md
+```
+
+### RC readiness packet を生成
+
+```bash
+cargo run -p xtask -- ops rc-readiness \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+  --provider-input artifacts/provider-dual.json \
+  --benchmark-input artifacts/bench-compare.json \
+  --security-review-input artifacts/security-review-template.md \
+  --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+  --provider-rollout-path docs/15_provider_rollout_checklist.md \
+  --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --output artifacts/v2-rc-readiness.md
+```
+
+### GA packet を生成
+
+```bash
+cargo run -p xtask -- ops ga-packet \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+  --policy-input artifacts/policy.v2.toml \
+  --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+  --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --ops-handbook-path docs/19_v2_ops_handbook.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --phase201-backcast-path docs/20_phase201_plus_backcast.md \
+  --output artifacts/v2-ga-packet.md
 ```

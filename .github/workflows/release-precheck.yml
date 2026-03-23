@@ -33,9 +33,15 @@ jobs:
           mkdir -p artifacts
           cp config/policy.toml.example artifacts/policy.lts.toml
           cp config/policy.toml.example artifacts/policy.needs-autofix.toml
+          cp config/policy.toml.example artifacts/policy.v2.toml
           sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
           sed -i 's/^rc_frozen = true$/rc_frozen = false/' artifacts/policy.needs-autofix.toml
           sed -i 's/^allow_legacy_config_names = false$/allow_legacy_config_names = true/' artifacts/policy.needs-autofix.toml
+          sed -i 's/^generic_schema = .*/generic_schema = "dual" # v1 | v2 | dual/' artifacts/policy.v2.toml
+          sed -i 's|^audit_v2_jsonl_path = ""$|audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"|' artifacts/policy.v2.toml
+          sed -i 's/^shadow_mode = false$/shadow_mode = true/' artifacts/policy.v2.toml
+          sed -i 's/^bridge_mode = .*/bridge_mode = "full" # off | provider | audit | full/' artifacts/policy.v2.toml
+          sed -i 's|^migration_guide_path = ""$|migration_guide_path = "docs/16_v2_migration_guide_alpha.md"|' artifacts/policy.v2.toml
           nix develop --command cargo run -p patchgate-cli -- policy lint \
             --path config/policy.toml.example \
             --require-current-version
@@ -61,6 +67,12 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
             --path artifacts/policy.autofix.toml \
             --format text
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v2 \
+            --path artifacts/policy.v2.toml \
+            --format json > artifacts/verify-v2.json
+          nix develop --command cargo run -p patchgate-cli -- policy diff-contract \
+            --path artifacts/policy.v2.toml \
+            --format json > artifacts/diff-contract.json
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
               --path "config/presets/${preset}.toml" \
@@ -79,6 +91,18 @@ jobs:
             --github-pr 1 \
             --github-sha deadbeef \
             --github-dry-run-output artifacts/github-payload.json
+
+      - name: Generic provider dual-schema smoke test
+        run: |
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --publish \
+            --ci-provider generic \
+            --ci-generic-schema dual \
+            --ci-generic-output artifacts/provider-dual.json
 
       - name: Benchmark baseline compare
         run: |
@@ -102,7 +126,14 @@ jobs:
             --format json \
             --no-cache \
             --metrics-output artifacts/scan-metrics.jsonl \
-            --audit-log-output artifacts/scan-audit.jsonl
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl
+          nix develop --command cargo run -p patchgate-cli -- history summary \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-summary.json
+          nix develop --command cargo run -p patchgate-cli -- history trend \
+            --input artifacts/scan-metrics.jsonl \
+            --format json > artifacts/history-trend.json
           nix develop --command cargo run -p xtask -- ops weekly-summary \
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
@@ -121,6 +152,34 @@ jobs:
           nix develop --command cargo run -p xtask -- ops verify-v1-calibrate \
             --metrics-input artifacts/scan-metrics.jsonl \
             --output artifacts/verify-v1-calibration.md
+          nix develop --command cargo run -p xtask -- ops compatibility-report \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/compatibility-report.md
+          nix develop --command cargo run -p xtask -- ops audit-drift-report \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/audit-drift-report.md
+
+      - name: Build RC security review template
+        run: |
+          mkdir -p artifacts
+          {
+            echo "# RC Security Review Packet"
+            echo
+            echo "## Inputs"
+            echo "- history summary: artifacts/history-summary.json"
+            echo "- history trend: artifacts/history-trend.json"
+            echo "- audit drift: artifacts/audit-drift-report.md"
+            echo
+            echo "## Review Criteria"
+            echo "- verify no unknown failure codes are introduced"
+            echo "- confirm dual-write drift is understood"
+            echo "- confirm candidate docs are synced"
+            echo
+            echo "## Decision"
+            echo "- [ ] Continue"
+            echo "- [ ] Mitigation required"
+          } > artifacts/security-review-template.md
 
       - name: Dead-letter replay dry-run smoke test
         run: |
@@ -165,6 +224,45 @@ jobs:
           wait "$server_pid"
           jq -e '.rewrite_input == true and .successful_records == 1 and .failed_records == 0 and .retained_records == 0' artifacts/dead-letter-rewrite-summary.json
           test ! -s artifacts/dead-letter-success.jsonl
+
+      - name: Refresh compatibility report with replay evidence
+        run: |
+          nix develop --command cargo run -p xtask -- ops replay-normalize \
+            --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+            --output artifacts/dead-letter-evidence.json
+          nix develop --command cargo run -p xtask -- ops compatibility-report \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+            --output artifacts/compatibility-report.md
+          nix develop --command cargo run -p xtask -- ops freeze-scoreboard \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+            --output artifacts/v1.1-readiness.md
+          nix develop --command cargo run -p xtask -- ops shadow-review \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --output artifacts/shadow-review.md
+          nix develop --command cargo run -p xtask -- ops fleet-review \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --cost-ceiling-minutes 30 \
+            --output artifacts/fleet-review.md
+          nix develop --command cargo run -p xtask -- ops rc-readiness \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+            --provider-input artifacts/provider-dual.json \
+            --benchmark-input artifacts/bench-compare.json \
+            --security-review-input artifacts/security-review-template.md \
+            --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+            --provider-rollout-path docs/15_provider_rollout_checklist.md \
+            --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+            --output artifacts/v2-rc-readiness.md
 
       - name: Verify SBOM and provenance metadata contract
         run: |

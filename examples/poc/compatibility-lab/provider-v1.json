@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "provider": "generic",
+  "repo": "example/repo",
+  "unix_ts": 1700000000,
+  "summary": {
+    "score": 92,
+    "threshold": 70,
+    "should_fail": false,
+    "mode": "warn",
+    "scope": "worktree",
+    "findings": 0
+  },
+  "report": {
+    "score": 92,
+    "threshold": 70
+  },
+  "markdown": "patchgate summary"
+}

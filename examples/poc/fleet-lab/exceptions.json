@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "repo": "example/repo-internal",
+      "kind": "waiver",
+      "scope": "provider-bridge",
+      "approved_by": "ops-lead",
+      "expires_at": "2026-04-30T00:00:00Z"
+    }
+  ]
+}

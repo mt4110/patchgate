@@ -1,0 +1,1 @@
+{"input_path":"artifacts/dead-letter.jsonl","transport_filter":"notification","selected_records":1,"successful_records":1,"dry_run_records":0,"failed_records":0,"skipped_records":0,"retained_records":0,"dry_run":false,"rewrite_input":true}
