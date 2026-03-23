@@ -8,6 +8,13 @@
 
 環境情報と設定読込診断を表示します。
 
+主な診断項目:
+
+- Git / config / cache の状態
+- host OS
+- plugin sandbox capability (`none` / `restricted` / `isolated`)
+- CI template catalog (`github` / `gitlab` / `jenkins`)
+
 ### `patchgate scan`
 
 Core options:
@@ -81,6 +88,8 @@ Provider/Webhook/Notification options:
 - `--max-records <n>`
 - `--retry-max-attempts <n>`
 - `--retry-backoff-ms <ms>`
+- `--rewrite-input` (成功したレコードを入力queueから除去)
+- `--summary-output <path>` (replay結果のJSON summaryを書き出し)
 - `--dry-run`
 
 ### `patchgate policy lint`
@@ -102,7 +111,10 @@ Provider/Webhook/Notification options:
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
 - `--readiness-profile <standard|strict|lts>`
+- `--autofix-output <path>` (safe autofix 済みpolicyを別ファイルへ出力)
+- `--autofix-write` (safe autofix を入力policyへ上書き)
 - v1 RC/GA前提の移行準備状態を検証
+- safe autofix対象は `compatibility.v1.*`, `plugins.sandbox.profile`, `release.lts.*` の一部
 
 ### `patchgate plugin init`
 

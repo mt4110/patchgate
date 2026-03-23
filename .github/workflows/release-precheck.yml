@@ -32,7 +32,10 @@ jobs:
         run: |
           mkdir -p artifacts
           cp config/policy.toml.example artifacts/policy.lts.toml
+          cp config/policy.toml.example artifacts/policy.needs-autofix.toml
           sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
+          sed -i 's/^rc_frozen = true$/rc_frozen = false/' artifacts/policy.needs-autofix.toml
+          sed -i 's/^allow_legacy_config_names = false$/allow_legacy_config_names = true/' artifacts/policy.needs-autofix.toml
           nix develop --command cargo run -p patchgate-cli -- policy lint \
             --path config/policy.toml.example \
             --require-current-version
@@ -46,6 +49,17 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
             --path artifacts/policy.lts.toml \
             --readiness-profile lts \
+            --format text
+          set +e
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path artifacts/policy.needs-autofix.toml \
+            --format text \
+            --autofix-output artifacts/policy.autofix.toml
+          autofix_code=$?
+          set -e
+          test "$autofix_code" -eq 14
+          nix develop --command cargo run -p patchgate-cli -- policy verify-v1 \
+            --path artifacts/policy.autofix.toml \
             --format text
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
@@ -116,7 +130,41 @@ jobs:
           nix develop --command cargo run -p patchgate-cli -- delivery replay \
             --input artifacts/dead-letter.jsonl \
             --dry-run \
-            --max-records 1
+            --max-records 1 \
+            --summary-output artifacts/dead-letter-replay-summary.json
+          jq -e '.dry_run_records == 1' artifacts/dead-letter-replay-summary.json
+
+      - name: Dead-letter replay rewrite smoke test
+        run: |
+          python3 - <<'PY' &
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b"ok")
+
+              def log_message(self, format, *args):
+                  return
+
+          HTTPServer(("127.0.0.1", 18080), Handler).handle_request()
+          PY
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          sleep 1
+          cat > artifacts/dead-letter-success.jsonl <<'EOF'
+          {"schema_version":1,"unix_ts":1700000000,"transport":"notification","endpoint":"http://127.0.0.1:18080/hook","idempotency_key":"pgv1-precheck-success","error":"timeout","payload":{"event":"scan.completed.notification","summary":{"score":88}}}
+          EOF
+          nix develop --command cargo run -p patchgate-cli -- delivery replay \
+            --input artifacts/dead-letter-success.jsonl \
+            --rewrite-input \
+            --max-records 1 \
+            --summary-output artifacts/dead-letter-rewrite-summary.json
+          wait "$server_pid"
+          jq -e '.rewrite_input == true and .successful_records == 1 and .failed_records == 0 and .retained_records == 0' artifacts/dead-letter-rewrite-summary.json
+          test ! -s artifacts/dead-letter-success.jsonl
 
       - name: Verify SBOM and provenance metadata contract
         run: |

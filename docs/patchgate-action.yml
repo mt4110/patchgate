@@ -1,5 +1,9 @@
 name: patchgate
 
+# Alternatives:
+# - GitLab: docs/patchgate-gitlab-ci.yml
+# - Jenkins: docs/Jenkinsfile.patchgate
+
 on:
   pull_request:
   workflow_dispatch:
@@ -53,7 +57,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # keep base parent reachable for staged diff materialization
+          fetch-depth: 2
       - uses: cachix/install-nix-action@v30
+      - name: Materialize PR diff into index
+        if: github.event_name == 'pull_request'
+        run: |
+          # checkout is pull_request merge commit by default.
+          # move HEAD to the base parent while keeping merged tree in index/worktree.
+          # this makes `git diff --cached` represent the PR delta for `--scope staged`.
+          git reset --soft HEAD^1
       - name: Build GitHub publish payload preview
         run: |
           nix develop --command cargo run -p patchgate-cli -- scan \

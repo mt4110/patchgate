@@ -35,6 +35,16 @@ patchgate scan \
   --ci-generic-output artifacts/ci-generic.json
 ```
 
+### GitLab CI から generic provider を使う
+
+`docs/patchgate-gitlab-ci.yml` をベースに、
+`artifacts/ci-generic.json` を artifact として回収します。
+
+### Jenkins から generic provider を使う
+
+`docs/Jenkinsfile.patchgate` をベースに、
+`artifacts/ci-generic.json` を archive します。
+
 ### 署名付きWebhook配信
 
 ```bash
@@ -67,7 +77,32 @@ patchgate scan \
 patchgate delivery replay \
   --input artifacts/dead-letter.jsonl \
   --transport notification \
-  --retry-max-attempts 3
+  --retry-max-attempts 3 \
+  --rewrite-input \
+  --summary-output artifacts/dead-letter-replay-summary.json
+```
+
+成功したレコードは queue から除去され、失敗したレコードだけが `artifacts/dead-letter.jsonl` に残ります。
+`.github/workflows/dead-letter-replay.yml` は、この queue を `dead-letter-queue` branch に永続化する前提です。
+
+### `verify-v1` の safe autofix preview を出力
+
+```bash
+patchgate policy verify-v1 \
+  --path policy.toml \
+  --readiness-profile strict \
+  --autofix-output artifacts/policy.autofix.toml \
+  --format text
+```
+
+### `verify-v1` の safe autofix をそのまま適用
+
+```bash
+patchgate policy verify-v1 \
+  --path policy.toml \
+  --readiness-profile standard \
+  --autofix-write \
+  --format text
 ```
 
 ### 履歴サマリとトレンド

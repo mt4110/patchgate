@@ -1,0 +1,26 @@
+pipeline {
+  agent any
+
+  stages {
+    stage('Patchgate') {
+      steps {
+        sh '''
+          mkdir -p artifacts
+          cargo run -p patchgate-cli -- scan \
+            --mode enforce \
+            --scope repo \
+            --format json \
+            --publish \
+            --ci-provider generic \
+            --ci-generic-output artifacts/ci-generic.json
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'artifacts/ci-generic.json', fingerprint: true
+    }
+  }
+}
