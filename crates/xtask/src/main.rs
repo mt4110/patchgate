@@ -328,6 +328,8 @@ struct ShadowAlignment {
     v1_failures: usize,
     v2_failures: usize,
     event_delta: isize,
+    mode_set_match: bool,
+    scope_set_match: bool,
     unique_targets: usize,
     unique_modes: usize,
     unique_scopes: usize,
@@ -1162,9 +1164,7 @@ fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
         options.p95_target_ms,
         options.false_positive_target_pct,
     );
-    let has_audit_failures = audits
-        .iter()
-        .any(|row| row.failure_code.is_some() || row.result == "error");
+    let has_audit_failures = audits.iter().any(audit_v1_is_failure);
     let has_metrics = !metrics.is_empty();
     let has_audits = !audits.is_empty();
     let ga_ready = slo.ready && has_metrics && has_audits && !has_audit_failures;
@@ -1569,6 +1569,8 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!("- unique_targets: {}\n", shadow.unique_targets));
     md.push_str(&format!("- unique_modes: {}\n", shadow.unique_modes));
     md.push_str(&format!("- unique_scopes: {}\n", shadow.unique_scopes));
+    md.push_str(&format!("- mode_set_match: {}\n", shadow.mode_set_match));
+    md.push_str(&format!("- scope_set_match: {}\n", shadow.scope_set_match));
     md.push_str(&format!(
         "- unique_schema_versions: {}\n",
         v2_schema_versions
@@ -1705,6 +1707,24 @@ fn build_shadow_alignment(
         .iter()
         .filter(|row| audit_v2_is_failure(row))
         .count();
+    let v1_modes = audits_v1
+        .iter()
+        .map(|row| row.mode.as_str())
+        .collect::<BTreeSet<_>>();
+    let v2_modes = audits_v2
+        .iter()
+        .map(|row| row.operation.mode.as_str())
+        .collect::<BTreeSet<_>>();
+    let v1_scopes = audits_v1
+        .iter()
+        .map(|row| row.scope.as_str())
+        .collect::<BTreeSet<_>>();
+    let v2_scopes = audits_v2
+        .iter()
+        .map(|row| row.operation.scope.as_str())
+        .collect::<BTreeSet<_>>();
+    let mode_set_match = v1_modes == v2_modes;
+    let scope_set_match = v1_scopes == v2_scopes;
     let unique_targets = audits_v2
         .iter()
         .map(|row| row.operation.target.as_str())
@@ -1725,7 +1745,11 @@ fn build_shadow_alignment(
         .map(|row| row.diagnostics.len())
         .sum::<usize>();
     let event_delta = audits_v2.len() as isize - audits_v1.len() as isize;
-    let aligned = !audits_v2.is_empty() && event_delta.abs() <= 1 && v2_failures <= v1_failures;
+    let aligned = !audits_v2.is_empty()
+        && event_delta.abs() <= 1
+        && v2_failures <= v1_failures
+        && mode_set_match
+        && scope_set_match;
 
     ShadowAlignment {
         v1_events: audits_v1.len(),
@@ -1733,6 +1757,8 @@ fn build_shadow_alignment(
         v1_failures,
         v2_failures,
         event_delta,
+        mode_set_match,
+        scope_set_match,
         unique_targets,
         unique_modes,
         unique_scopes,
@@ -2569,10 +2595,7 @@ fn build_compatibility_assessment(
     );
     let calibration = build_verify_v1_calibration(metrics);
     let failure_codes = aggregate_failure_code_counts(metrics, audits);
-    let audit_failures = audits
-        .iter()
-        .filter(|row| row.failure_code.is_some() || row.result == "error")
-        .count();
+    let audit_failures = audits.iter().filter(|row| audit_v1_is_failure(row)).count();
     let replay_evidence_present = replay_summary.is_some();
     let delivery_recovery_ready = replay_summary
         .as_ref()
@@ -3479,6 +3502,35 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_assessment_counts_gate_fail_as_audit_failure() {
+        let metrics = vec![MetricLogRecord {
+            unix_ts: 1,
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 10,
+            score: Some(95),
+            should_fail: Some(false),
+            failure_code: None,
+        }];
+        let audits = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "gate_fail".to_string(),
+            failure_code: None,
+        }];
+
+        let assessment = build_compatibility_assessment(&metrics, &audits, None, 99, 1_500, 5);
+        assert_eq!(assessment.audit_failures, 1);
+        assert_eq!(assessment.posture, CompatibilityPosture::StabilizeV1);
+    }
+
+    #[test]
     fn freeze_scoreboard_allows_v11_freeze_before_v2_seed() {
         let metrics = vec![MetricLogRecord {
             unix_ts: 1,
@@ -3723,6 +3775,49 @@ mod tests {
         assert_eq!(alignment.v1_failures, 1);
         assert_eq!(alignment.v2_failures, 1);
         assert!(alignment.aligned);
+    }
+
+    #[test]
+    fn shadow_alignment_rejects_mode_or_scope_drift() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "enforce".to_string(),
+                scope: "repo".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(95),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        let alignment = build_shadow_alignment(&audits_v1, &audits_v2);
+        assert!(!alignment.mode_set_match);
+        assert!(!alignment.scope_set_match);
+        assert!(!alignment.aligned);
     }
 
     #[test]

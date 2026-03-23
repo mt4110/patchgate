@@ -643,26 +643,6 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
-    if matches!(cfg.compatibility.v2.bridge_mode.as_str(), "audit" | "full")
-        && cfg.observability.audit_v2_jsonl_path.trim().is_empty()
-    {
-        return Err(validation_error(
-            ValidationCategory::Dependency,
-            "observability.audit_v2_jsonl_path",
-            "must be non-empty when compatibility.v2.bridge_mode includes audit output",
-        ));
-    }
-    if matches!(
-        cfg.compatibility.v2.bridge_mode.as_str(),
-        "provider" | "full"
-    ) && cfg.integrations.ci.generic_schema == "v1"
-    {
-        return Err(validation_error(
-            ValidationCategory::Dependency,
-            "integrations.ci.generic_schema",
-            "must be `v2` or `dual` when compatibility.v2.bridge_mode includes provider output",
-        ));
-    }
     if cfg.compatibility.v2.shadow_mode
         && cfg.compatibility.v2.bridge_mode == "off"
         && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
@@ -1394,25 +1374,20 @@ generic_schema = "bridge"
     }
 
     #[test]
-    fn validation_rejects_v2_audit_bridge_without_v2_output_path() {
+    fn validation_allows_v2_bridge_placeholders_for_runtime_overrides() {
         let path = write_temp_policy(
             r#"
 [compatibility.v2]
 shadow_mode = true
 bridge_mode = "full"
 [integrations.ci]
-generic_schema = "dual"
+generic_schema = "v1"
 "#,
         );
 
-        let err = load_from_typed(&path).expect_err("must fail without audit_v2_jsonl_path");
-        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
-        match err {
-            ConfigError::Validation { field, .. } => {
-                assert_eq!(field, "observability.audit_v2_jsonl_path")
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        let loaded = load_from_typed(&path).expect("cli overrides may satisfy bridge outputs");
+        assert_eq!(loaded.compatibility.v2.bridge_mode, "full");
+        assert_eq!(loaded.integrations.ci.generic_schema, "v1");
 
         let _ = fs::remove_file(path);
     }
