@@ -2290,49 +2290,65 @@ fn apply_policy_autofixes(
         .parse::<DocumentMut>()
         .with_context(|| format!("parse policy for autofix: {}", input_path.display()))?;
     for autofix in autofixes {
-        apply_policy_autofix(&mut doc, autofix);
+        apply_policy_autofix(&mut doc, autofix)?;
     }
     write_text_atomic(output_path, doc.to_string().as_str())
         .with_context(|| format!("write autofixed policy: {}", output_path.display()))
 }
 
-fn apply_policy_autofix(doc: &mut DocumentMut, autofix: &PolicyAutofix) {
+fn apply_policy_autofix(doc: &mut DocumentMut, autofix: &PolicyAutofix) -> Result<()> {
     match autofix {
         PolicyAutofix::SetRcFrozen => {
-            let compatibility = ensure_table(doc.as_table_mut(), "compatibility");
-            let v1 = ensure_table(compatibility, "v1");
+            let compatibility = ensure_table(doc.as_table_mut(), "compatibility")?;
+            let v1 = ensure_table(compatibility, "v1")?;
             v1["rc_frozen"] = value(true);
         }
         PolicyAutofix::DisableLegacyConfigNames => {
-            let compatibility = ensure_table(doc.as_table_mut(), "compatibility");
-            let v1 = ensure_table(compatibility, "v1");
+            let compatibility = ensure_table(doc.as_table_mut(), "compatibility")?;
+            let v1 = ensure_table(compatibility, "v1")?;
             v1["allow_legacy_config_names"] = value(false);
         }
         PolicyAutofix::SetPluginSandboxProfile(profile) => {
-            let plugins = ensure_table(doc.as_table_mut(), "plugins");
-            let sandbox = ensure_table(plugins, "sandbox");
+            let plugins = ensure_table(doc.as_table_mut(), "plugins")?;
+            let sandbox = ensure_table(plugins, "sandbox")?;
             sandbox["profile"] = value(*profile);
         }
         PolicyAutofix::SetLtsActive => {
-            let release = ensure_table(doc.as_table_mut(), "release");
-            let lts = ensure_table(release, "lts");
+            let release = ensure_table(doc.as_table_mut(), "release")?;
+            let lts = ensure_table(release, "lts")?;
             lts["active"] = value(true);
         }
         PolicyAutofix::SetLtsSecuritySlaHours(hours) => {
-            let release = ensure_table(doc.as_table_mut(), "release");
-            let lts = ensure_table(release, "lts");
+            let release = ensure_table(doc.as_table_mut(), "release")?;
+            let lts = ensure_table(release, "lts")?;
             lts["security_sla_hours"] = value(i64::from(*hours));
         }
     }
+    Ok(())
 }
 
-fn ensure_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
-    if !table.contains_key(key) || !table[key].is_table() {
+fn ensure_table<'a>(table: &'a mut Table, key: &str) -> Result<&'a mut Table> {
+    if !table.contains_key(key) {
         table[key] = Item::Table(Table::new());
+    } else if !table[key].is_table() {
+        let item = table
+            .remove(key)
+            .expect("key must exist when converting autofix path");
+        match item.into_table() {
+            Ok(converted) => {
+                table[key] = Item::Table(converted);
+            }
+            Err(original) => {
+                table[key] = original;
+                anyhow::bail!(
+                    "autofix expected `{key}` to be a table or inline table; refusing to overwrite existing non-table value"
+                );
+            }
+        }
     }
     table[key]
         .as_table_mut()
-        .expect("table must exist after insertion")
+        .ok_or_else(|| anyhow!("autofix expected `{key}` to resolve to a table"))
 }
 
 fn write_text_atomic(path: &Path, content: &str) -> Result<()> {
@@ -2362,6 +2378,8 @@ fn create_sibling_temp_file(path: &Path) -> Result<(PathBuf, fs::File)> {
         .and_then(|name| name.to_str())
         .unwrap_or("patchgate-policy");
     let pid = std::process::id();
+    #[cfg(unix)]
+    let existing_mode = existing_file_mode(path)?;
     for _ in 0..64 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2369,11 +2387,17 @@ fn create_sibling_temp_file(path: &Path) -> Result<(PathBuf, fs::File)> {
             .unwrap_or(0);
         let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
         let temp_path = path.with_file_name(format!(".{file_name}.tmp-{pid}-{nonce}-{seq}"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if let Some(mode) = existing_mode {
+                options.mode(mode);
+            }
+        }
+        match options.open(&temp_path) {
             Ok(file) => return Ok((temp_path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
@@ -2387,6 +2411,17 @@ fn create_sibling_temp_file(path: &Path) -> Result<(PathBuf, fs::File)> {
         "failed to allocate unique temp file alongside {}",
         path.display()
     );
+}
+
+#[cfg(unix)]
+fn existing_file_mode(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions().mode() & 0o777)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("stat existing file {}", path.display())),
+    }
 }
 
 #[cfg(not(windows))]
@@ -3975,13 +4010,6 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
                     record.transport, record.endpoint
                 );
                 summary.skipped_records += 1;
-                summary.failed_records += 1;
-                summary.failures.push(DeadLetterReplayFailure {
-                    transport: record.transport.clone(),
-                    endpoint: record.endpoint.clone(),
-                    idempotency_key: record.idempotency_key.clone(),
-                    error: error.clone(),
-                });
                 let mut retained = record;
                 retained.error = error;
                 retained.unix_ts = current_unix_ts();
@@ -6728,6 +6756,74 @@ allow_legacy_config_names = true
     }
 
     #[test]
+    fn policy_autofix_preserves_inline_table_fields() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root = std::env::temp_dir().join(format!("patchgate-cli-policy-inline-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let input_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("policy.autofix.toml");
+        fs::write(
+            &input_path,
+            r#"
+policy_version = 2
+compatibility = { v1 = { rc_frozen = false, allow_legacy_config_names = true }, extra = true }
+plugins = { enabled = true, sandbox = { profile = "none", allow_network = true } }
+"#,
+        )
+        .expect("write policy");
+
+        apply_policy_autofixes(
+            input_path.as_path(),
+            output_path.as_path(),
+            &[
+                PolicyAutofix::SetRcFrozen,
+                PolicyAutofix::DisableLegacyConfigNames,
+                PolicyAutofix::SetPluginSandboxProfile("restricted"),
+            ],
+        )
+        .expect("apply autofixes");
+
+        let output = fs::read_to_string(&output_path).expect("read autofixed policy");
+        assert!(output.contains("extra = true"));
+        assert!(output.contains("allow_network = true"));
+        assert!(output.contains("rc_frozen = true"));
+        assert!(output.contains("allow_legacy_config_names = false"));
+        assert!(output.contains("profile = \"restricted\""));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_autofix_refuses_to_overwrite_non_table_values() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root = std::env::temp_dir().join(format!("patchgate-cli-policy-non-table-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let input_path = repo_root.join("policy.toml");
+        let output_path = repo_root.join("policy.autofix.toml");
+        fs::write(
+            &input_path,
+            r#"
+policy_version = 2
+compatibility = "legacy"
+"#,
+        )
+        .expect("write policy");
+
+        let err = apply_policy_autofixes(
+            input_path.as_path(),
+            output_path.as_path(),
+            &[PolicyAutofix::SetRcFrozen],
+        )
+        .expect_err("non-table path should block autofix");
+        assert!(format!("{err:#}").contains("compatibility"));
+        assert!(!output_path.exists());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
     fn policy_verify_v1_autofix_write_updates_policy_in_place() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let repo_root =
@@ -6794,6 +6890,31 @@ allow_legacy_config_names = true
 
         let content = fs::read_to_string(&path).expect("read overwritten file");
         assert_eq!(content, "after");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_text_atomic_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-write-text-atomic-mode-{seq}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.toml");
+        fs::write(&path, "before").expect("seed file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set strict permissions");
+
+        write_text_atomic(&path, "after").expect("overwrite file");
+
+        let mode = fs::metadata(&path)
+            .expect("stat rewritten file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -7197,6 +7318,49 @@ profile = "none"
         .expect("parse summary json");
         assert_eq!(summary["successful_records"], 0);
         assert_eq!(summary["failed_records"], 1);
+        assert_eq!(summary["retained_records"], 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_skips_redacted_endpoints_without_failing() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-redacted-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        let summary_output = dir.join("replay-summary.json");
+        fs::write(
+            &input,
+            "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://***/hook\",\"idempotency_key\":\"pgv1-redacted\",\"error\":\"timeout\",\"payload\":{\"event\":\"scan.completed.notification\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            rewrite_input: true,
+            summary_output: Some(summary_output.clone()),
+            dry_run: false,
+        })
+        .expect("redacted endpoints should be skipped without failing");
+
+        let remaining = fs::read_to_string(&input).expect("read retained dead-letter");
+        assert!(remaining.contains("pgv1-redacted"));
+        assert!(remaining.contains("redacted endpoint cannot be replayed"));
+
+        let summary: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&summary_output)
+                .expect("read summary")
+                .as_str(),
+        )
+        .expect("parse summary json");
+        assert_eq!(summary["successful_records"], 0);
+        assert_eq!(summary["failed_records"], 0);
+        assert_eq!(summary["skipped_records"], 1);
         assert_eq!(summary["retained_records"], 1);
 
         let _ = fs::remove_dir_all(dir);
