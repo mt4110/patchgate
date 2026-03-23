@@ -1939,6 +1939,12 @@ fn run_policy_verify_v1(
         });
     } else if let Some(output_path) = args.autofix_output.as_ref() {
         let output_path = resolve_repo_relative_path(repo_root, output_path.clone());
+        if paths_conflict(policy_path.as_path(), output_path.as_path()) {
+            eprintln!(
+                "patchgate policy verify-v1 error: --autofix-output must differ from the input policy path"
+            );
+            return PolicyExitCode::ReadOrParse;
+        }
         let applied_changes = active_assessment.autofix_suggestions.clone();
         if let Err(err) = apply_policy_autofixes(
             policy_path.as_path(),
@@ -3375,6 +3381,26 @@ fn resolve_repo_relative_path(repo_root: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn resolve_cwd_relative_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve current directory")?
+            .join(path))
+    }
+}
+
+fn paths_conflict(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn resolve_audit_actor(override_actor: Option<&str>) -> String {
     if let Some(actor) = override_actor {
         if !actor.trim().is_empty() {
@@ -3942,6 +3968,17 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
             );
         }
     }
+    let input_path = resolve_cwd_relative_path(args.input.as_path())?;
+    let summary_output_path = args
+        .summary_output
+        .as_ref()
+        .map(|path| resolve_cwd_relative_path(path))
+        .transpose()?;
+    if let Some(summary_output_path) = summary_output_path.as_ref() {
+        if paths_conflict(input_path.as_path(), summary_output_path.as_path()) {
+            anyhow::bail!("--summary-output must differ from --input");
+        }
+    }
     let attempts = args.retry_max_attempts.max(1);
     let client = Client::builder()
         .timeout(Duration::from_millis(5_000))
@@ -4067,7 +4104,7 @@ fn run_dead_letter_replay(args: DeliveryReplayArgs) -> Result<()> {
     }
     replay_result?;
 
-    write_dead_letter_replay_summary(args.summary_output.as_deref(), &summary)?;
+    write_dead_letter_replay_summary(summary_output_path.as_deref(), &summary)?;
     if summary.selected_records > 0 {
         println!(
             "dead-letter replay completed: selected_records={} successful_records={} dry_run_records={} failed_records={} skipped_records={} retained_records={}",
@@ -6756,6 +6793,46 @@ allow_legacy_config_names = true
     }
 
     #[test]
+    fn policy_verify_v1_rejects_autofix_output_equal_to_input_path() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let repo_root =
+            std::env::temp_dir().join(format!("patchgate-cli-policy-autofix-same-path-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = false
+allow_legacy_config_names = true
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v1(
+            &repo_root,
+            None,
+            PolicyVerifyV1Args {
+                path: Some(policy_path.clone()),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
+                autofix_output: Some(policy_path.clone()),
+                autofix_write: false,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::ReadOrParse);
+
+        let output = fs::read_to_string(&policy_path).expect("read unchanged policy");
+        assert!(output.contains("rc_frozen = false"));
+        assert!(output.contains("allow_legacy_config_names = true"));
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
     fn policy_autofix_preserves_inline_table_fields() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let repo_root = std::env::temp_dir().join(format!("patchgate-cli-policy-inline-{seq}"));
@@ -7362,6 +7439,37 @@ profile = "none"
         assert_eq!(summary["failed_records"], 0);
         assert_eq!(summary["skipped_records"], 1);
         assert_eq!(summary["retained_records"], 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dead_letter_replay_rejects_summary_output_equal_to_input() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("patchgate-replay-summary-conflict-{seq}"));
+        fs::create_dir_all(&dir).expect("create replay dir");
+        let input = dir.join("dead-letter.jsonl");
+        fs::write(
+            &input,
+            "{\"schema_version\":1,\"unix_ts\":1,\"transport\":\"notification\",\"endpoint\":\"https://example.invalid/hook\",\"idempotency_key\":\"pgv1-conflict\",\"error\":\"timeout\",\"payload\":{\"event\":\"scan.completed.notification\"},\"headers\":{},\"payload_raw\":null}\n",
+        )
+        .expect("seed dead-letter");
+
+        let err = run_dead_letter_replay(DeliveryReplayArgs {
+            input: input.clone(),
+            transport: Some("notification".to_string()),
+            max_records: Some(1),
+            retry_max_attempts: 1,
+            retry_backoff_ms: 10,
+            rewrite_input: true,
+            summary_output: Some(input.clone()),
+            dry_run: false,
+        })
+        .expect_err("summary output path conflict should fail");
+        assert!(format!("{err:#}").contains("--summary-output must differ from --input"));
+
+        let retained = fs::read_to_string(&input).expect("read unchanged queue");
+        assert!(retained.contains("pgv1-conflict"));
 
         let _ = fs::remove_dir_all(dir);
     }
