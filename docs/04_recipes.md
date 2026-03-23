@@ -242,6 +242,8 @@ cargo run -p xtask -- ops rc-readiness \
   --output artifacts/v2-rc-readiness.md
 ```
 
+`artifacts/security-review-template.md` は、レビュー完了後に `- [x] Continue` を付け、`Mitigation required` は未チェックのままにしてください。
+
 ### GA packet を生成
 
 ```bash

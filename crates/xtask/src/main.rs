@@ -438,7 +438,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -1044,11 +1044,22 @@ fn run_audit_report(options: &OpsOptions) -> Result<()> {
 
 fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let drift = build_audit_drift_summary(&audits);
+    let audits_v2 = options
+        .audit_v2_input
+        .as_deref()
+        .map(load_jsonl_records::<AuditLogV2Record>)
+        .transpose()?
+        .unwrap_or_default();
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
 
     let mut md = String::new();
     md.push_str("# Audit Drift Report\n\n");
-    md.push_str(&format!("- audit_events: {}\n", audits.len()));
+    md.push_str(&format!(
+        "- audit_events: {}\n",
+        audits.len() + audits_v2.len()
+    ));
+    md.push_str(&format!("- audit_v1_events: {}\n", audits.len()));
+    md.push_str(&format!("- audit_v2_events: {}\n", audits_v2.len()));
     md.push_str(&format!(
         "- unknown_failure_codes: {}\n",
         drift.unknown_failure_codes.values().copied().sum::<usize>()
@@ -1621,17 +1632,78 @@ fn build_audit_drift_summary(audits: &[AuditLogRecord]) -> AuditDriftSummary {
     }
 }
 
+fn build_audit_v2_drift_summary(audits: &[AuditLogV2Record]) -> AuditDriftSummary {
+    let known_codes = known_failure_codes();
+    let known_results = ["pass", "gate_fail", "error"];
+    let mut unknown_failure_codes = BTreeMap::<String, usize>::new();
+    let mut unknown_results = BTreeMap::<String, usize>::new();
+    let mut schema_versions = BTreeMap::<u8, usize>::new();
+    let mut formats = BTreeMap::<String, usize>::new();
+
+    for row in audits {
+        *schema_versions.entry(row.schema_version).or_insert(0) += 1;
+        *formats.entry(row.audit_format.clone()).or_insert(0) += 1;
+        if !known_results.contains(&row.operation.result.as_str()) {
+            *unknown_results
+                .entry(row.operation.result.clone())
+                .or_insert(0) += 1;
+        }
+        if let Some(code) = row.failure.code.as_ref() {
+            if !known_codes.contains(code.as_str()) {
+                *unknown_failure_codes.entry(code.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    AuditDriftSummary {
+        unknown_failure_codes,
+        unknown_results,
+        schema_versions,
+        formats,
+    }
+}
+
+fn merge_count_maps<K: Ord>(target: &mut BTreeMap<K, usize>, source: BTreeMap<K, usize>) {
+    for (key, count) in source {
+        *target.entry(key).or_insert(0) += count;
+    }
+}
+
+fn build_combined_audit_drift_summary(
+    audits: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> AuditDriftSummary {
+    let mut combined = build_audit_drift_summary(audits);
+    let drift_v2 = build_audit_v2_drift_summary(audits_v2);
+    merge_count_maps(
+        &mut combined.unknown_failure_codes,
+        drift_v2.unknown_failure_codes,
+    );
+    merge_count_maps(&mut combined.unknown_results, drift_v2.unknown_results);
+    merge_count_maps(&mut combined.schema_versions, drift_v2.schema_versions);
+    merge_count_maps(&mut combined.formats, drift_v2.formats);
+    combined
+}
+
+fn audit_v1_is_failure(row: &AuditLogRecord) -> bool {
+    row.failure_code.is_some() || matches!(row.result.as_str(), "gate_fail" | "error")
+}
+
+fn audit_v2_is_failure(row: &AuditLogV2Record) -> bool {
+    row.failure.code.is_some() || matches!(row.operation.result.as_str(), "gate_fail" | "error")
+}
+
 fn build_shadow_alignment(
     audits_v1: &[AuditLogRecord],
     audits_v2: &[AuditLogV2Record],
 ) -> ShadowAlignment {
     let v1_failures = audits_v1
         .iter()
-        .filter(|row| row.failure_code.is_some() || row.result == "error")
+        .filter(|row| audit_v1_is_failure(row))
         .count();
     let v2_failures = audits_v2
         .iter()
-        .filter(|row| row.failure.code.is_some() || row.operation.result == "error")
+        .filter(|row| audit_v2_is_failure(row))
         .count();
     let unique_targets = audits_v2
         .iter()
@@ -1670,7 +1742,16 @@ fn build_shadow_alignment(
 }
 
 fn audit_drift_is_clean(drift: &AuditDriftSummary) -> bool {
-    drift.unknown_failure_codes.is_empty() && drift.unknown_results.is_empty()
+    drift.unknown_failure_codes.is_empty()
+        && drift.unknown_results.is_empty()
+        && drift
+            .schema_versions
+            .keys()
+            .all(|version| matches!(version, 1 | 2))
+        && drift
+            .formats
+            .keys()
+            .all(|format| matches!(format.as_str(), "patchgate.audit.v1" | "patchgate.audit.v2"))
 }
 
 fn fleet_repo_posture_label(
@@ -1995,7 +2076,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     );
     let scoreboard = build_freeze_scoreboard(&metrics, &audits, &assessment);
     let shadow = build_shadow_alignment(&audits, &audits_v2);
-    let drift = build_audit_drift_summary(&audits);
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
     let benchmark_signoff = options
         .benchmark_input
         .as_deref()
@@ -2004,6 +2085,8 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         .map(|report| !report.regressed)
         .unwrap_or(false);
     let security_review_present = path_exists(options.security_review_input.as_deref());
+    let security_review_approved =
+        security_review_is_approved(options.security_review_input.as_deref())?;
     let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
     let provider_rollout_present = path_exists(options.provider_rollout_path.as_deref());
     let candidate_checklist_present = path_exists(options.candidate_checklist_path.as_deref());
@@ -2024,7 +2107,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         && shadow.aligned
         && provider_bridge_ready
         && benchmark_signoff
-        && security_review_present
+        && security_review_approved
         && migration_guide_present
         && provider_rollout_present
         && candidate_checklist_present
@@ -2051,6 +2134,12 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
             &mut next_actions,
             &mut seen_actions,
             "Attach the RC security review packet before promoting the candidate.".to_string(),
+        );
+    } else if !security_review_approved {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Mark the RC security review packet with `- [x] Continue` and keep `Mitigation required` unchecked after reviewer sign-off.".to_string(),
         );
     }
     if !migration_guide_present || !provider_rollout_present || !candidate_checklist_present {
@@ -2082,6 +2171,10 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         security_review_present
     ));
     md.push_str(&format!(
+        "- security_review_approved: {}\n",
+        security_review_approved
+    ));
+    md.push_str(&format!(
         "- migration_drill_clean: {}\n",
         migration_drill_clean
     ));
@@ -2092,7 +2185,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
 
     md.push_str("## Checklist\n");
     md.push_str(&format!(
-        "- {} v1.1 freeze scoreboard passes\n",
+        "- {} v2 seed readiness passes\n",
         checklist_box(scoreboard.v2_seed_ready)
     ));
     md.push_str(&format!(
@@ -2112,8 +2205,8 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         checklist_box(benchmark_signoff)
     ));
     md.push_str(&format!(
-        "- {} security review packet is attached\n",
-        checklist_box(security_review_present)
+        "- {} security review packet is approved\n",
+        checklist_box(security_review_approved)
     ));
     md.push_str(&format!(
         "- {} migration guide path resolves\n",
@@ -2177,7 +2270,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     );
     let scoreboard = build_freeze_scoreboard(&metrics, &audits, &assessment);
     let shadow = build_shadow_alignment(&audits, &audits_v2);
-    let drift = build_audit_drift_summary(&audits);
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
     let replay_clean = replay_summary
         .as_ref()
         .is_some_and(|summary| summary.failed_records == 0 && summary.retained_records == 0);
@@ -2198,7 +2291,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         && phase201_backcast_present;
     let dual_run_decommission_ready = replay_clean && shadow.aligned;
     let audit_drift_clean = audit_drift_is_clean(&drift);
-    let ga_ready = scoreboard.freeze_ready
+    let ga_ready = scoreboard.v2_seed_ready
         && dual_run_decommission_ready
         && audit_drift_clean
         && lts_ready
@@ -2229,6 +2322,13 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
                 .to_string(),
         );
     }
+    if !scoreboard.v2_seed_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Promote the compatibility posture to `start-v2-seed`; `freeze_ready` alone is not enough for GA.".to_string(),
+        );
+    }
     if !audit_drift_clean {
         push_unique_action(
             &mut next_actions,
@@ -2241,6 +2341,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     md.push_str("# V2 GA Packet\n\n");
     md.push_str(&format!("- ga_ready: {}\n", ga_ready));
     md.push_str(&format!("- posture: `{}`\n", assessment.posture.as_str()));
+    md.push_str(&format!("- v2_seed_ready: {}\n", scoreboard.v2_seed_ready));
     md.push_str(&format!("- lts_active: {}\n", release_policy.lts_active));
     md.push_str(&format!("- lts_branch: {}\n", release_policy.lts_branch));
     md.push_str(&format!(
@@ -2256,8 +2357,8 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
 
     md.push_str("## Checklist\n");
     md.push_str(&format!(
-        "- {} freeze scoreboard remains green\n",
-        checklist_box(scoreboard.freeze_ready)
+        "- {} v2 seed readiness remains green\n",
+        checklist_box(scoreboard.v2_seed_ready)
     ));
     md.push_str(&format!(
         "- {} dual-run can be decommissioned cleanly\n",
@@ -2353,6 +2454,17 @@ fn path_exists(path: Option<&Path>) -> bool {
     path.is_some_and(Path::exists)
 }
 
+fn security_review_is_approved(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path.filter(|path| path.exists()) else {
+        return Ok(false);
+    };
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let continue_checked = raw.contains("- [x] Continue") || raw.contains("- [X] Continue");
+    let mitigation_checked =
+        raw.contains("- [x] Mitigation required") || raw.contains("- [X] Mitigation required");
+    Ok(continue_checked && !mitigation_checked)
+}
+
 fn load_release_policy_summary(path: &Path) -> Result<ReleasePolicySummary> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let value = raw
@@ -2369,12 +2481,12 @@ fn load_release_policy_summary(path: &Path) -> Result<ReleasePolicySummary> {
     let lts_branch = lts
         .and_then(|table| table.get("branch"))
         .and_then(toml::Value::as_str)
-        .unwrap_or("")
+        .unwrap_or("lts/v1")
         .to_string();
     let security_sla_hours = lts
         .and_then(|table| table.get("security_sla_hours"))
         .and_then(toml::Value::as_integer)
-        .unwrap_or(0)
+        .unwrap_or(72)
         .clamp(0, u16::MAX as i64) as u16;
     Ok(ReleasePolicySummary {
         lts_active,
@@ -3025,13 +3137,14 @@ mod tests {
 
     use super::{
         aggregate_failure_code_counts, audit_drift_is_clean, average_duration_for_summary,
-        build_audit_drift_summary, build_compatibility_assessment, build_freeze_scoreboard,
-        build_shadow_alignment, build_verify_v1_calibration, canonical_repo_path, checklist_box,
-        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
-        percentile_u128, run_ga_readiness, summarize_provider_inputs, validate_workload_identity,
-        AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record, AuditOperationV2,
-        BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord, MetricLogRecord,
-        OpsOptions, OpsSubcommand, TEMP_SEQ,
+        build_audit_drift_summary, build_combined_audit_drift_summary,
+        build_compatibility_assessment, build_freeze_scoreboard, build_shadow_alignment,
+        build_verify_v1_calibration, canonical_repo_path, checklist_box, fleet_repo_posture_label,
+        load_json_file, load_jsonl_records, load_release_policy_summary, percentile_u128,
+        run_ga_readiness, security_review_is_approved, summarize_provider_inputs,
+        validate_workload_identity, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
+        AuditOperationV2, BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord,
+        MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -3462,6 +3575,51 @@ mod tests {
     }
 
     #[test]
+    fn combined_audit_drift_summary_includes_v2_unknowns() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 9,
+            audit_format: "patchgate.audit.future".to_string(),
+            emitted_at: 2,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "deferred".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(80),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: Some("PG-NEW-002".to_string()),
+                category: Some("runtime".to_string()),
+            },
+            diagnostics: vec![],
+        }];
+
+        let drift = build_combined_audit_drift_summary(&audits_v1, &audits_v2);
+        assert_eq!(drift.unknown_failure_codes.get("PG-NEW-002"), Some(&1usize));
+        assert_eq!(drift.unknown_results.get("deferred"), Some(&1usize));
+        assert_eq!(drift.schema_versions.get(&9), Some(&1usize));
+        assert_eq!(drift.formats.get("patchgate.audit.future"), Some(&1usize));
+        assert!(!audit_drift_is_clean(&drift));
+    }
+
+    #[test]
     fn fleet_repo_posture_label_marks_missing_telemetry_as_incomplete() {
         let metrics = Vec::new();
         let audits = vec![AuditLogRecord {
@@ -3525,6 +3683,49 @@ mod tests {
     }
 
     #[test]
+    fn shadow_alignment_counts_gate_fail_as_failure() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "gate_fail".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "gate_fail".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(60),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        let alignment = build_shadow_alignment(&audits_v1, &audits_v2);
+        assert_eq!(alignment.v1_failures, 1);
+        assert_eq!(alignment.v2_failures, 1);
+        assert!(alignment.aligned);
+    }
+
+    #[test]
     fn summarize_provider_inputs_detects_dual_payload() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("xtask-provider-{seq}.json"));
@@ -3562,6 +3763,49 @@ security_sla_hours = 48
         assert_eq!(summary.security_sla_hours, 48);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_release_policy_summary_uses_config_defaults_when_missing_lts_fields() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-policy-defaults-{seq}.toml"));
+        fs::write(
+            &path,
+            r#"[release.lts]
+active = true
+"#,
+        )
+        .expect("write policy file");
+
+        let summary = load_release_policy_summary(&path).expect("load release policy summary");
+        assert!(summary.lts_active);
+        assert_eq!(summary.lts_branch, "lts/v1");
+        assert_eq!(summary.security_sla_hours, 72);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn security_review_requires_checked_continue() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pending = std::env::temp_dir().join(format!("xtask-security-pending-{seq}.md"));
+        let approved = std::env::temp_dir().join(format!("xtask-security-approved-{seq}.md"));
+        fs::write(
+            &pending,
+            "# RC Security Review Packet\n\n## Decision\n- [ ] Continue\n- [ ] Mitigation required\n",
+        )
+        .expect("write pending review");
+        fs::write(
+            &approved,
+            "# RC Security Review Packet\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
+        )
+        .expect("write approved review");
+
+        assert!(!security_review_is_approved(Some(&pending)).expect("pending review state"));
+        assert!(security_review_is_approved(Some(&approved)).expect("approved review state"));
+
+        let _ = fs::remove_file(pending);
+        let _ = fs::remove_file(approved);
     }
 
     #[test]

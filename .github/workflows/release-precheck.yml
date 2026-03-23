@@ -158,6 +158,7 @@ jobs:
             --output artifacts/compatibility-report.md
           nix develop --command cargo run -p xtask -- ops audit-drift-report \
             --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
             --output artifacts/audit-drift-report.md
 
       - name: Build RC security review template
@@ -177,6 +178,7 @@ jobs:
             echo "- confirm candidate docs are synced"
             echo
             echo "## Decision"
+            echo "- mark exactly one checkbox after reviewer sign-off"
             echo "- [ ] Continue"
             echo "- [ ] Mitigation required"
           } > artifacts/security-review-template.md

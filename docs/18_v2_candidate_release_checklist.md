@@ -12,7 +12,7 @@
 - [ ] audit dual-write artifact compatibility verified
 - [ ] migration guide updated
 - [ ] rollback packet updated
-- [ ] RC security review attached
+- [ ] RC security review approved (`Continue` checked)
 - [ ] benchmark sign-off attached
 
 ## Reference Command
@@ -31,3 +31,5 @@ cargo run -p xtask -- ops rc-readiness \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
   --output artifacts/v2-rc-readiness.md
 ```
+
+`artifacts/security-review-template.md` は `- [x] Continue` が必要で、`Mitigation required` を同時にチェックしてはいけません。

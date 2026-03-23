@@ -78,6 +78,7 @@ jobs:
             echo "- verify-v2: artifacts/verify-v2.json"
             echo
             echo "## Decision"
+            echo "- mark exactly one checkbox after reviewer sign-off"
             echo "- [ ] Continue"
             echo "- [ ] Mitigation required"
           } > artifacts/security-review-template.md
@@ -126,6 +127,7 @@ jobs:
             --output artifacts/v1.1-readiness.md
           cargo run -p xtask -- ops audit-drift-report \
             --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
             --output artifacts/audit-drift-report.md
           cargo run -p xtask -- ops shadow-review \
             --audit-input artifacts/scan-audit.jsonl \

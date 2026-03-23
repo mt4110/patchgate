@@ -90,6 +90,7 @@ jobs:
         run: |
           cargo run -p xtask -- ops audit-drift-report \
             --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
             --output artifacts/audit-drift-report.md
           cargo run -p xtask -- ops shadow-review \
             --audit-input artifacts/scan-audit.jsonl \
