@@ -151,9 +151,27 @@ struct MetricLogRecord {
     failure_code: Option<String>,
 }
 
+fn default_audit_v1_schema_version() -> u8 {
+    1
+}
+
+fn default_audit_v1_format() -> String {
+    "patchgate.audit.v1".to_string()
+}
+
+fn default_audit_v2_schema_version() -> u8 {
+    2
+}
+
+fn default_audit_v2_format() -> String {
+    "patchgate.audit.v2".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AuditLogRecord {
+    #[serde(default = "default_audit_v1_schema_version")]
     schema_version: u8,
+    #[serde(default = "default_audit_v1_format")]
     audit_format: String,
     unix_ts: u64,
     actor: String,
@@ -166,7 +184,9 @@ struct AuditLogRecord {
 
 #[derive(Debug, Clone, Deserialize)]
 struct AuditLogV2Record {
+    #[serde(default = "default_audit_v2_schema_version")]
     schema_version: u8,
+    #[serde(default = "default_audit_v2_format")]
     audit_format: String,
     emitted_at: u64,
     actor: String,
@@ -3362,6 +3382,28 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("xtask-missing-{seq}.jsonl"));
         let err = load_jsonl_records::<MetricLogRecord>(&missing).expect_err("must error");
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn audit_log_record_defaults_missing_contract_fields() {
+        let record: AuditLogRecord = serde_json::from_str(
+            r#"{"unix_ts":1,"actor":"bot","repo":"repo","mode":"warn","scope":"staged","result":"pass","failure_code":null}"#,
+        )
+        .expect("decode v1 audit record");
+
+        assert_eq!(record.schema_version, 1);
+        assert_eq!(record.audit_format, "patchgate.audit.v1");
+    }
+
+    #[test]
+    fn audit_log_v2_record_defaults_missing_contract_fields() {
+        let record: AuditLogV2Record = serde_json::from_str(
+            r#"{"emitted_at":1,"actor":"bot","repo":"repo","operation":{"target":"scan","mode":"warn","scope":"staged","result":"pass"},"gate":{"score":80,"threshold":70,"changed_files":1},"failure":{"code":null,"category":null},"diagnostics":[]}"#,
+        )
+        .expect("decode v2 audit record");
+
+        assert_eq!(record.schema_version, 2);
+        assert_eq!(record.audit_format, "patchgate.audit.v2");
     }
 
     #[test]
