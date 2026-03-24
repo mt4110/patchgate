@@ -1075,7 +1075,7 @@ fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     if drift.schema_versions.is_empty() {
         md.push_str("- none\n");
     } else {
-        for (version, count) in drift.schema_versions {
+        for (version, count) in &drift.schema_versions {
             md.push_str(&format!("- v{version}: {count}\n"));
         }
     }
@@ -1084,7 +1084,7 @@ fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     if drift.formats.is_empty() {
         md.push_str("- none\n");
     } else {
-        for (format, count) in drift.formats {
+        for (format, count) in &drift.formats {
             md.push_str(&format!("- {format}: {count}\n"));
         }
     }
@@ -1093,7 +1093,7 @@ fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     if drift.unknown_failure_codes.is_empty() {
         md.push_str("- none\n");
     } else {
-        for (code, count) in drift.unknown_failure_codes {
+        for (code, count) in &drift.unknown_failure_codes {
             md.push_str(&format!("- {code}: {count}\n"));
         }
     }
@@ -1102,7 +1102,7 @@ fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     if drift.unknown_results.is_empty() {
         md.push_str("- none\n");
     } else {
-        for (result, count) in drift.unknown_results {
+        for (result, count) in &drift.unknown_results {
             md.push_str(&format!("- {result}: {count}\n"));
         }
     }
