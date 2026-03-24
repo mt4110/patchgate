@@ -328,6 +328,7 @@ struct ShadowAlignment {
     v1_failures: usize,
     v2_failures: usize,
     event_delta: isize,
+    repo_set_match: bool,
     mode_set_match: bool,
     scope_set_match: bool,
     unique_targets: usize,
@@ -1566,6 +1567,7 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!("- event_delta: {}\n\n", shadow.event_delta));
 
     md.push_str("## V2 Coverage\n");
+    md.push_str(&format!("- repo_set_match: {}\n", shadow.repo_set_match));
     md.push_str(&format!("- unique_targets: {}\n", shadow.unique_targets));
     md.push_str(&format!("- unique_modes: {}\n", shadow.unique_modes));
     md.push_str(&format!("- unique_scopes: {}\n", shadow.unique_scopes));
@@ -1723,6 +1725,15 @@ fn build_shadow_alignment(
         .iter()
         .map(|row| row.operation.scope.as_str())
         .collect::<BTreeSet<_>>();
+    let v1_repos = audits_v1
+        .iter()
+        .map(|row| row.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let v2_repos = audits_v2
+        .iter()
+        .map(|row| row.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let repo_set_match = v1_repos == v2_repos;
     let mode_set_match = v1_modes == v2_modes;
     let scope_set_match = v1_scopes == v2_scopes;
     let unique_targets = audits_v2
@@ -1748,6 +1759,7 @@ fn build_shadow_alignment(
     let aligned = !audits_v2.is_empty()
         && event_delta.abs() <= 1
         && v2_failures <= v1_failures
+        && repo_set_match
         && mode_set_match
         && scope_set_match;
 
@@ -1757,6 +1769,7 @@ fn build_shadow_alignment(
         v1_failures,
         v2_failures,
         event_delta,
+        repo_set_match,
         mode_set_match,
         scope_set_match,
         unique_targets,
@@ -1773,11 +1786,23 @@ fn audit_drift_is_clean(drift: &AuditDriftSummary) -> bool {
         && drift
             .schema_versions
             .keys()
-            .all(|version| matches!(version, 1 | 2))
+            .all(|version| matches!(*version, 1 | 2))
         && drift
             .formats
             .keys()
             .all(|format| matches!(format.as_str(), "patchgate.audit.v1" | "patchgate.audit.v2"))
+}
+
+fn audit_stream_contracts_are_clean(
+    audits: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> bool {
+    audits
+        .iter()
+        .all(|row| row.schema_version == 1 && row.audit_format == "patchgate.audit.v1")
+        && audits_v2
+            .iter()
+            .all(|row| row.schema_version == 2 && row.audit_format == "patchgate.audit.v2")
 }
 
 fn fleet_repo_posture_label(
@@ -2117,11 +2142,11 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     let provider_rollout_present = path_exists(options.provider_rollout_path.as_deref());
     let candidate_checklist_present = path_exists(options.candidate_checklist_path.as_deref());
     let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
-    let provider_bridge_ready = !provider_summaries.is_empty()
-        && provider_summaries
-            .iter()
-            .any(|summary| summary.schema_mode == "dual" || summary.schema_mode == "v2");
-    let audit_drift_clean = audit_drift_is_clean(&drift);
+    let candidate_repos = candidate_repos(&metrics, &audits);
+    let provider_bridge_ready =
+        provider_bridge_ready_for_repos(&provider_summaries, &candidate_repos);
+    let audit_drift_clean =
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
     let migration_drill_clean = replay_summary
         .as_ref()
         .is_some_and(|summary| summary.failed_records == 0 && summary.retained_records == 0);
@@ -2145,7 +2170,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
-            "Generate at least one dual/v2 provider artifact before RC sign-off.".to_string(),
+            "Generate at least one dual/v2 provider artifact for the candidate repo before RC sign-off.".to_string(),
         );
     }
     if !benchmark_signoff {
@@ -2316,7 +2341,8 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         && sunset_notice_present
         && phase201_backcast_present;
     let dual_run_decommission_ready = replay_clean && shadow.aligned;
-    let audit_drift_clean = audit_drift_is_clean(&drift);
+    let audit_drift_clean =
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
     let ga_ready = scoreboard.v2_seed_ready
         && dual_run_decommission_ready
         && audit_drift_clean
@@ -2474,6 +2500,25 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
         });
     }
     Ok(out)
+}
+
+fn candidate_repos(metrics: &[MetricLogRecord], audits: &[AuditLogRecord]) -> BTreeSet<String> {
+    metrics
+        .iter()
+        .map(|row| row.repo.clone())
+        .chain(audits.iter().map(|row| row.repo.clone()))
+        .collect()
+}
+
+fn provider_bridge_ready_for_repos(
+    provider_summaries: &[ProviderArtifactSummary],
+    repos: &BTreeSet<String>,
+) -> bool {
+    !repos.is_empty()
+        && provider_summaries.iter().any(|summary| {
+            repos.contains(summary.repo.as_str())
+                && matches!(summary.schema_mode.as_str(), "dual" | "v2")
+        })
 }
 
 fn path_exists(path: Option<&Path>) -> bool {
@@ -3159,15 +3204,17 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        aggregate_failure_code_counts, audit_drift_is_clean, average_duration_for_summary,
-        build_audit_drift_summary, build_combined_audit_drift_summary,
-        build_compatibility_assessment, build_freeze_scoreboard, build_shadow_alignment,
-        build_verify_v1_calibration, canonical_repo_path, checklist_box, fleet_repo_posture_label,
+        aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
+        average_duration_for_summary, build_audit_drift_summary,
+        build_combined_audit_drift_summary, build_compatibility_assessment,
+        build_freeze_scoreboard, build_shadow_alignment, build_verify_v1_calibration,
+        candidate_repos, canonical_repo_path, checklist_box, fleet_repo_posture_label,
         load_json_file, load_jsonl_records, load_release_policy_summary, percentile_u128,
-        run_ga_readiness, security_review_is_approved, summarize_provider_inputs,
-        validate_workload_identity, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
-        AuditOperationV2, BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord,
-        MetricLogRecord, OpsOptions, OpsSubcommand, TEMP_SEQ,
+        provider_bridge_ready_for_repos, run_ga_readiness, security_review_is_approved,
+        summarize_provider_inputs, validate_workload_identity, AuditFailureV2, AuditGateV2,
+        AuditLogRecord, AuditLogV2Record, AuditOperationV2, BenchSample, CompatibilityPosture,
+        DeadLetterReplaySummaryRecord, MetricLogRecord, OpsOptions, OpsSubcommand,
+        ProviderArtifactSummary, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -3818,6 +3865,126 @@ mod tests {
         assert!(!alignment.mode_set_match);
         assert!(!alignment.scope_set_match);
         assert!(!alignment.aligned);
+    }
+
+    #[test]
+    fn shadow_alignment_rejects_repo_drift() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo-a".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo-b".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(95),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        let alignment = build_shadow_alignment(&audits_v1, &audits_v2);
+        assert!(!alignment.repo_set_match);
+        assert!(!alignment.aligned);
+    }
+
+    #[test]
+    fn audit_stream_contracts_require_expected_versions_and_formats() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(95),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        assert!(!audit_stream_contracts_are_clean(&audits_v1, &audits_v2));
+    }
+
+    #[test]
+    fn provider_bridge_ready_requires_candidate_repo_match() {
+        let metrics = vec![MetricLogRecord {
+            unix_ts: 1,
+            repo: "repo-a".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            duration_ms: 10,
+            score: Some(95),
+            should_fail: Some(false),
+            failure_code: None,
+        }];
+        let audits = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo-a".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let repos = candidate_repos(&metrics, &audits);
+        let summaries = vec![
+            ProviderArtifactSummary {
+                repo: "repo-b".to_string(),
+                schema_mode: "dual".to_string(),
+            },
+            ProviderArtifactSummary {
+                repo: "repo-a".to_string(),
+                schema_mode: "v1".to_string(),
+            },
+        ];
+
+        assert!(!provider_bridge_ready_for_repos(&summaries, &repos));
     }
 
     #[test]
