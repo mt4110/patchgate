@@ -650,7 +650,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         return Err(validation_error(
             ValidationCategory::Dependency,
             "compatibility.v2",
-            "shadow_mode requires a bridge_mode or migration_guide_path to document the rollout",
+            "shadow_mode requires bridge_mode != \"off\" or a non-empty migration_guide_path to document the rollout",
         ));
     }
     if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {

@@ -1881,6 +1881,20 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     let mut repo_rows = Vec::new();
     let mut incomplete_telemetry_repos = 0usize;
     let use_global_replay = repo_names.len() <= 1;
+    let mut metrics_by_repo = BTreeMap::<String, Vec<MetricLogRecord>>::new();
+    let mut audits_by_repo = BTreeMap::<String, Vec<AuditLogRecord>>::new();
+    for row in &metrics {
+        metrics_by_repo
+            .entry(row.repo.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    for row in &audits {
+        audits_by_repo
+            .entry(row.repo.clone())
+            .or_default()
+            .push(row.clone());
+    }
     let bundle_map = bundle_catalog
         .as_ref()
         .map(|catalog| {
@@ -1891,21 +1905,21 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let empty_metrics: &[MetricLogRecord] = &[];
+    let empty_audits: &[AuditLogRecord] = &[];
 
     for repo in &repo_names {
-        let repo_metrics = metrics
-            .iter()
-            .filter(|row| row.repo == *repo)
-            .cloned()
-            .collect::<Vec<_>>();
-        let repo_audits = audits
-            .iter()
-            .filter(|row| row.repo == *repo)
-            .cloned()
-            .collect::<Vec<_>>();
+        let repo_metrics = metrics_by_repo
+            .get(repo)
+            .map(Vec::as_slice)
+            .unwrap_or(empty_metrics);
+        let repo_audits = audits_by_repo
+            .get(repo)
+            .map(Vec::as_slice)
+            .unwrap_or(empty_audits);
         let assessment = build_compatibility_assessment(
-            &repo_metrics,
-            &repo_audits,
+            repo_metrics,
+            repo_audits,
             if use_global_replay {
                 replay_summary.clone()
             } else {
@@ -1915,7 +1929,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             options.p95_target_ms,
             options.false_positive_target_pct,
         );
-        let posture_label = fleet_repo_posture_label(&repo_metrics, &repo_audits, &assessment);
+        let posture_label = fleet_repo_posture_label(repo_metrics, repo_audits, &assessment);
         if posture_label == "telemetry-incomplete" {
             incomplete_telemetry_repos += 1;
         }
@@ -1926,7 +1940,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .map(|entry| entry.segment.clone())
             .unwrap_or_else(|| "default".to_string());
         *segment_duration_ms.entry(segment.clone()).or_insert(0) += total_duration_ms;
-        let average_score = average_metric_score(&repo_metrics);
+        let average_score = average_metric_score(repo_metrics);
         let gate_failures = repo_metrics
             .iter()
             .filter(|row| row.should_fail.unwrap_or(false))
@@ -2574,11 +2588,18 @@ fn load_release_policy_summary(path: &Path) -> Result<ReleasePolicySummary> {
         .and_then(toml::Value::as_str)
         .unwrap_or("lts/v1")
         .to_string();
-    let security_sla_hours = lts
+    let security_sla_hours_raw = lts
         .and_then(|table| table.get("security_sla_hours"))
         .and_then(toml::Value::as_integer)
-        .unwrap_or(72)
-        .clamp(0, u16::MAX as i64) as u16;
+        .unwrap_or(72);
+    if !(0..=u16::MAX as i64).contains(&security_sla_hours_raw) {
+        bail!(
+            "release.lts.security_sla_hours must be between 0 and {} in {}",
+            u16::MAX,
+            path.display()
+        );
+    }
+    let security_sla_hours = security_sla_hours_raw as u16;
     Ok(ReleasePolicySummary {
         lts_active,
         lts_branch,
@@ -4085,6 +4106,25 @@ active = true
         assert!(summary.lts_active);
         assert_eq!(summary.lts_branch, "lts/v1");
         assert_eq!(summary.security_sla_hours, 72);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_release_policy_summary_rejects_negative_security_sla_hours() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-policy-negative-sla-{seq}.toml"));
+        fs::write(
+            &path,
+            r#"[release.lts]
+active = true
+security_sla_hours = -1
+"#,
+        )
+        .expect("write policy file");
+
+        let err = load_release_policy_summary(&path).expect_err("negative SLA hours should fail");
+        assert!(format!("{err:#}").contains("release.lts.security_sla_hours must be between 0"));
 
         let _ = fs::remove_file(path);
     }
