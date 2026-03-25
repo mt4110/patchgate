@@ -2687,11 +2687,15 @@ fn build_compatibility_assessment(
     let calibration = build_verify_v1_calibration(metrics);
     let failure_codes = aggregate_failure_code_counts(metrics, audits);
     let audit_failures = audits.iter().filter(|row| audit_v1_is_failure(row)).count();
-    let replay_evidence_present = replay_summary.is_some();
-    let delivery_recovery_ready = replay_summary
+    let replay_evidence_present = replay_summary
         .as_ref()
-        .map(|summary| summary.failed_records == 0 && summary.retained_records == 0)
-        .unwrap_or(false);
+        .is_some_and(|summary| !summary.dry_run && summary.rewrite_input);
+    let delivery_recovery_ready = replay_summary.as_ref().is_some_and(|summary| {
+        !summary.dry_run
+            && summary.rewrite_input
+            && summary.failed_records == 0
+            && summary.retained_records == 0
+    });
 
     let posture = if !slo.ready
         || audit_failures > 0
@@ -2743,6 +2747,27 @@ fn build_compatibility_assessment(
                     summary.failed_records, summary.retained_records
                 ),
             );
+        }
+        Some(summary) if summary.dry_run || !summary.rewrite_input => {
+            push_unique_action(
+                &mut next_actions,
+                &mut seen_actions,
+                "Attach a non-dry-run dead-letter replay summary with rewrite enabled before promoting v2 seed work.".to_string(),
+            );
+            if summary.dry_run {
+                push_unique_action(
+                    &mut next_actions,
+                    &mut seen_actions,
+                    "Re-run dead-letter replay without --dry-run to collect real delivery recovery evidence.".to_string(),
+                );
+            }
+            if !summary.rewrite_input {
+                push_unique_action(
+                    &mut next_actions,
+                    &mut seen_actions,
+                    "Re-run dead-letter replay with input rewrite enabled so retained records are proven clean.".to_string(),
+                );
+            }
         }
         Some(_) => {}
         None => {
@@ -3614,6 +3639,116 @@ mod tests {
             build_compatibility_assessment(&metrics, &audits, Some(replay), 99, 1_500, 5);
         assert_eq!(assessment.posture, CompatibilityPosture::StartV2Seed);
         assert!(assessment.delivery_recovery_ready);
+    }
+
+    #[test]
+    fn compatibility_assessment_rejects_dry_run_replay_evidence() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 1,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 10,
+                score: Some(95),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+            MetricLogRecord {
+                unix_ts: 2,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 12,
+                score: Some(94),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+        ];
+        let audits = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 2,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let replay = DeadLetterReplaySummaryRecord {
+            input_path: "artifacts/dead-letter-replay-summary.json".to_string(),
+            transport_filter: Some("notification".to_string()),
+            selected_records: 0,
+            successful_records: 0,
+            dry_run_records: 0,
+            failed_records: 0,
+            skipped_records: 0,
+            retained_records: 0,
+            dry_run: true,
+            rewrite_input: true,
+        };
+
+        let assessment =
+            build_compatibility_assessment(&metrics, &audits, Some(replay), 99, 1_500, 5);
+        assert_eq!(assessment.posture, CompatibilityPosture::HoldV11Line);
+        assert!(!assessment.replay_evidence_present);
+        assert!(!assessment.delivery_recovery_ready);
+    }
+
+    #[test]
+    fn compatibility_assessment_requires_rewrite_enabled_replay_evidence() {
+        let metrics = vec![
+            MetricLogRecord {
+                unix_ts: 1,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 10,
+                score: Some(95),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+            MetricLogRecord {
+                unix_ts: 2,
+                repo: "repo".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                duration_ms: 12,
+                score: Some(94),
+                should_fail: Some(false),
+                failure_code: None,
+            },
+        ];
+        let audits = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 2,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let replay = DeadLetterReplaySummaryRecord {
+            input_path: "artifacts/dead-letter-replay-summary.json".to_string(),
+            transport_filter: Some("notification".to_string()),
+            selected_records: 0,
+            successful_records: 0,
+            dry_run_records: 0,
+            failed_records: 0,
+            skipped_records: 0,
+            retained_records: 0,
+            dry_run: false,
+            rewrite_input: false,
+        };
+
+        let assessment =
+            build_compatibility_assessment(&metrics, &audits, Some(replay), 99, 1_500, 5);
+        assert_eq!(assessment.posture, CompatibilityPosture::HoldV11Line);
+        assert!(!assessment.replay_evidence_present);
+        assert!(!assessment.delivery_recovery_ready);
     }
 
     #[test]

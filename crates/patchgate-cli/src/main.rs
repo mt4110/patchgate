@@ -4469,49 +4469,82 @@ fn publish_generic_ci_payload(
     output_path: Option<&Path>,
 ) -> Result<()> {
     let sanitized_report = sanitize_report_for_external(report)?;
-    let payload_v1 = GenericCiPublishPayload {
-        schema_version: 1,
-        provider: "generic".to_string(),
-        repo: telemetry_repo.to_string(),
-        unix_ts: current_unix_ts(),
-        summary: GenericPublishSummary {
-            score: report.score,
-            threshold: report.threshold,
-            should_fail: report.should_fail,
-            mode: report.mode.clone(),
-            scope: report.scope.clone(),
-            findings: report.findings.len(),
-        },
-        report: sanitized_report,
-        markdown: markdown.to_string(),
-    };
-    let payload_v2 = GenericCiPublishPayloadV2 {
-        schema_version: 2,
-        publish_format: "patchgate.provider.generic.v2".to_string(),
-        repo: telemetry_repo.to_string(),
-        emitted_at: payload_v1.unix_ts,
-        gate: GenericPublishGateV2 {
-            score: report.score,
-            threshold: report.threshold,
-            should_fail: report.should_fail,
-            mode: report.mode.clone(),
-            scope: report.scope.clone(),
-            findings_count: report.findings.len(),
-        },
-        artifacts: GenericPublishArtifactsV2 {
-            report: payload_v1.report.clone(),
-            markdown: markdown.to_string(),
-        },
-    };
+    let unix_ts = current_unix_ts();
     let pretty = match schema_mode {
-        GenericCiSchemaMode::V1 => serde_json::to_string_pretty(&payload_v1)?,
-        GenericCiSchemaMode::V2 => serde_json::to_string_pretty(&payload_v2)?,
+        GenericCiSchemaMode::V1 => serde_json::to_string_pretty(&GenericCiPublishPayload {
+            schema_version: 1,
+            provider: "generic".to_string(),
+            repo: telemetry_repo.to_string(),
+            unix_ts,
+            summary: GenericPublishSummary {
+                score: report.score,
+                threshold: report.threshold,
+                should_fail: report.should_fail,
+                mode: report.mode.clone(),
+                scope: report.scope.clone(),
+                findings: report.findings.len(),
+            },
+            report: sanitized_report,
+            markdown: markdown.to_string(),
+        })?,
+        GenericCiSchemaMode::V2 => serde_json::to_string_pretty(&GenericCiPublishPayloadV2 {
+            schema_version: 2,
+            publish_format: "patchgate.provider.generic.v2".to_string(),
+            repo: telemetry_repo.to_string(),
+            emitted_at: unix_ts,
+            gate: GenericPublishGateV2 {
+                score: report.score,
+                threshold: report.threshold,
+                should_fail: report.should_fail,
+                mode: report.mode.clone(),
+                scope: report.scope.clone(),
+                findings_count: report.findings.len(),
+            },
+            artifacts: GenericPublishArtifactsV2 {
+                report: sanitized_report,
+                markdown: markdown.to_string(),
+            },
+        })?,
         GenericCiSchemaMode::Dual => {
+            let payload_v1 = GenericCiPublishPayload {
+                schema_version: 1,
+                provider: "generic".to_string(),
+                repo: telemetry_repo.to_string(),
+                unix_ts,
+                summary: GenericPublishSummary {
+                    score: report.score,
+                    threshold: report.threshold,
+                    should_fail: report.should_fail,
+                    mode: report.mode.clone(),
+                    scope: report.scope.clone(),
+                    findings: report.findings.len(),
+                },
+                report: sanitized_report.clone(),
+                markdown: markdown.to_string(),
+            };
+            let payload_v2 = GenericCiPublishPayloadV2 {
+                schema_version: 2,
+                publish_format: "patchgate.provider.generic.v2".to_string(),
+                repo: telemetry_repo.to_string(),
+                emitted_at: unix_ts,
+                gate: GenericPublishGateV2 {
+                    score: report.score,
+                    threshold: report.threshold,
+                    should_fail: report.should_fail,
+                    mode: report.mode.clone(),
+                    scope: report.scope.clone(),
+                    findings_count: report.findings.len(),
+                },
+                artifacts: GenericPublishArtifactsV2 {
+                    report: sanitized_report,
+                    markdown: markdown.to_string(),
+                },
+            };
             serde_json::to_string_pretty(&GenericCiPublishBridgePayload {
                 schema_version: 1,
                 bridge_format: "patchgate.provider.generic.bridge.v1".to_string(),
                 repo: telemetry_repo.to_string(),
-                emitted_at: payload_v1.unix_ts,
+                emitted_at: unix_ts,
                 v1: payload_v1,
                 v2: payload_v2,
             })?
