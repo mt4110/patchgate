@@ -50,6 +50,22 @@
   - `patchgate history trend`
 - SLO report:
   - `cargo run -p xtask -- ops slo-report`
+- Compatibility report:
+  - `cargo run -p xtask -- ops compatibility-report`
+  - v1.1 freeze を維持するか、v2 seed へ進めるかを telemetry から判定する
+- Freeze scoreboard:
+  - `cargo run -p xtask -- ops freeze-scoreboard`
+  - v1.1 freeze ready と v2 seed ready を release artifact として出力する
+- Shadow review:
+  - `cargo run -p xtask -- ops shadow-review`
+  - audit v1/v2 dual-write の乖離を確認する
+- Fleet review:
+  - `cargo run -p xtask -- ops fleet-review`
+  - repo / provider / provenance / exception / cost を fleet 単位で束ねる
+- RC / GA packets:
+  - `cargo run -p xtask -- ops rc-readiness`
+  - `cargo run -p xtask -- ops ga-packet`
+  - candidate / GA 判定を artifact で再現する
 
 ## Failure taxonomy
 
@@ -84,3 +100,19 @@
 - Release artifacts:
   - `.github/workflows/release-ga.yml`
   - checksum + SBOM相当 + provenance metadata
+
+## Compatibility evidence loop (Phase151+)
+
+- 週次運用・GA readiness・release precheck で compatibility report artifact を生成する
+- 判定 posture:
+  - `stabilize-v1`: SLO / audit / replay 証跡に未解決項目がある
+  - `hold-v1.1-line`: v1.1 維持は可能だが、v2 seed を始める証跡がまだ不足
+  - `start-v2-seed`: strict/lts 相当の安定性と replay 証跡が揃っている
+- bridge primitives:
+  - generic provider: `v1` / `v2` / `dual`
+  - audit export: `patchgate.audit.v1` + `patchgate.audit.v2`
+  - policy gate: `verify-v1` + `verify-v2`
+- governance packets:
+  - `fleet-review.md`
+  - `v2-rc-readiness.md`
+  - `v2-ga-packet.md`

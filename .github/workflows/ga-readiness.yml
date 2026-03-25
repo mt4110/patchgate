@@ -22,13 +22,20 @@ jobs:
             --format json \
             --no-cache \
             --metrics-output artifacts/scan-metrics.jsonl \
-            --audit-log-output artifacts/scan-audit.jsonl
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl
 
       - name: Verify v1 readiness
         run: |
           mkdir -p artifacts
           cp config/policy.toml.example artifacts/policy.lts.toml
+          cp config/policy.toml.example artifacts/policy.v2.toml
           sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
+          sed -i 's/^generic_schema = .*/generic_schema = "dual" # v1 | v2 | dual/' artifacts/policy.v2.toml
+          sed -i 's|^audit_v2_jsonl_path = ""$|audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"|' artifacts/policy.v2.toml
+          sed -i 's/^shadow_mode = false$/shadow_mode = true/' artifacts/policy.v2.toml
+          sed -i 's/^bridge_mode = .*/bridge_mode = "full" # off | provider | audit | full/' artifacts/policy.v2.toml
+          sed -i 's|^migration_guide_path = ""$|migration_guide_path = "docs/16_v2_migration_guide_alpha.md"|' artifacts/policy.v2.toml
           cargo run -p patchgate-cli -- policy verify-v1 \
             --path config/policy.toml.example \
             --format text
@@ -40,6 +47,24 @@ jobs:
             --path artifacts/policy.lts.toml \
             --readiness-profile lts \
             --format text
+          cargo run -p patchgate-cli -- policy verify-v2 \
+            --path artifacts/policy.v2.toml \
+            --format json > artifacts/verify-v2.json
+          cargo run -p patchgate-cli -- policy diff-contract \
+            --path artifacts/policy.v2.toml \
+            --format json > artifacts/diff-contract.json
+
+      - name: Generate generic provider dual artifact
+        run: |
+          cargo run -p patchgate-cli -- scan \
+            --scope staged \
+            --mode warn \
+            --format json \
+            --no-cache \
+            --publish \
+            --ci-provider generic \
+            --ci-generic-schema dual \
+            --ci-generic-output artifacts/provider-dual.json
 
       - name: Build verify-v1 calibration report
         run: |
@@ -54,16 +79,40 @@ jobs:
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/ga-readiness.md
 
-      - name: Build v1.1 readiness summary
+      - name: Build compatibility report
         run: |
-          mkdir -p artifacts
-          cat > artifacts/v1.1-readiness.md <<'EOF'
-          # v1.1 Readiness
+          cargo run -p xtask -- ops compatibility-report \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/compatibility-report.md
 
-          - verify-v1 profiles: executed (standard/strict/lts)
-          - calibration report: generated
-          - ga-readiness report: generated
-          EOF
+      - name: Build audit drift and shadow review
+        run: |
+          cargo run -p xtask -- ops audit-drift-report \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --output artifacts/audit-drift-report.md
+          cargo run -p xtask -- ops shadow-review \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --output artifacts/shadow-review.md
+
+      - name: Build v1.1 freeze scoreboard
+        run: |
+          cargo run -p xtask -- ops freeze-scoreboard \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --output artifacts/v1.1-readiness.md
+
+      - name: Build fleet review packet
+        run: |
+          cargo run -p xtask -- ops fleet-review \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --cost-ceiling-minutes 30 \
+            --output artifacts/fleet-review.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -71,4 +120,11 @@ jobs:
           path: |
             artifacts/ga-readiness.md
             artifacts/verify-v1-calibration.md
+            artifacts/compatibility-report.md
+            artifacts/audit-drift-report.md
+            artifacts/shadow-review.md
             artifacts/v1.1-readiness.md
+            artifacts/fleet-review.md
+            artifacts/verify-v2.json
+            artifacts/diff-contract.json
+            artifacts/provider-dual.json

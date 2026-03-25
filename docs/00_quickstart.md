@@ -41,6 +41,11 @@ patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.
 - Notifications: `--notify-target slack=...` / `--notify-target teams=...`
 - Delivery fallback: `--dead-letter-output artifacts/dead-letter.jsonl`
 - Replay dead-letter: `patchgate delivery replay --input artifacts/dead-letter.jsonl --rewrite-input --summary-output artifacts/dead-letter-replay-summary.json`
+- Compatibility report: `cargo run -p xtask -- ops compatibility-report --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/compatibility-report.md`
+- Freeze scoreboard: `cargo run -p xtask -- ops freeze-scoreboard --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/v1.1-readiness.md`
+- V2 readiness: `patchgate policy verify-v2 --path policy.toml --format text`
+- Fleet review: `cargo run -p xtask -- ops fleet-review --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/fleet-review.md`
+- RC/GA packets: `cargo run -p xtask -- ops rc-readiness ...` / `cargo run -p xtask -- ops ga-packet ...`
 
 ## 7) SDK template
 

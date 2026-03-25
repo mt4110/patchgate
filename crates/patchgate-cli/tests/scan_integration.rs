@@ -332,6 +332,73 @@ fn scan_generic_ci_publish_fails_without_output_path() -> TestResult<()> {
     Ok(())
 }
 
+#[test]
+fn scan_accepts_bridge_outputs_from_cli_overrides() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+
+[integrations.ci]
+provider = "generic"
+generic_schema = "v1"
+"#,
+    )?;
+    repo.write_file("docs/v2-migration-alpha.md", "# v2 migration\n")?;
+    repo.append_line(
+        "src/lib.rs",
+        "pub fn changed_for_bridge_override() -> i32 { 13 }",
+    )?;
+    let payload_path = repo.root().join("artifacts/provider-dual.json");
+    let audit_v2_path = repo.root().join("artifacts/scan-audit-v2.jsonl");
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+            "--publish",
+            "--ci-provider",
+            "generic",
+            "--ci-generic-schema",
+            "dual",
+            "--ci-generic-output",
+            payload_path
+                .to_str()
+                .ok_or("invalid generic ci output path utf8")?,
+            "--audit-log-v2-output",
+            audit_v2_path
+                .to_str()
+                .ok_or("invalid audit v2 output path utf8")?,
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "bridge override scan should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload = fs::read_to_string(payload_path)?;
+    assert!(payload.contains("\"bridge_format\""));
+
+    let audit_v2 = fs::read_to_string(audit_v2_path)?;
+    assert!(audit_v2.contains("\"audit_format\":\"patchgate.audit.v2\""));
+
+    Ok(())
+}
+
 fn run_patchgate(repo: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_patchgate"))
         .current_dir(repo)

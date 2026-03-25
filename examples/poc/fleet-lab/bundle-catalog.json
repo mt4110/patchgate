@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "bundles": [
+    {
+      "repo": "example/repo",
+      "policy_bundle": "core-strict",
+      "wave": "canary",
+      "segment": "prod"
+    },
+    {
+      "repo": "example/repo-internal",
+      "policy_bundle": "core-balanced",
+      "wave": "wave-1",
+      "segment": "internal"
+    }
+  ]
+}

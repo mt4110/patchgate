@@ -2018,8 +2018,10 @@ name = "xtask"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "patchgate-core",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

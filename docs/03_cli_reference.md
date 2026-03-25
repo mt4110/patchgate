@@ -30,6 +30,7 @@ Core options:
 - `--profile-output <path>`
 - `--metrics-output <path>`
 - `--audit-log-output <path>`
+- `--audit-log-v2-output <path>`
 - `--audit-actor <name>`
 
 GitHub publish options:
@@ -60,6 +61,7 @@ Provider/Webhook/Notification options:
 - `--publish`
 - `--ci-provider <github|generic>`
 - `--ci-generic-output <path>` (`--publish` かつ `ci-provider=generic` の場合は必須)
+- `--ci-generic-schema <v1|v2|dual>`
 - `--webhook-url <https://...>` (repeatable)
 - `--webhook-secret-env <env_name>`
 - `--webhook-timeout-ms <ms>`
@@ -116,6 +118,21 @@ Provider/Webhook/Notification options:
 - v1 RC/GA前提の移行準備状態を検証
 - safe autofix対象は `compatibility.v1.*`, `plugins.sandbox.profile`, `release.lts.*` の一部
 
+### `patchgate policy verify-v2`
+
+- `--path <file>`
+- `--policy-preset <strict|balanced|relaxed>`
+- `--format <text|json>`
+- v2 shadow / bridge の準備状態を検証
+- 主に `compatibility.v2.*`, `integrations.ci.generic_schema`, `observability.audit_v2_*` を確認
+
+### `patchgate policy diff-contract`
+
+- `--path <file>`
+- `--policy-preset <strict|balanced|relaxed>`
+- `--format <text|json>`
+- v1 contract と v2 bridge contract の差分を要約
+
 ### `patchgate plugin init`
 
 - `--lang <python|node|rust>`
@@ -140,6 +157,7 @@ Provider/Webhook/Notification options:
 
 - Metrics (`schema_version=1`): repo/mode/scope/duration/score/failure code
 - Audit (`patchgate.audit.v1`): actor/target/result/failure code
+- Audit v2 (`patchgate.audit.v2`): operation/gate/failure/diagnostics を構造化出力
 
 ## Failure codes
 

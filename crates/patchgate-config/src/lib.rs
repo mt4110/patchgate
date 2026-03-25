@@ -368,6 +368,16 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         cfg.integrations.ci.provider.as_str(),
         &["github", "generic"],
     )?;
+    validate_enum(
+        "integrations.ci.generic_schema",
+        cfg.integrations.ci.generic_schema.as_str(),
+        &["v1", "v2", "dual"],
+    )?;
+    validate_enum(
+        "compatibility.v2.bridge_mode",
+        cfg.compatibility.v2.bridge_mode.as_str(),
+        &["off", "provider", "audit", "full"],
+    )?;
 
     validate_range_u8("output.fail_threshold", cfg.output.fail_threshold, 0, 100)?;
     validate_positive_u32("scope.max_changed_files", cfg.scope.max_changed_files)?;
@@ -509,6 +519,12 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         1,
         10,
     )?;
+    validate_range_u8(
+        "observability.audit_v2_schema_version",
+        cfg.observability.audit_v2_schema_version,
+        2,
+        10,
+    )?;
     validate_positive_u32(
         "plugins.sandbox.max_stdout_kib",
         cfg.plugins.sandbox.max_stdout_kib,
@@ -600,6 +616,15 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
+    if !cfg.observability.audit_v2_jsonl_path.is_empty()
+        && cfg.observability.audit_v2_jsonl_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "observability.audit_v2_jsonl_path",
+            "must be non-empty string when provided",
+        ));
+    }
     if (cfg.integrations.webhook.enabled || !cfg.integrations.webhook.urls.is_empty())
         && cfg.integrations.webhook.secret_env.trim().is_empty()
     {
@@ -616,6 +641,24 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             ValidationCategory::Type,
             "integrations.ci.generic_output_path",
             "must be non-empty string when provided",
+        ));
+    }
+    if !cfg.compatibility.v2.migration_guide_path.is_empty()
+        && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "compatibility.v2.migration_guide_path",
+            "must be non-empty string when provided",
+        ));
+    }
+    if cfg.compatibility.v2.shadow_mode
+        && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "compatibility.v2",
+            "shadow_mode requires a non-empty migration_guide_path to document the rollout",
         ));
     }
     if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {
@@ -1318,6 +1361,74 @@ profile = "isolated"
     }
 
     #[test]
+    fn validation_rejects_invalid_generic_schema() {
+        let path = write_temp_policy(
+            r#"
+[integrations.ci]
+generic_schema = "bridge"
+"#,
+        );
+
+        let err = load_from_typed(&path).expect_err("must fail for invalid generic schema");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "integrations.ci.generic_schema")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_allows_v2_bridge_placeholders_for_runtime_overrides() {
+        let path = write_temp_policy(
+            r#"
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+[integrations.ci]
+generic_schema = "v1"
+"#,
+        );
+
+        let loaded = load_from_typed(&path).expect("cli overrides may satisfy bridge outputs");
+        assert_eq!(loaded.compatibility.v2.bridge_mode, "full");
+        assert_eq!(loaded.integrations.ci.generic_schema, "v1");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_requires_migration_guide_path_when_shadow_mode_enabled() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+"#,
+        );
+
+        let err = load_from_typed(&path)
+            .expect_err("must reject shadow mode without a migration guide path");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation {
+                category, field, ..
+            } => {
+                assert_eq!(category, ValidationCategory::Dependency);
+                assert_eq!(field, "compatibility.v2");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn validation_rejects_empty_plugin_public_key_env_when_signature_required() {
         let path = write_temp_policy(
             r#"
@@ -1475,6 +1586,32 @@ metrics_jsonl_path = "   "
             } => {
                 assert_eq!(category, ValidationCategory::Type);
                 assert_eq!(field, "observability.metrics_jsonl_path");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_reports_type_category_for_migration_guide_path_whitespace() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[compatibility.v2]
+migration_guide_path = "   "
+"#,
+        );
+
+        let err =
+            load_from_typed(&path).expect_err("must reject whitespace-only migration guide path");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation {
+                category, field, ..
+            } => {
+                assert_eq!(category, ValidationCategory::Type);
+                assert_eq!(field, "compatibility.v2.migration_guide_path");
             }
             other => panic!("unexpected error: {other}"),
         }

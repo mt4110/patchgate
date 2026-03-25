@@ -32,8 +32,8 @@ use patchgate_config::{
     POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
-    CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority, Runner, ScopeMode,
-    Severity,
+    failure_codes, CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority,
+    Runner, ScopeMode, Severity,
 };
 
 #[derive(Parser, Debug)]
@@ -121,6 +121,10 @@ struct ScanArgs {
     /// Append audit log JSONL record
     #[arg(long)]
     audit_log_output: Option<PathBuf>,
+
+    /// Append audit log v2 JSONL record
+    #[arg(long)]
+    audit_log_v2_output: Option<PathBuf>,
 
     /// Override actor for audit logs (default: GITHUB_ACTOR or $USER)
     #[arg(long)]
@@ -217,6 +221,10 @@ struct ScanArgs {
     /// Generic provider payload output path
     #[arg(long)]
     ci_generic_output: Option<PathBuf>,
+
+    /// Generic provider payload schema: v1|v2|dual
+    #[arg(long)]
+    ci_generic_schema: Option<String>,
 
     /// Signed webhook endpoint URL (repeatable)
     #[arg(long = "webhook-url")]
@@ -393,6 +401,12 @@ enum PolicyCommand {
 
     /// Verify v1.0 readiness for migration
     VerifyV1(PolicyVerifyV1Args),
+
+    /// Verify v2 shadow/bridge readiness
+    VerifyV2(PolicyVerifyV2Args),
+
+    /// Show v1/v2 contract migration diff
+    DiffContract(PolicyDiffContractArgs),
 }
 
 #[derive(Args, Debug)]
@@ -456,6 +470,36 @@ struct PolicyVerifyV1Args {
     autofix_write: bool,
 }
 
+#[derive(Args, Debug)]
+struct PolicyVerifyV2Args {
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Args, Debug)]
+struct PolicyDiffContractArgs {
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanErrorKind {
     Input,
@@ -507,18 +551,18 @@ enum FailureCode {
 impl FailureCode {
     fn as_str(self) -> &'static str {
         match self {
-            FailureCode::InputInvalidOption => "PG-IN-001",
-            FailureCode::ConfigLoadFailed => "PG-CFG-001",
-            FailureCode::GitDiffFailed => "PG-GIT-001",
-            FailureCode::RuntimeEvaluationFailed => "PG-RT-001",
-            FailureCode::OutputWriteFailed => "PG-OUT-001",
-            FailureCode::PublishInputFailed => "PG-PUB-001",
-            FailureCode::PublishApiFailed => "PG-PUB-002",
-            FailureCode::PublishSsoRequired => "PG-PUB-SSO-001",
-            FailureCode::PublishOrgPolicyBlocked => "PG-PUB-ORG-001",
-            FailureCode::PublishWebhookFailed => "PG-PUB-WEB-001",
-            FailureCode::NotificationFailed => "PG-NOT-001",
-            FailureCode::WaiverExpired => "PG-GOV-001",
+            FailureCode::InputInvalidOption => failure_codes::INPUT_INVALID_OPTION,
+            FailureCode::ConfigLoadFailed => failure_codes::CONFIG_LOAD_FAILED,
+            FailureCode::GitDiffFailed => failure_codes::GIT_DIFF_FAILED,
+            FailureCode::RuntimeEvaluationFailed => failure_codes::RUNTIME_EVALUATION_FAILED,
+            FailureCode::OutputWriteFailed => failure_codes::OUTPUT_WRITE_FAILED,
+            FailureCode::PublishInputFailed => failure_codes::PUBLISH_INPUT_FAILED,
+            FailureCode::PublishApiFailed => failure_codes::PUBLISH_API_FAILED,
+            FailureCode::PublishSsoRequired => failure_codes::PUBLISH_SSO_REQUIRED,
+            FailureCode::PublishOrgPolicyBlocked => failure_codes::PUBLISH_ORG_POLICY_BLOCKED,
+            FailureCode::PublishWebhookFailed => failure_codes::PUBLISH_WEBHOOK_FAILED,
+            FailureCode::NotificationFailed => failure_codes::NOTIFICATION_FAILED,
+            FailureCode::WaiverExpired => failure_codes::WAIVER_EXPIRED,
         }
     }
 
@@ -690,6 +734,24 @@ impl CiProvider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericCiSchemaMode {
+    V1,
+    V2,
+    Dual,
+}
+
+impl GenericCiSchemaMode {
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw.unwrap_or("v1") {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            "dual" => Ok(Self::Dual),
+            other => Err(format!("`{other}` (expected: v1|v2|dual)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationKind {
     Slack,
     Teams,
@@ -726,6 +788,42 @@ struct GenericCiPublishPayload {
 }
 
 #[derive(Debug, Serialize)]
+struct GenericCiPublishPayloadV2 {
+    schema_version: u8,
+    publish_format: String,
+    repo: String,
+    emitted_at: u64,
+    gate: GenericPublishGateV2,
+    artifacts: GenericPublishArtifactsV2,
+}
+
+#[derive(Debug, Serialize)]
+struct GenericPublishGateV2 {
+    score: u8,
+    threshold: u8,
+    should_fail: bool,
+    mode: String,
+    scope: String,
+    findings_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GenericPublishArtifactsV2 {
+    report: Report,
+    markdown: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenericCiPublishBridgePayload {
+    schema_version: u8,
+    bridge_format: String,
+    repo: String,
+    emitted_at: u64,
+    v1: GenericCiPublishPayload,
+    v2: GenericCiPublishPayloadV2,
+}
+
+#[derive(Debug, Serialize)]
 struct GenericPublishSummary {
     score: u8,
     threshold: u8,
@@ -741,6 +839,32 @@ struct WebhookEnvelope<'a> {
     unix_ts: u64,
     repo: &'a str,
     report: &'a Report,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeliveryBridgeContext<'a> {
+    enabled: bool,
+    shadow_mode: bool,
+    bridge_mode: &'a str,
+}
+
+impl<'a> DeliveryBridgeContext<'a> {
+    fn from_config(cfg: &'a Config) -> Self {
+        let bridge_mode = cfg.compatibility.v2.bridge_mode.as_str();
+        Self {
+            enabled: cfg.compatibility.v2.shadow_mode && bridge_mode == "full",
+            shadow_mode: cfg.compatibility.v2.shadow_mode,
+            bridge_mode,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct NotificationBridgeMetadata<'a> {
+    schema_version: u8,
+    bridge_format: &'a str,
+    shadow_of: &'a str,
+    bridge_mode: &'a str,
 }
 
 struct ResolvedScanOptions {
@@ -813,6 +937,49 @@ struct AuditLogRecord {
     threshold: Option<u8>,
     changed_files: Option<usize>,
     diagnostic_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditLogV2Record {
+    schema_version: u8,
+    audit_format: String,
+    emitted_at: u64,
+    actor: String,
+    repo: String,
+    operation: AuditOperationV2,
+    gate: AuditGateV2,
+    failure: AuditFailureV2,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditOperationV2 {
+    target: String,
+    mode: String,
+    scope: String,
+    result: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditGateV2 {
+    score: Option<u8>,
+    threshold: Option<u8>,
+    changed_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditFailureV2 {
+    code: Option<String>,
+    category: Option<String>,
+}
+
+struct ScanSuccessOutputs<'a> {
+    metrics_path: Option<&'a Path>,
+    audit_path: Option<&'a Path>,
+    audit_v2_path: Option<&'a Path>,
+    actor: String,
+    audit_schema_version: u8,
+    audit_v2_schema_version: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1135,6 +1302,10 @@ const NODE_TEMPLATE_SAMPLE_INPUT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/node-plugin/sample-input.json"
 ));
+const NODE_TEMPLATE_SAMPLE_INPUT_V2: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/node-plugin/sample-input.v2.json"
+));
 const NODE_TEMPLATE_PACKAGE_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/node-plugin/package.json"
@@ -1151,6 +1322,10 @@ const RUST_TEMPLATE_SAMPLE_INPUT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/rust-plugin/sample-input.json"
 ));
+const RUST_TEMPLATE_SAMPLE_INPUT_V2: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/rust-plugin/sample-input.v2.json"
+));
 const RUST_TEMPLATE_CARGO_TOML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/rust-plugin/Cargo.toml"
@@ -1159,6 +1334,22 @@ const RUST_TEMPLATE_MAIN_RS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/rust-plugin/src/main.rs"
 ));
+const PYTHON_TEMPLATE_README: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/python-plugin/README.md"
+));
+const PYTHON_TEMPLATE_SAMPLE_INPUT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/python-plugin/sample-input.json"
+));
+const PYTHON_TEMPLATE_SAMPLE_INPUT_V2: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/python-plugin/sample-input.v2.json"
+));
+const PYTHON_TEMPLATE_MAIN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../sdk/templates/python-plugin/main.py"
+));
 
 fn render_embedded_template(template: &str, replacements: &[(&str, &str)]) -> String {
     let mut rendered = template.to_string();
@@ -1166,6 +1357,16 @@ fn render_embedded_template(template: &str, replacements: &[(&str, &str)]) -> St
         rendered = rendered.replace(from, to);
     }
     rendered
+}
+
+fn render_plugin_sample_input(template: &str, plugin_id: &str) -> String {
+    render_embedded_template(
+        template,
+        &[(
+            "\"plugin_id\":\"sample\"",
+            &format!("\"plugin_id\":\"{plugin_id}\""),
+        )],
+    )
 }
 
 fn render_plugin_template(
@@ -1177,31 +1378,30 @@ fn render_plugin_template(
         PluginTemplateLang::Python => vec![
             (
                 "README.md",
-                format!(
-                    "# {plugin_id} (Python plugin)\n\nGenerated by `patchgate plugin init`.\n\nRun:\n\n```bash\npython3 main.py < sample-input.json\n```\n"
+                render_embedded_template(
+                    PYTHON_TEMPLATE_README,
+                    &[("plugin_id=sample", &format!("plugin_id={plugin_id}"))],
                 ),
             ),
             (
                 "sample-input.json",
-                format!(
-                    "{{\"schema_version\":1,\"api_version\":\"patchgate.plugin.v1\",\"plugin_id\":\"{plugin_id}\",\"repo_root\":\".\",\"mode\":\"warn\",\"scope\":\"worktree\",\"changed_files\":[]}}\n"
-                ),
+                render_plugin_sample_input(PYTHON_TEMPLATE_SAMPLE_INPUT, plugin_id),
             ),
             (
-                "main.py",
-                format!(
-                    "#!/usr/bin/env python3\nimport json\nimport sys\n\n\ndef main() -> int:\n    raw = sys.stdin.read()\n    if not raw.strip():\n        print(json.dumps({{\"findings\": [], \"diagnostics\": [\"empty input\"]}}))\n        return 0\n\n    payload = json.loads(raw)\n    diagnostics = [\n        \"plugin_id={plugin_id}\",\n        f\"changed_files={{len(payload.get('changed_files', []))}}\",\n    ]\n    print(json.dumps({{\"findings\": [], \"diagnostics\": diagnostics}}))\n    return 0\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"
-                ),
+                "sample-input.v2.json",
+                render_plugin_sample_input(PYTHON_TEMPLATE_SAMPLE_INPUT_V2, plugin_id),
             ),
+            ("main.py", PYTHON_TEMPLATE_MAIN.to_string()),
         ],
         PluginTemplateLang::Node => vec![
             ("README.md", NODE_TEMPLATE_README.to_string()),
             (
                 "sample-input.json",
-                render_embedded_template(
-                    NODE_TEMPLATE_SAMPLE_INPUT,
-                    &[("\"plugin_id\":\"sample\"", &format!("\"plugin_id\":\"{plugin_id}\""))],
-                ),
+                render_plugin_sample_input(NODE_TEMPLATE_SAMPLE_INPUT, plugin_id),
+            ),
+            (
+                "sample-input.v2.json",
+                render_plugin_sample_input(NODE_TEMPLATE_SAMPLE_INPUT_V2, plugin_id),
             ),
             (
                 "package.json",
@@ -1222,10 +1422,11 @@ fn render_plugin_template(
             ("README.md", RUST_TEMPLATE_README.to_string()),
             (
                 "sample-input.json",
-                render_embedded_template(
-                    RUST_TEMPLATE_SAMPLE_INPUT,
-                    &[("\"plugin_id\":\"sample\"", &format!("\"plugin_id\":\"{plugin_id}\""))],
-                ),
+                render_plugin_sample_input(RUST_TEMPLATE_SAMPLE_INPUT, plugin_id),
+            ),
+            (
+                "sample-input.v2.json",
+                render_plugin_sample_input(RUST_TEMPLATE_SAMPLE_INPUT_V2, plugin_id),
             ),
             (
                 "Cargo.toml",
@@ -1361,6 +1562,12 @@ fn execute_policy(repo_root: &Path, config_override: Option<&Path>, policy: Poli
         }
         PolicyCommand::VerifyV1(args) => {
             run_policy_verify_v1(repo_root, config_override, args).as_i32()
+        }
+        PolicyCommand::VerifyV2(args) => {
+            run_policy_verify_v2(repo_root, config_override, args).as_i32()
+        }
+        PolicyCommand::DiffContract(args) => {
+            run_policy_diff_contract(repo_root, config_override, args).as_i32()
         }
     }
 }
@@ -1779,6 +1986,41 @@ struct V1ReadinessReport {
     autofix_result: Option<V1AutofixResult>,
 }
 
+#[derive(Debug, Serialize)]
+struct V2ReadinessReport {
+    ready: bool,
+    policy_path: String,
+    policy_version: u32,
+    v1_rc_frozen: bool,
+    v1_strict_compatibility: bool,
+    v2_shadow_mode: bool,
+    v2_bridge_mode: String,
+    migration_guide_path: String,
+    migration_guide_exists: bool,
+    ci_provider: String,
+    ci_generic_schema: String,
+    audit_schema_version: u8,
+    audit_v2_schema_version: u8,
+    audit_v2_output_enabled: bool,
+    warnings: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContractDiffReport {
+    policy_path: String,
+    v1_contract: ContractSurfaceSummary,
+    v2_contract: ContractSurfaceSummary,
+    migration_delta: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContractSurfaceSummary {
+    enabled: bool,
+    details: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessProfile {
     Standard,
@@ -1999,6 +2241,414 @@ fn run_policy_verify_v1(
         PolicyExitCode::Ok
     } else {
         PolicyExitCode::MigrationRequired
+    }
+}
+
+fn run_policy_verify_v2(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyVerifyV2Args,
+) -> PolicyExitCode {
+    let Some(policy_path) = resolve_policy_path(repo_root, config_override, args.path.as_deref())
+    else {
+        eprintln!(
+            "patchgate policy verify-v2 error: policy file not found. tried: `policy.toml`, `.patchgate/policy.toml`"
+        );
+        return PolicyExitCode::ReadOrParse;
+    };
+
+    let preset = match parse_policy_preset(args.policy_preset.as_deref()) {
+        Ok(preset) => preset,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v2 error: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+    let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v2 error: {err:#}");
+            return map_config_error_to_policy_exit(&err);
+        }
+    };
+
+    let report = build_v2_readiness_report(repo_root, policy_path.as_path(), &loaded.config);
+    if let Err(err) = print_v2_readiness_report(&report, args.format.as_str()) {
+        eprintln!("patchgate policy verify-v2 error: {err}");
+        return if err.contains("unsupported --format") {
+            PolicyExitCode::ReadOrParse
+        } else {
+            PolicyExitCode::IoFailed
+        };
+    }
+
+    if report.ready {
+        PolicyExitCode::Ok
+    } else {
+        PolicyExitCode::MigrationRequired
+    }
+}
+
+fn run_policy_diff_contract(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyDiffContractArgs,
+) -> PolicyExitCode {
+    let Some(policy_path) = resolve_policy_path(repo_root, config_override, args.path.as_deref())
+    else {
+        eprintln!(
+            "patchgate policy diff-contract error: policy file not found. tried: `policy.toml`, `.patchgate/policy.toml`"
+        );
+        return PolicyExitCode::ReadOrParse;
+    };
+
+    let preset = match parse_policy_preset(args.policy_preset.as_deref()) {
+        Ok(preset) => preset,
+        Err(err) => {
+            eprintln!("patchgate policy diff-contract error: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+    let loaded = match load_policy_config(Some(policy_path.as_path()), preset) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("patchgate policy diff-contract error: {err:#}");
+            return map_config_error_to_policy_exit(&err);
+        }
+    };
+
+    let report = build_contract_diff_report(repo_root, policy_path.as_path(), &loaded.config);
+    if let Err(err) = print_contract_diff_report(&report, args.format.as_str()) {
+        eprintln!("patchgate policy diff-contract error: {err}");
+        return if err.contains("unsupported --format") {
+            PolicyExitCode::ReadOrParse
+        } else {
+            PolicyExitCode::IoFailed
+        };
+    }
+    PolicyExitCode::Ok
+}
+
+fn build_v2_readiness_report(
+    repo_root: &Path,
+    policy_path: &Path,
+    cfg: &Config,
+) -> V2ReadinessReport {
+    let mut warnings = Vec::new();
+    let mut next_actions = Vec::new();
+    let migration_guide_path = cfg.compatibility.v2.migration_guide_path.clone();
+    let migration_guide_exists =
+        resolve_optional_repo_path(repo_root, migration_guide_path.as_str())
+            .is_some_and(|path| path.exists());
+    let bridge_mode = cfg.compatibility.v2.bridge_mode.as_str();
+    let uses_generic_provider = cfg.integrations.ci.provider == "generic";
+    let audit_v2_output_enabled = !cfg.observability.audit_v2_jsonl_path.trim().is_empty();
+
+    if !cfg.compatibility.v1.rc_frozen {
+        warnings.push("verify-v2 requires compatibility.v1.rc_frozen=true".to_string());
+        next_actions.push("Freeze v1 compatibility before enabling v2 shadow work.".to_string());
+    }
+    if cfg.compatibility.v1.allow_legacy_config_names {
+        warnings.push(
+            "verify-v2 requires compatibility.v1.allow_legacy_config_names=false".to_string(),
+        );
+        next_actions
+            .push("Disable legacy config names before widening the contract surface.".to_string());
+    }
+    if !cfg.compatibility.v2.shadow_mode {
+        warnings.push("compatibility.v2.shadow_mode=false".to_string());
+        next_actions
+            .push("Enable compatibility.v2.shadow_mode to start bridge validation.".to_string());
+    }
+    if bridge_mode == "off" {
+        warnings.push("compatibility.v2.bridge_mode=off".to_string());
+        next_actions
+            .push("Use bridge_mode=provider|audit|full before claiming v2 readiness.".to_string());
+    }
+    if uses_generic_provider
+        && matches!(bridge_mode, "provider" | "full")
+        && cfg.integrations.ci.generic_schema == "v1"
+    {
+        warnings
+            .push("provider bridge requires integrations.ci.generic_schema=v2|dual".to_string());
+        next_actions.push("Switch integrations.ci.generic_schema to `v2` or `dual`.".to_string());
+    }
+    if matches!(bridge_mode, "audit" | "full") && !audit_v2_output_enabled {
+        warnings.push("audit bridge requires observability.audit_v2_jsonl_path".to_string());
+        next_actions
+            .push("Configure observability.audit_v2_jsonl_path for audit dual-write.".to_string());
+    }
+    if cfg.compatibility.v2.shadow_mode && !migration_guide_exists {
+        warnings.push("compatibility.v2.migration_guide_path is missing or unresolved".to_string());
+        next_actions.push("Add a migration guide artifact for the v2 shadow rollout.".to_string());
+    }
+
+    let ready = cfg.policy_version == POLICY_VERSION_CURRENT
+        && cfg.compatibility.v1.rc_frozen
+        && !cfg.compatibility.v1.allow_legacy_config_names
+        && cfg.compatibility.v2.shadow_mode
+        && bridge_mode != "off"
+        && (!uses_generic_provider
+            || !matches!(bridge_mode, "provider" | "full")
+            || cfg.integrations.ci.generic_schema != "v1")
+        && (!matches!(bridge_mode, "audit" | "full") || audit_v2_output_enabled)
+        && migration_guide_exists;
+
+    if ready {
+        next_actions.push("v2 shadow/bridge prerequisites are satisfied.".to_string());
+    }
+
+    V2ReadinessReport {
+        ready,
+        policy_path: policy_path.display().to_string(),
+        policy_version: cfg.policy_version,
+        v1_rc_frozen: cfg.compatibility.v1.rc_frozen,
+        v1_strict_compatibility: !cfg.compatibility.v1.allow_legacy_config_names,
+        v2_shadow_mode: cfg.compatibility.v2.shadow_mode,
+        v2_bridge_mode: cfg.compatibility.v2.bridge_mode.clone(),
+        migration_guide_path,
+        migration_guide_exists,
+        ci_provider: cfg.integrations.ci.provider.clone(),
+        ci_generic_schema: cfg.integrations.ci.generic_schema.clone(),
+        audit_schema_version: cfg.observability.audit_schema_version,
+        audit_v2_schema_version: cfg.observability.audit_v2_schema_version,
+        audit_v2_output_enabled,
+        warnings,
+        next_actions,
+    }
+}
+
+fn print_v2_readiness_report(
+    report: &V2ReadinessReport,
+    format: &str,
+) -> std::result::Result<(), String> {
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(report)
+                .map_err(|err| format!("failed to encode json: {err}"))?;
+            println!("{json}");
+        }
+        "text" => {
+            println!("patchgate policy verify-v2");
+            println!("- ready: {}", report.ready);
+            println!("- policy_path: {}", report.policy_path);
+            println!("- policy_version: {}", report.policy_version);
+            println!("- v1_rc_frozen: {}", report.v1_rc_frozen);
+            println!(
+                "- v1_strict_compatibility: {}",
+                report.v1_strict_compatibility
+            );
+            println!("- v2_shadow_mode: {}", report.v2_shadow_mode);
+            println!("- v2_bridge_mode: {}", report.v2_bridge_mode);
+            println!("- migration_guide_path: {}", report.migration_guide_path);
+            println!(
+                "- migration_guide_exists: {}",
+                report.migration_guide_exists
+            );
+            println!("- ci_provider: {}", report.ci_provider);
+            println!("- ci_generic_schema: {}", report.ci_generic_schema);
+            println!("- audit_schema_version: {}", report.audit_schema_version);
+            println!(
+                "- audit_v2_schema_version: {}",
+                report.audit_v2_schema_version
+            );
+            println!(
+                "- audit_v2_output_enabled: {}",
+                report.audit_v2_output_enabled
+            );
+            if report.warnings.is_empty() {
+                println!("- warnings: none");
+            } else {
+                println!("- warnings:");
+                for warning in &report.warnings {
+                    println!("  - {warning}");
+                }
+            }
+            println!("- next_actions:");
+            for action in &report.next_actions {
+                println!("  - {action}");
+            }
+        }
+        other => {
+            return Err(format!(
+                "unsupported --format `{other}` (expected: text|json)"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn build_contract_diff_report(
+    repo_root: &Path,
+    policy_path: &Path,
+    cfg: &Config,
+) -> ContractDiffReport {
+    let migration_guide_exists = resolve_optional_repo_path(
+        repo_root,
+        cfg.compatibility.v2.migration_guide_path.as_str(),
+    )
+    .is_some_and(|path| path.exists());
+    let v1_contract = ContractSurfaceSummary {
+        enabled: true,
+        details: vec![
+            format!("policy_version={}", cfg.policy_version),
+            format!(
+                "compatibility.v1.rc_frozen={}",
+                cfg.compatibility.v1.rc_frozen
+            ),
+            format!(
+                "compatibility.v1.allow_legacy_config_names={}",
+                cfg.compatibility.v1.allow_legacy_config_names
+            ),
+            format!("integrations.ci.provider={}", cfg.integrations.ci.provider),
+            format!(
+                "observability.audit_schema_version={}",
+                cfg.observability.audit_schema_version
+            ),
+        ],
+    };
+    let v2_contract = ContractSurfaceSummary {
+        enabled: cfg.compatibility.v2.shadow_mode || cfg.compatibility.v2.bridge_mode != "off",
+        details: vec![
+            format!(
+                "compatibility.v2.shadow_mode={}",
+                cfg.compatibility.v2.shadow_mode
+            ),
+            format!(
+                "compatibility.v2.bridge_mode={}",
+                cfg.compatibility.v2.bridge_mode
+            ),
+            format!(
+                "integrations.ci.generic_schema={}",
+                cfg.integrations.ci.generic_schema
+            ),
+            format!(
+                "observability.audit_v2_schema_version={}",
+                cfg.observability.audit_v2_schema_version
+            ),
+            format!(
+                "observability.audit_v2_jsonl_path={}",
+                if cfg.observability.audit_v2_jsonl_path.is_empty() {
+                    "<disabled>".to_string()
+                } else {
+                    cfg.observability.audit_v2_jsonl_path.clone()
+                }
+            ),
+            format!("migration_guide_exists={migration_guide_exists}"),
+        ],
+    };
+    let mut migration_delta = Vec::new();
+    migration_delta.push(format!(
+        "provider payload schema: {} -> {}",
+        "v1", cfg.integrations.ci.generic_schema
+    ));
+    migration_delta.push(format!(
+        "audit export: v{} -> v{}",
+        cfg.observability.audit_schema_version, cfg.observability.audit_v2_schema_version
+    ));
+    migration_delta.push(format!(
+        "bridge mode: off -> {}",
+        cfg.compatibility.v2.bridge_mode
+    ));
+
+    let mut next_actions = Vec::new();
+    if !cfg.compatibility.v2.shadow_mode {
+        next_actions
+            .push("Enable compatibility.v2.shadow_mode before attempting dual-run.".to_string());
+    }
+    if cfg.integrations.ci.generic_schema == "v1" {
+        next_actions.push("Switch integrations.ci.generic_schema to `v2` or `dual` for provider bridge validation.".to_string());
+    }
+    if cfg.observability.audit_v2_jsonl_path.trim().is_empty() {
+        next_actions
+            .push("Configure observability.audit_v2_jsonl_path for audit dual-write.".to_string());
+    }
+    if !migration_guide_exists {
+        next_actions.push(
+            "Add the migration guide referenced by compatibility.v2.migration_guide_path."
+                .to_string(),
+        );
+    }
+    if next_actions.is_empty() {
+        next_actions.push(
+            "Contract bridge inputs are present; continue with shadow traffic review.".to_string(),
+        );
+    }
+
+    ContractDiffReport {
+        policy_path: policy_path.display().to_string(),
+        v1_contract,
+        v2_contract,
+        migration_delta,
+        next_actions,
+    }
+}
+
+fn print_contract_diff_report(
+    report: &ContractDiffReport,
+    format: &str,
+) -> std::result::Result<(), String> {
+    match format {
+        "json" => {
+            let json = render_contract_diff_report_json(report)?;
+            println!("{json}");
+        }
+        "text" => {
+            print!("{}", render_contract_diff_report_text(report));
+        }
+        other => {
+            return Err(format!(
+                "unsupported --format `{other}` (expected: text|json)"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn render_contract_diff_report_json(
+    report: &ContractDiffReport,
+) -> std::result::Result<String, String> {
+    serde_json::to_string_pretty(report).map_err(|err| format!("failed to encode json: {err}"))
+}
+
+fn render_contract_diff_report_text(report: &ContractDiffReport) -> String {
+    let mut out = String::new();
+    out.push_str("patchgate policy diff-contract\n");
+    out.push_str(&format!("- policy_path: {}\n", report.policy_path));
+    out.push_str(&format!(
+        "- v1_contract_enabled: {}\n",
+        report.v1_contract.enabled
+    ));
+    for detail in &report.v1_contract.details {
+        out.push_str(&format!("  - v1: {detail}\n"));
+    }
+    out.push_str(&format!(
+        "- v2_contract_enabled: {}\n",
+        report.v2_contract.enabled
+    ));
+    for detail in &report.v2_contract.details {
+        out.push_str(&format!("  - v2: {detail}\n"));
+    }
+    out.push_str("- migration_delta:\n");
+    for item in &report.migration_delta {
+        out.push_str(&format!("  - {item}\n"));
+    }
+    out.push_str("- next_actions:\n");
+    for action in &report.next_actions {
+        out.push_str(&format!("  - {action}\n"));
+    }
+    out
+}
+
+fn resolve_optional_repo_path(repo_root: &Path, raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(resolve_repo_relative_path(
+            repo_root,
+            PathBuf::from(trimmed),
+        ))
     }
 }
 
@@ -2662,6 +3312,7 @@ fn execute_scan(
         profile_output,
         metrics_output,
         audit_log_output,
+        audit_log_v2_output,
         audit_actor,
         github_comment,
         github_publish,
@@ -2686,6 +3337,7 @@ fn execute_scan(
         publish,
         ci_provider,
         ci_generic_output,
+        ci_generic_schema,
         webhook_urls,
         webhook_secret_env,
         webhook_timeout_ms,
@@ -3042,11 +3694,25 @@ fn execute_scan(
                 let config_generic_output =
                     non_empty_path(cfg.integrations.ci.generic_output_path.as_str())
                         .map(|p| resolve_repo_relative_path(repo_root, p));
+                let generic_schema_mode = resolve_generic_ci_schema_mode(
+                    ci_generic_schema.as_deref(),
+                    Some(cfg.integrations.ci.generic_schema.as_str()),
+                )
+                .map_err(|err| {
+                    ScanError::with_code(
+                        ScanErrorKind::Input,
+                        FailureCode::InputInvalidOption,
+                        anyhow!(
+                            "invalid value for --ci-generic-schema / integrations.ci.generic_schema: {err}"
+                        ),
+                    )
+                })?;
                 let generic_output = ci_generic_output.clone().or(config_generic_output);
                 publish_generic_ci_payload(
                     telemetry_repo.as_str(),
                     &report,
                     &markdown,
+                    generic_schema_mode,
                     generic_output.as_deref(),
                 )
                 .map_err(|err| {
@@ -3065,6 +3731,7 @@ fn execute_scan(
         .as_ref()
         .map(|p| resolve_repo_relative_path(repo_root, p.clone()));
     let idempotency_key = build_delivery_idempotency_key(telemetry_repo.as_str(), &report);
+    let delivery_bridge = DeliveryBridgeContext::from_config(&cfg);
 
     let webhook_targets = resolve_webhook_targets(&cfg, &webhook_urls);
     if !webhook_targets.is_empty() {
@@ -3083,6 +3750,7 @@ fn execute_scan(
                 secret_env,
                 idempotency_key: idempotency_key.as_str(),
                 dead_letter_path: dead_letter_path.as_deref(),
+                bridge: delivery_bridge,
             },
             &mut profile.delivery,
         )
@@ -3117,6 +3785,7 @@ fn execute_scan(
                 timeout_ms: notify_timeout_ms.unwrap_or(cfg.integrations.notifications.timeout_ms),
                 idempotency_key: idempotency_key.as_str(),
                 dead_letter_path: dead_letter_path.as_deref(),
+                bridge: delivery_bridge,
             },
             &mut profile.delivery,
         )
@@ -3178,13 +3847,24 @@ fn execute_scan(
             non_empty_path(cfg.observability.audit_jsonl_path.as_str())
                 .map(|p| resolve_repo_relative_path(repo_root, p))
         });
+    let audit_v2_path = audit_log_v2_output
+        .as_deref()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            non_empty_path(cfg.observability.audit_v2_jsonl_path.as_str())
+                .map(|p| resolve_repo_relative_path(repo_root, p))
+        });
     append_scan_success_records(
         telemetry_repo.as_str(),
         &report,
-        metrics_path.as_deref(),
-        audit_path.as_deref(),
-        resolve_audit_actor(audit_actor.as_deref()),
-        cfg.observability.audit_schema_version,
+        ScanSuccessOutputs {
+            metrics_path: metrics_path.as_deref(),
+            audit_path: audit_path.as_deref(),
+            audit_v2_path: audit_v2_path.as_deref(),
+            actor: resolve_audit_actor(audit_actor.as_deref()),
+            audit_schema_version: cfg.observability.audit_schema_version,
+            audit_v2_schema_version: cfg.observability.audit_v2_schema_version,
+        },
     )?;
 
     Ok(gate_exit_code(&opts.mode, report.should_fail))
@@ -3193,13 +3873,10 @@ fn execute_scan(
 fn append_scan_success_records(
     telemetry_repo: &str,
     report: &Report,
-    metrics_path: Option<&Path>,
-    audit_path: Option<&Path>,
-    actor: String,
-    audit_schema_version: u8,
+    outputs: ScanSuccessOutputs<'_>,
 ) -> ScanResult<()> {
     let unix_ts = current_unix_ts();
-    if let Some(path) = metrics_path {
+    if let Some(path) = outputs.metrics_path {
         let metrics = ScanMetricRecord {
             schema_version: 1,
             unix_ts,
@@ -3231,17 +3908,17 @@ fn append_scan_success_records(
         })?;
     }
 
-    if let Some(path) = audit_path {
+    if let Some(path) = outputs.audit_path {
         let result = if report.should_fail {
             "gate_fail"
         } else {
             "pass"
         };
         let audit = AuditLogRecord {
-            schema_version: audit_schema_version,
+            schema_version: outputs.audit_schema_version,
             audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
-            actor,
+            actor: outputs.actor.clone(),
             repo: telemetry_repo.to_string(),
             target: "scan".to_string(),
             mode: report.mode.clone(),
@@ -3263,6 +3940,44 @@ fn append_scan_success_records(
         })?;
     }
 
+    if let Some(path) = outputs.audit_v2_path {
+        let result = if report.should_fail {
+            "gate_fail"
+        } else {
+            "pass"
+        };
+        let audit = AuditLogV2Record {
+            schema_version: outputs.audit_v2_schema_version,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: unix_ts,
+            actor: outputs.actor,
+            repo: telemetry_repo.to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: report.mode.clone(),
+                scope: report.scope.clone(),
+                result: result.to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(report.score),
+                threshold: Some(report.threshold),
+                changed_files: Some(report.changed_files),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: report.diagnostic_hints.clone(),
+        };
+        append_jsonl(path, &audit).map_err(|err| {
+            ScanError::with_code(
+                ScanErrorKind::Output,
+                FailureCode::OutputWriteFailed,
+                err.context("failed to append audit v2 jsonl"),
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -3274,7 +3989,9 @@ fn append_scan_failure_records(
 ) -> Result<()> {
     let mut metrics_path = scan.metrics_output.clone();
     let mut audit_path = scan.audit_log_output.clone();
+    let mut audit_v2_path = scan.audit_log_v2_output.clone();
     let mut audit_schema_version = 1u8;
+    let mut audit_v2_schema_version = 2u8;
     let mut telemetry_mode = scan.mode.clone().unwrap_or_else(|| "unknown".to_string());
     let mut telemetry_scope = scan.scope.clone().unwrap_or_else(|| "unknown".to_string());
 
@@ -3291,7 +4008,13 @@ fn append_scan_failure_records(
             audit_path = non_empty_path(loaded.config.observability.audit_jsonl_path.as_str())
                 .map(|p| resolve_repo_relative_path(repo_root, p));
         }
+        if audit_v2_path.is_none() {
+            audit_v2_path =
+                non_empty_path(loaded.config.observability.audit_v2_jsonl_path.as_str())
+                    .map(|p| resolve_repo_relative_path(repo_root, p));
+        }
         audit_schema_version = loaded.config.observability.audit_schema_version;
+        audit_v2_schema_version = loaded.config.observability.audit_v2_schema_version;
         if let Ok(opts) = resolve_scan_options(
             &loaded.config,
             None,
@@ -3332,10 +4055,10 @@ fn append_scan_failure_records(
             audit_format: "patchgate.audit.v1".to_string(),
             unix_ts,
             actor: resolve_audit_actor(scan.audit_actor.as_deref()),
-            repo: telemetry_repo,
+            repo: telemetry_repo.clone(),
             target: "scan".to_string(),
-            mode: telemetry_mode,
-            scope: telemetry_scope,
+            mode: telemetry_mode.clone(),
+            scope: telemetry_scope.clone(),
             result: "error".to_string(),
             failure_code: Some(err.code().as_str().to_string()),
             failure_category: Some(err.code().category().to_string()),
@@ -3343,6 +4066,33 @@ fn append_scan_failure_records(
             threshold: None,
             changed_files: None,
             diagnostic_hints: err.hint().map(|h| vec![h.to_string()]).unwrap_or_default(),
+        };
+        append_jsonl(path, &audit)?;
+    }
+
+    if let Some(path) = audit_v2_path.as_deref() {
+        let audit = AuditLogV2Record {
+            schema_version: audit_v2_schema_version,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: unix_ts,
+            actor: resolve_audit_actor(scan.audit_actor.as_deref()),
+            repo: telemetry_repo,
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: telemetry_mode,
+                scope: telemetry_scope,
+                result: "error".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: None,
+                threshold: None,
+                changed_files: None,
+            },
+            failure: AuditFailureV2 {
+                code: Some(err.code().as_str().to_string()),
+                category: Some(err.code().category().to_string()),
+            },
+            diagnostics: err.hint().map(|h| vec![h.to_string()]).unwrap_or_default(),
         };
         append_jsonl(path, &audit)?;
     }
@@ -3727,30 +4477,102 @@ fn resolve_ci_provider_for_publish(
     resolve_ci_provider(effective_cli_value, config_value)
 }
 
+fn resolve_generic_ci_schema_mode(
+    cli_value: Option<&str>,
+    config_value: Option<&str>,
+) -> std::result::Result<GenericCiSchemaMode, String> {
+    GenericCiSchemaMode::parse(cli_value.or(config_value))
+}
+
 fn publish_generic_ci_payload(
     telemetry_repo: &str,
     report: &Report,
     markdown: &str,
+    schema_mode: GenericCiSchemaMode,
     output_path: Option<&Path>,
 ) -> Result<()> {
     let sanitized_report = sanitize_report_for_external(report)?;
-    let payload = GenericCiPublishPayload {
-        schema_version: 1,
-        provider: "generic".to_string(),
-        repo: telemetry_repo.to_string(),
-        unix_ts: current_unix_ts(),
-        summary: GenericPublishSummary {
-            score: report.score,
-            threshold: report.threshold,
-            should_fail: report.should_fail,
-            mode: report.mode.clone(),
-            scope: report.scope.clone(),
-            findings: report.findings.len(),
-        },
-        report: sanitized_report,
-        markdown: markdown.to_string(),
+    let unix_ts = current_unix_ts();
+    let pretty = match schema_mode {
+        GenericCiSchemaMode::V1 => serde_json::to_string_pretty(&GenericCiPublishPayload {
+            schema_version: 1,
+            provider: "generic".to_string(),
+            repo: telemetry_repo.to_string(),
+            unix_ts,
+            summary: GenericPublishSummary {
+                score: report.score,
+                threshold: report.threshold,
+                should_fail: report.should_fail,
+                mode: report.mode.clone(),
+                scope: report.scope.clone(),
+                findings: report.findings.len(),
+            },
+            report: sanitized_report,
+            markdown: markdown.to_string(),
+        })?,
+        GenericCiSchemaMode::V2 => serde_json::to_string_pretty(&GenericCiPublishPayloadV2 {
+            schema_version: 2,
+            publish_format: "patchgate.provider.generic.v2".to_string(),
+            repo: telemetry_repo.to_string(),
+            emitted_at: unix_ts,
+            gate: GenericPublishGateV2 {
+                score: report.score,
+                threshold: report.threshold,
+                should_fail: report.should_fail,
+                mode: report.mode.clone(),
+                scope: report.scope.clone(),
+                findings_count: report.findings.len(),
+            },
+            artifacts: GenericPublishArtifactsV2 {
+                report: sanitized_report,
+                markdown: markdown.to_string(),
+            },
+        })?,
+        GenericCiSchemaMode::Dual => {
+            let payload_v1 = GenericCiPublishPayload {
+                schema_version: 1,
+                provider: "generic".to_string(),
+                repo: telemetry_repo.to_string(),
+                unix_ts,
+                summary: GenericPublishSummary {
+                    score: report.score,
+                    threshold: report.threshold,
+                    should_fail: report.should_fail,
+                    mode: report.mode.clone(),
+                    scope: report.scope.clone(),
+                    findings: report.findings.len(),
+                },
+                report: sanitized_report.clone(),
+                markdown: markdown.to_string(),
+            };
+            let payload_v2 = GenericCiPublishPayloadV2 {
+                schema_version: 2,
+                publish_format: "patchgate.provider.generic.v2".to_string(),
+                repo: telemetry_repo.to_string(),
+                emitted_at: unix_ts,
+                gate: GenericPublishGateV2 {
+                    score: report.score,
+                    threshold: report.threshold,
+                    should_fail: report.should_fail,
+                    mode: report.mode.clone(),
+                    scope: report.scope.clone(),
+                    findings_count: report.findings.len(),
+                },
+                artifacts: GenericPublishArtifactsV2 {
+                    report: sanitized_report,
+                    markdown: markdown.to_string(),
+                },
+            };
+            serde_json::to_string_pretty(&GenericCiPublishBridgePayload {
+                schema_version: 1,
+                bridge_format: "patchgate.provider.generic.bridge.v1".to_string(),
+                repo: telemetry_repo.to_string(),
+                emitted_at: unix_ts,
+                v1: payload_v1,
+                v2: payload_v2,
+            })?
+        }
     };
-    let pretty = serde_json::to_string_pretty(&payload)?;
     let pretty = mask_sensitive(pretty.as_str());
     let path = output_path.ok_or_else(|| {
         anyhow!(
@@ -3823,6 +4645,7 @@ struct WebhookDispatchOptions<'a> {
     secret_env: &'a str,
     idempotency_key: &'a str,
     dead_letter_path: Option<&'a Path>,
+    bridge: DeliveryBridgeContext<'a>,
 }
 
 struct NotificationDispatchOptions<'a> {
@@ -3831,6 +4654,7 @@ struct NotificationDispatchOptions<'a> {
     timeout_ms: u64,
     idempotency_key: &'a str,
     dead_letter_path: Option<&'a Path>,
+    bridge: DeliveryBridgeContext<'a>,
 }
 
 struct DeadLetterWriteOptions<'a> {
@@ -3857,6 +4681,20 @@ fn build_delivery_idempotency_key(telemetry_repo: &str, report: &Report) -> Stri
     hasher.update(report.scope.as_bytes());
     let digest = hasher.finalize();
     format!("pgv1-{}", encode_hex(digest.as_slice()))
+}
+
+fn delivery_bridge_headers(bridge: DeliveryBridgeContext<'_>) -> Vec<(&'static str, String)> {
+    if !bridge.enabled {
+        return Vec::new();
+    }
+    vec![
+        (
+            "x-patchgate-bridge-format",
+            "patchgate.delivery.v2-shadow".to_string(),
+        ),
+        ("x-patchgate-bridge-mode", bridge.bridge_mode.to_string()),
+        ("x-patchgate-shadow-mode", bridge.shadow_mode.to_string()),
+    ]
 }
 
 fn append_dead_letter(path: Option<&Path>, options: DeadLetterWriteOptions<'_>) -> Result<()> {
@@ -4319,6 +5157,13 @@ fn dispatch_signed_webhooks(
         );
         replay_headers.insert("X-Patchgate-Timestamp".to_string(), timestamp.clone());
         replay_headers.insert("X-Patchgate-Signature".to_string(), signature.clone());
+        for (name, value) in delivery_bridge_headers(options.bridge) {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value.as_str())?,
+            );
+            replay_headers.insert(header_name_to_title_case(name), value);
+        }
 
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 1..=attempts {
@@ -4400,7 +5245,8 @@ fn dispatch_notifications(
     for target in targets {
         delivery.notification_attempted += 1;
         let safe_url = redacted_endpoint(target.url.as_str());
-        let mut payload = notification_payload(target.kind, telemetry_repo, report)?;
+        let mut payload =
+            notification_payload(target.kind, telemetry_repo, report, options.bridge)?;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
                 "idempotency_key".to_string(),
@@ -4471,6 +5317,7 @@ fn notification_payload(
     kind: NotificationKind,
     telemetry_repo: &str,
     report: &Report,
+    bridge: DeliveryBridgeContext<'_>,
 ) -> Result<Value> {
     let summary = format!(
         "patchgate {}: score {}/{} (mode={}, scope={})",
@@ -4517,7 +5364,42 @@ fn notification_payload(
             },
         }),
     };
+    let payload = if bridge.enabled && matches!(kind, NotificationKind::Generic) {
+        let mut payload = payload;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "bridge".to_string(),
+                serde_json::to_value(NotificationBridgeMetadata {
+                    schema_version: 1,
+                    bridge_format: "patchgate.notification.v2-shadow",
+                    shadow_of: "scan.completed.notification",
+                    bridge_mode: bridge.bridge_mode,
+                })?,
+            );
+        }
+        payload
+    } else {
+        payload
+    };
     Ok(payload)
+}
+
+fn header_name_to_title_case(name: &str) -> String {
+    name.split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut title = String::new();
+                    title.extend(first.to_uppercase());
+                    title.push_str(chars.as_str());
+                    title
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn sanitize_report_for_external(report: &Report) -> Result<Report> {
@@ -5295,25 +6177,29 @@ mod tests {
     use patchgate_config::Config;
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
     use patchgate_github::PublishAuth;
+    use serde_json::Value;
 
     use super::{
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
-        build_delivery_idempotency_key, build_history_summary, build_history_trend,
-        changed_file_limit_fail_open_report, ci_template_catalog, detect_head_sha_from_env,
-        detect_pr_number_from_env, detect_sandbox_capabilities, gate_exit_code,
-        is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
-        notification_payload, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        publish_generic_ci_payload, recover_cache_db, redacted_endpoint, render_github_comment,
-        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
-        run_policy_verify_v1, sign_webhook_payload, sorted_findings_for_comment, write_text_atomic,
-        CiProvider, Cli, DeadLetterWriteOptions, DeliveryReplayArgs, FailureCode, NotificationKind,
-        OptionSource, PluginInitArgs, PolicyAutofix, PolicyExitCode, PolicyLintArgs,
-        PolicyVerifyV1Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
+        build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
+        build_history_trend, changed_file_limit_fail_open_report, ci_template_catalog,
+        delivery_bridge_headers, detect_head_sha_from_env, detect_pr_number_from_env,
+        detect_sandbox_capabilities, gate_exit_code, is_likely_cache_corruption,
+        load_dead_letter_jsonl, load_policy_config, notification_payload, parse_mode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, render_contract_diff_report_json,
+        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
+        sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
+        DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
+        GenericCiSchemaMode, NotificationKind, OptionSource, PluginInitArgs, PolicyAutofix,
+        PolicyDiffContractArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        PolicyVerifyV2Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
         RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
@@ -5404,6 +6290,7 @@ mod tests {
             profile_output: None,
             metrics_output: None,
             audit_log_output: None,
+            audit_log_v2_output: None,
             audit_actor: None,
             github_comment: None,
             github_publish: false,
@@ -5428,6 +6315,7 @@ mod tests {
             publish: false,
             ci_provider: None,
             ci_generic_output: None,
+            ci_generic_schema: None,
             webhook_urls: Vec::new(),
             webhook_secret_env: None,
             webhook_timeout_ms: None,
@@ -6598,6 +7486,237 @@ security_sla_hours = 72
         let _ = fs::remove_dir_all(repo_root);
     }
 
+    #[test]
+    fn policy_verify_v2_requires_shadow_bridge_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = false
+bridge_mode = "off"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_passes_with_full_bridge_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-ready-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_does_not_require_generic_schema_for_github_provider() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-github-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "github"
+generic_schema = "v1"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_diff_contract_reports_missing_bridge_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-diff-contract-missing-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v2]
+shadow_mode = false
+bridge_mode = "off"
+"#,
+        )
+        .expect("write policy");
+
+        let loaded =
+            load_policy_config(Some(policy_path.as_path()), None).expect("load policy config");
+        let report = build_contract_diff_report(&repo_root, policy_path.as_path(), &loaded.config);
+        let text = render_contract_diff_report_text(&report);
+        let json = render_contract_diff_report_json(&report).expect("render json");
+
+        assert!(!report.v2_contract.enabled);
+        assert!(text.contains("patchgate policy diff-contract"));
+        assert!(text.contains("- v2_contract_enabled: false"));
+        assert!(text.contains("Enable compatibility.v2.shadow_mode before attempting dual-run."));
+        assert!(json.contains("\"policy_path\""));
+        assert!(json.contains("\"v2_contract\""));
+        assert!(json.contains("\"next_actions\""));
+
+        let code = run_policy_diff_contract(
+            &repo_root,
+            None,
+            PolicyDiffContractArgs {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_diff_contract_succeeds_for_ready_bridge_configs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-diff-contract-ready-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let loaded =
+            load_policy_config(Some(policy_path.as_path()), None).expect("load policy config");
+        let report = build_contract_diff_report(&repo_root, policy_path.as_path(), &loaded.config);
+        let text = render_contract_diff_report_text(&report);
+
+        assert!(report.v2_contract.enabled);
+        assert!(text.contains("- v2_contract_enabled: true"));
+        assert!(text
+            .contains("Contract bridge inputs are present; continue with shadow traffic review."));
+
+        let code = run_policy_diff_contract(
+            &repo_root,
+            None,
+            PolicyDiffContractArgs {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "json".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn policy_verify_v1_strict_requires_linux_runtime_for_isolated_plugins() {
@@ -7581,8 +8700,17 @@ profile = "none"
                 skipped_by_cache: false,
             },
         );
-        let payload = notification_payload(NotificationKind::Slack, "example/repo", &report)
-            .expect("payload");
+        let payload = notification_payload(
+            NotificationKind::Slack,
+            "example/repo",
+            &report,
+            DeliveryBridgeContext {
+                enabled: false,
+                shadow_mode: false,
+                bridge_mode: "off",
+            },
+        )
+        .expect("payload");
         let findings_value = payload
             .get("attachments")
             .and_then(|v| v.as_array())
@@ -7618,20 +8746,40 @@ profile = "none"
                 skipped_by_cache: false,
             },
         );
-        let slack = notification_payload(NotificationKind::Slack, "example/repo", &report)
-            .expect("slack payload");
+        let disabled_bridge = DeliveryBridgeContext {
+            enabled: false,
+            shadow_mode: false,
+            bridge_mode: "off",
+        };
+        let slack = notification_payload(
+            NotificationKind::Slack,
+            "example/repo",
+            &report,
+            disabled_bridge,
+        )
+        .expect("slack payload");
         assert!(
             slack.get("patchgate").is_none(),
             "slack payload must avoid full report embedding"
         );
-        let teams = notification_payload(NotificationKind::Teams, "example/repo", &report)
-            .expect("teams payload");
+        let teams = notification_payload(
+            NotificationKind::Teams,
+            "example/repo",
+            &report,
+            disabled_bridge,
+        )
+        .expect("teams payload");
         assert!(
             teams.get("patchgate").is_none(),
             "teams payload must avoid full report embedding"
         );
-        let generic = notification_payload(NotificationKind::Generic, "example/repo", &report)
-            .expect("generic payload");
+        let generic = notification_payload(
+            NotificationKind::Generic,
+            "example/repo",
+            &report,
+            disabled_bridge,
+        )
+        .expect("generic payload");
         assert!(
             generic.get("report").is_none(),
             "generic payload must avoid full report embedding"
@@ -7640,6 +8788,69 @@ profile = "none"
             generic.get("summary").is_some(),
             "generic payload must include bounded summary"
         );
+    }
+
+    #[test]
+    fn notification_payload_generic_includes_bridge_metadata_in_shadow_mode() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let payload = notification_payload(
+            NotificationKind::Generic,
+            "example/repo",
+            &report,
+            DeliveryBridgeContext {
+                enabled: true,
+                shadow_mode: true,
+                bridge_mode: "full",
+            },
+        )
+        .expect("generic payload");
+        assert_eq!(
+            payload
+                .get("bridge")
+                .and_then(|value| value.get("bridge_format"))
+                .and_then(Value::as_str),
+            Some("patchgate.notification.v2-shadow")
+        );
+        assert_eq!(
+            payload
+                .get("bridge")
+                .and_then(|value| value.get("bridge_mode"))
+                .and_then(Value::as_str),
+            Some("full")
+        );
+    }
+
+    #[test]
+    fn delivery_bridge_headers_emit_shadow_metadata_when_enabled() {
+        let headers = delivery_bridge_headers(DeliveryBridgeContext {
+            enabled: true,
+            shadow_mode: true,
+            bridge_mode: "full",
+        });
+        assert_eq!(headers.len(), 3);
+        assert!(headers.iter().any(|(name, value)| {
+            *name == "x-patchgate-bridge-format" && value == "patchgate.delivery.v2-shadow"
+        }));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| *name == "x-patchgate-shadow-mode" && value == "true"));
     }
 
     #[test]
@@ -7663,8 +8874,14 @@ profile = "none"
             },
         );
 
-        let err = publish_generic_ci_payload("example/repo", &report, "md", None)
-            .expect_err("missing output path must fail");
+        let err = publish_generic_ci_payload(
+            "example/repo",
+            &report,
+            "md",
+            GenericCiSchemaMode::V1,
+            None,
+        )
+        .expect_err("missing output path must fail");
         let message = format!("{err:#}");
         assert!(message.contains("generic CI publish requires output path"));
     }
@@ -7698,14 +8915,24 @@ profile = "none"
             .diagnostic_hints
             .push("bearer super-secret-token".to_string());
 
-        publish_generic_ci_payload("example/repo", &report, "md", Some(output.as_path()))
-            .expect("publish generic payload");
+        publish_generic_ci_payload(
+            "example/repo",
+            &report,
+            "md",
+            GenericCiSchemaMode::Dual,
+            Some(output.as_path()),
+        )
+        .expect("publish generic payload");
         let written = fs::read_to_string(output).expect("read payload");
         assert!(
             !written.contains("super-secret-token"),
             "payload must not contain raw bearer token"
         );
         assert!(written.contains("bearer ***"), "payload should be masked");
+        assert!(
+            written.contains("\"bridge_format\": \"patchgate.provider.generic.bridge.v1\""),
+            "dual mode should emit bridge payload"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -7730,9 +8957,22 @@ profile = "none"
         .expect("generate template");
 
         let main_py = fs::read_to_string(output.join("main.py")).expect("main.py");
-        assert!(main_py.contains("plugin_id=sample-plugin"));
+        let readme = fs::read_to_string(output.join("README.md")).expect("README.md");
+        let sample_input =
+            fs::read_to_string(output.join("sample-input.json")).expect("sample-input.json");
+        let shadow_sample_input =
+            fs::read_to_string(output.join("sample-input.v2.json")).expect("sample-input.v2.json");
+        assert!(main_py.contains("invalid json input:"));
+        assert!(main_py.contains("payload.get('plugin_id', 'unknown')"));
         assert!(output.join("README.md").exists());
         assert!(output.join("sample-input.json").exists());
+        assert!(output.join("sample-input.v2.json").exists());
+        assert!(readme.contains("sample-input.v2.json"));
+        assert!(readme.contains("V2 shadow preview"));
+        assert!(readme.contains("plugin_id=sample-plugin"));
+        assert!(sample_input.contains("\"plugin_id\":\"sample-plugin\""));
+        assert!(shadow_sample_input.contains("\"plugin_id\":\"sample-plugin\""));
+        assert!(shadow_sample_input.contains("\"api_version\":\"patchgate.plugin.v2-shadow\""));
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -7760,10 +9000,13 @@ profile = "none"
         let index_js = fs::read_to_string(output.join("index.js")).expect("index.js");
         let sample_input =
             fs::read_to_string(output.join("sample-input.json")).expect("sample-input.json");
+        let shadow_sample_input =
+            fs::read_to_string(output.join("sample-input.v2.json")).expect("sample-input.v2.json");
         assert!(package_json.contains("\"name\": \"sample-node-plugin\""));
         assert!(index_js.contains("invalid json input:"));
         assert!(index_js.contains("payload.plugin_id ?? \"sample-node-plugin\""));
         assert!(sample_input.contains("\"plugin_id\":\"sample-node-plugin\""));
+        assert!(shadow_sample_input.contains("\"api_version\":\"patchgate.plugin.v2-shadow\""));
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -7834,6 +9077,7 @@ profile = "none"
         assert!(main_rs.contains("unwrap_or(\"sample-rust-plugin\")"));
         assert!(output.join("src/main.rs").exists());
         assert!(output.join("sample-input.json").exists());
+        assert!(output.join("sample-input.v2.json").exists());
 
         let _ = fs::remove_dir_all(repo_root);
     }

@@ -20,6 +20,8 @@ db_path = ".patchgate/cache.db"
 metrics_jsonl_path = ""
 audit_jsonl_path = ""
 audit_schema_version = 1
+audit_v2_jsonl_path = ""
+audit_v2_schema_version = 2
 
 [alerts]
 # Used by `patchgate history summary --baseline ...`
@@ -183,6 +185,7 @@ public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
 
 [integrations.ci]
 provider = "github" # github | generic
+generic_schema = "v1" # v1 | v2 | dual
 generic_output_path = ""
 
 [integrations.webhook]
@@ -212,3 +215,8 @@ false_positive_target_pct = 5
 [compatibility.v1]
 rc_frozen = true
 allow_legacy_config_names = false
+
+[compatibility.v2]
+shadow_mode = false
+bridge_mode = "off" # off | provider | audit | full
+migration_guide_path = ""

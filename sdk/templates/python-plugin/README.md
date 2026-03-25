@@ -8,6 +8,12 @@
 python3 main.py < sample-input.json
 ```
 
+V2 shadow preview:
+
+```bash
+python3 main.py < sample-input.v2.json
+```
+
 ## Output
 
 ```json

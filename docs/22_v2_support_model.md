@@ -1,0 +1,22 @@
+# V2 Support Model
+
+v2 GA 後の support / escalation ルールをまとめます。
+
+## Support bands
+
+- `critical`: service blocking / security / rollback trigger
+- `standard`: migration question / contract drift / provider compatibility
+- `advisory`: docs mismatch / template improvement / future backcast feedback
+
+## Escalation
+
+1. `compatibility-report.md` と `v1.1-readiness.md` を確認
+2. `shadow-review.md` と `fleet-review.md` で drift を切り分け
+3. `v2-rc-readiness.md` または `v2-ga-packet.md` で gate failure を確認
+4. rollback trigger に一致する場合は `bridge_mode = "off"` / `generic_schema = "v1"` へ戻す
+
+## Response expectations
+
+- critical: 24h以内に一次判断
+- standard: 3営業日以内に triage
+- advisory: 次回 roadmap review で整理

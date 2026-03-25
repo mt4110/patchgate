@@ -16,6 +16,8 @@
 - `[scope]`: `mode`, `max_changed_files`, `on_exceed`
 - `[cache]`: `enabled`, `db_path`
 - `[observability]`: metrics/audit path + schema version
+  - `audit_v2_jsonl_path`
+  - `audit_v2_schema_version`
 - `[alerts]`: summary alert threshold
 - `[exclude]`, `[generated_code]`, `[language_rules]`
 - `[weights]`
@@ -44,6 +46,7 @@
 
 - `[integrations.ci]`
   - `provider = "github" | "generic"`
+  - `generic_schema = "v1" | "v2" | "dual"`
   - `generic_output_path`（`provider = "generic"` で publish する場合は必須）
 - `[integrations.webhook]`
   - `enabled`
@@ -68,6 +71,24 @@
   - `availability_target_pct`
   - `p95_duration_ms`
   - `false_positive_target_pct`（現行実装では `gate_failure_rate_pct` を proxy 指標として判定）
+
+## Compatibility sections (Phase151+)
+
+- `[compatibility.v1]`
+  - `rc_frozen`
+  - `allow_legacy_config_names`
+- `[compatibility.v2]`
+  - `shadow_mode`
+  - `bridge_mode = "off" | "provider" | "audit" | "full"`
+  - `migration_guide_path`
+
+`compatibility.v2.bridge_mode` を `audit` / `full` にする場合は
+`observability.audit_v2_jsonl_path` が必要です
+（プレビュー用スモークテストなどで CLI フラグや bridge のランタイム上書きで注入する場合を除く）。
+`provider` / `full` の場合は `integrations.ci.generic_schema = "v2" | "dual"` が、
+完全に構成された bridge 実行では必要です
+（こちらもプレビュー実行では CLI オーバーライドで代替可能です）。
+`full` の場合は webhook / notification adapter も shadow metadata を付与します。
 
 ## Validation categories
 

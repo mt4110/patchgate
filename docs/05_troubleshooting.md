@@ -51,6 +51,13 @@
 - summary: `patchgate history summary --input ...`
 - trend: `patchgate history trend --input ...`
 - slo: `cargo run -p xtask -- ops slo-report ...`
+- compatibility: `cargo run -p xtask -- ops compatibility-report ...`
+- freeze scoreboard: `cargo run -p xtask -- ops freeze-scoreboard ...`
+- audit drift: `cargo run -p xtask -- ops audit-drift-report ...`
+- shadow review: `cargo run -p xtask -- ops shadow-review ...`
+- fleet review: `cargo run -p xtask -- ops fleet-review ...`
+- rc readiness: `cargo run -p xtask -- ops rc-readiness ...`
+- ga packet: `cargo run -p xtask -- ops ga-packet ...`
 
 ## Recovery drill
 
