@@ -643,6 +643,15 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty string when provided",
         ));
     }
+    if !cfg.compatibility.v2.migration_guide_path.is_empty()
+        && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
+    {
+        return Err(validation_error(
+            ValidationCategory::Type,
+            "compatibility.v2.migration_guide_path",
+            "must be non-empty string when provided",
+        ));
+    }
     if cfg.compatibility.v2.shadow_mode
         && cfg.compatibility.v2.bridge_mode == "off"
         && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
@@ -1550,6 +1559,32 @@ metrics_jsonl_path = "   "
             } => {
                 assert_eq!(category, ValidationCategory::Type);
                 assert_eq!(field, "observability.metrics_jsonl_path");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_reports_type_category_for_migration_guide_path_whitespace() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[compatibility.v2]
+migration_guide_path = "   "
+"#,
+        );
+
+        let err =
+            load_from_typed(&path).expect_err("must reject whitespace-only migration guide path");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation {
+                category, field, ..
+            } => {
+                assert_eq!(category, ValidationCategory::Type);
+                assert_eq!(field, "compatibility.v2.migration_guide_path");
             }
             other => panic!("unexpected error: {other}"),
         }

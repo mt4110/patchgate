@@ -461,7 +461,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -1001,21 +1001,23 @@ fn aggregate_failure_code_counts(
     failure_codes
 }
 
-fn known_failure_codes() -> BTreeSet<&'static str> {
-    BTreeSet::from([
-        "PG-IN-001",
-        "PG-CFG-001",
-        "PG-GIT-001",
-        "PG-RT-001",
-        "PG-OUT-001",
-        "PG-PUB-001",
-        "PG-PUB-002",
-        "PG-PUB-SSO-001",
-        "PG-PUB-ORG-001",
-        "PG-PUB-WEB-001",
-        "PG-NOT-001",
-        "PG-GOV-001",
-    ])
+const KNOWN_FAILURE_CODES: &[&str] = &[
+    "PG-IN-001",
+    "PG-CFG-001",
+    "PG-GIT-001",
+    "PG-RT-001",
+    "PG-OUT-001",
+    "PG-PUB-001",
+    "PG-PUB-002",
+    "PG-PUB-SSO-001",
+    "PG-PUB-ORG-001",
+    "PG-PUB-WEB-001",
+    "PG-NOT-001",
+    "PG-GOV-001",
+];
+
+fn is_known_failure_code(code: &str) -> bool {
+    KNOWN_FAILURE_CODES.contains(&code)
 }
 
 fn run_audit_report(options: &OpsOptions) -> Result<()> {
@@ -1619,7 +1621,7 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
 
     md.push_str("## Review Notes\n");
     md.push_str("- Compare event counts before promoting shadow traffic to wider rollout.\n");
-    md.push_str("- Investigate any failure drift where v2 failures exceed v1 failures.\n");
+    md.push_str("- Investigate any failure drift where v1 and v2 failure totals differ.\n");
     md.push_str("- Keep dual-write enabled until event counts and failure codes stay aligned.\n");
 
     write_output(&options.output, md.as_str())?;
@@ -1628,7 +1630,6 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
 }
 
 fn build_audit_drift_summary(audits: &[AuditLogRecord]) -> AuditDriftSummary {
-    let known_codes = known_failure_codes();
     let known_results = ["pass", "gate_fail", "error"];
     let mut unknown_failure_codes = BTreeMap::<String, usize>::new();
     let mut unknown_results = BTreeMap::<String, usize>::new();
@@ -1642,7 +1643,7 @@ fn build_audit_drift_summary(audits: &[AuditLogRecord]) -> AuditDriftSummary {
             *unknown_results.entry(row.result.clone()).or_insert(0) += 1;
         }
         if let Some(code) = row.failure_code.as_ref() {
-            if !known_codes.contains(code.as_str()) {
+            if !is_known_failure_code(code) {
                 *unknown_failure_codes.entry(code.clone()).or_insert(0) += 1;
             }
         }
@@ -1657,7 +1658,6 @@ fn build_audit_drift_summary(audits: &[AuditLogRecord]) -> AuditDriftSummary {
 }
 
 fn build_audit_v2_drift_summary(audits: &[AuditLogV2Record]) -> AuditDriftSummary {
-    let known_codes = known_failure_codes();
     let known_results = ["pass", "gate_fail", "error"];
     let mut unknown_failure_codes = BTreeMap::<String, usize>::new();
     let mut unknown_results = BTreeMap::<String, usize>::new();
@@ -1673,7 +1673,7 @@ fn build_audit_v2_drift_summary(audits: &[AuditLogV2Record]) -> AuditDriftSummar
                 .or_insert(0) += 1;
         }
         if let Some(code) = row.failure.code.as_ref() {
-            if !known_codes.contains(code.as_str()) {
+            if !is_known_failure_code(code) {
                 *unknown_failure_codes.entry(code.clone()).or_insert(0) += 1;
             }
         }
@@ -1778,7 +1778,7 @@ fn build_shadow_alignment(
     let event_delta = audits_v2.len() as isize - audits_v1.len() as isize;
     let aligned = !audits_v2.is_empty()
         && event_delta.abs() <= 1
-        && v2_failures <= v1_failures
+        && v2_failures == v1_failures
         && repo_set_match
         && mode_set_match
         && scope_set_match;
@@ -1806,7 +1806,7 @@ fn audit_drift_is_clean(drift: &AuditDriftSummary) -> bool {
         && drift
             .schema_versions
             .keys()
-            .all(|version| matches!(*version, 1 | 2))
+            .all(|version| (1..=10).contains(version))
         && drift
             .formats
             .keys()
@@ -1817,12 +1817,11 @@ fn audit_stream_contracts_are_clean(
     audits: &[AuditLogRecord],
     audits_v2: &[AuditLogV2Record],
 ) -> bool {
-    audits
-        .iter()
-        .all(|row| row.schema_version == 1 && row.audit_format == "patchgate.audit.v1")
-        && audits_v2
-            .iter()
-            .all(|row| row.schema_version == 2 && row.audit_format == "patchgate.audit.v2")
+    audits.iter().all(|row| {
+        (1..=10).contains(&row.schema_version) && row.audit_format == "patchgate.audit.v1"
+    }) && audits_v2.iter().all(|row| {
+        (2..=10).contains(&row.schema_version) && row.audit_format == "patchgate.audit.v2"
+    })
 }
 
 fn fleet_repo_posture_label(
@@ -2588,14 +2587,20 @@ fn load_release_policy_summary(path: &Path) -> Result<ReleasePolicySummary> {
         .and_then(toml::Value::as_str)
         .unwrap_or("lts/v1")
         .to_string();
-    let security_sla_hours_raw = lts
-        .and_then(|table| table.get("security_sla_hours"))
-        .and_then(toml::Value::as_integer)
-        .unwrap_or(72);
-    if !(0..=u16::MAX as i64).contains(&security_sla_hours_raw) {
+    let security_sla_hours_raw = match lts.and_then(|table| table.get("security_sla_hours")) {
+        Some(value) => value.as_integer().ok_or_else(|| {
+            anyhow!(
+                "release.lts.security_sla_hours must be an integer between 1 and {} in {}",
+                24 * 30,
+                path.display()
+            )
+        })?,
+        None => 72,
+    };
+    if !(1..=i64::from(24 * 30)).contains(&security_sla_hours_raw) {
         bail!(
-            "release.lts.security_sla_hours must be between 0 and {} in {}",
-            u16::MAX,
+            "release.lts.security_sla_hours must be between 1 and {} in {}",
+            24 * 30,
             path.display()
         );
     }
@@ -3737,6 +3742,24 @@ mod tests {
     }
 
     #[test]
+    fn audit_drift_accepts_supported_schema_version_bumps() {
+        let audits = vec![AuditLogRecord {
+            schema_version: 3,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+
+        let drift = build_audit_drift_summary(&audits);
+        assert!(audit_drift_is_clean(&drift));
+    }
+
+    #[test]
     fn combined_audit_drift_summary_includes_v2_unknowns() {
         let audits_v1 = vec![AuditLogRecord {
             schema_version: 1,
@@ -3802,7 +3825,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_alignment_requires_v2_to_not_exceed_v1_failures() {
+    fn shadow_alignment_rejects_more_v2_failures_than_v1() {
         let audits_v1 = vec![AuditLogRecord {
             schema_version: 1,
             audit_format: "patchgate.audit.v1".to_string(),
@@ -3885,6 +3908,49 @@ mod tests {
         assert_eq!(alignment.v1_failures, 1);
         assert_eq!(alignment.v2_failures, 1);
         assert!(alignment.aligned);
+    }
+
+    #[test]
+    fn shadow_alignment_rejects_failure_total_drift() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "gate_fail".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(80),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        let alignment = build_shadow_alignment(&audits_v1, &audits_v2);
+        assert_eq!(alignment.v1_failures, 1);
+        assert_eq!(alignment.v2_failures, 0);
+        assert!(!alignment.aligned);
     }
 
     #[test]
@@ -4013,6 +4079,46 @@ mod tests {
     }
 
     #[test]
+    fn audit_stream_contracts_accept_configured_schema_bumps() {
+        let audits_v1 = vec![AuditLogRecord {
+            schema_version: 3,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 4,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(95),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        assert!(audit_stream_contracts_are_clean(&audits_v1, &audits_v2));
+    }
+
+    #[test]
     fn provider_bridge_ready_requires_candidate_repo_match() {
         let metrics = vec![MetricLogRecord {
             unix_ts: 1,
@@ -4124,7 +4230,27 @@ security_sla_hours = -1
         .expect("write policy file");
 
         let err = load_release_policy_summary(&path).expect_err("negative SLA hours should fail");
-        assert!(format!("{err:#}").contains("release.lts.security_sla_hours must be between 0"));
+        assert!(format!("{err:#}").contains("release.lts.security_sla_hours must be between 1"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_release_policy_summary_rejects_non_integer_security_sla_hours() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-policy-string-sla-{seq}.toml"));
+        fs::write(
+            &path,
+            r#"[release.lts]
+active = true
+security_sla_hours = "72"
+"#,
+        )
+        .expect("write policy file");
+
+        let err =
+            load_release_policy_summary(&path).expect_err("non-integer SLA hours should fail");
+        assert!(format!("{err:#}").contains("release.lts.security_sla_hours must be an integer"));
 
         let _ = fs::remove_file(path);
     }
