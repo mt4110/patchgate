@@ -1187,7 +1187,7 @@ fn run_ga_readiness(options: &OpsOptions) -> Result<()> {
         options.p95_target_ms,
         options.false_positive_target_pct,
     );
-    let has_audit_failures = audits.iter().any(audit_v1_is_failure);
+    let has_audit_failures = audits.iter().any(audit_v1_is_execution_failure);
     let has_metrics = !metrics.is_empty();
     let has_audits = !audits.is_empty();
     let ga_ready = slo.ready && has_metrics && has_audits && !has_audit_failures;
@@ -1711,6 +1711,10 @@ fn build_combined_audit_drift_summary(
 
 fn audit_v1_is_failure(row: &AuditLogRecord) -> bool {
     row.failure_code.is_some() || matches!(row.result.as_str(), "gate_fail" | "error")
+}
+
+fn audit_v1_is_execution_failure(row: &AuditLogRecord) -> bool {
+    row.failure_code.is_some() || row.result == "error"
 }
 
 fn audit_v2_is_failure(row: &AuditLogV2Record) -> bool {
@@ -2514,11 +2518,26 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
     let mut out = Vec::new();
     for path in paths {
         let value = load_json_file::<serde_json::Value>(path)?;
-        let schema_mode = if value.get("bridge_format").is_some() {
+        let schema_mode = if value
+            .get("bridge_format")
+            .and_then(serde_json::Value::as_str)
+            == Some("patchgate.provider.generic.bridge.v1")
+            && value.get("v1").is_some()
+            && value.get("v2").is_some()
+        {
             "dual"
-        } else if value.get("publish_format").is_some() {
+        } else if value
+            .get("publish_format")
+            .and_then(serde_json::Value::as_str)
+            == Some("patchgate.provider.generic.v2")
+            && value.get("gate").is_some()
+            && value.get("artifacts").is_some()
+        {
             "v2"
-        } else if value.get("provider").is_some() {
+        } else if value.get("provider").and_then(serde_json::Value::as_str) == Some("generic")
+            && value.get("summary").is_some()
+            && value.get("report").is_some()
+        {
             "v1"
         } else {
             "unknown"
@@ -3519,6 +3538,64 @@ mod tests {
     }
 
     #[test]
+    fn ga_readiness_ignores_gate_fail_outcomes() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-ga-readiness-gate-fail-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let metrics_input = base.join("metrics.jsonl");
+        let audit_input = base.join("audit.jsonl");
+        let output = base.join("ga-readiness.md");
+        fs::write(
+            &metrics_input,
+            concat!(
+                "{\"unix_ts\":1,\"repo\":\"repo\",\"mode\":\"warn\",\"scope\":\"staged\",\"duration_ms\":10,\"score\":95,\"should_fail\":false,\"failure_code\":null}\n",
+                "{\"unix_ts\":2,\"repo\":\"repo\",\"mode\":\"warn\",\"scope\":\"staged\",\"duration_ms\":12,\"score\":94,\"should_fail\":false,\"failure_code\":null}\n"
+            ),
+        )
+        .expect("write metrics");
+        fs::write(
+            &audit_input,
+            "{\"schema_version\":1,\"audit_format\":\"patchgate.audit.v1\",\"unix_ts\":2,\"actor\":\"bot\",\"repo\":\"repo\",\"mode\":\"warn\",\"scope\":\"staged\",\"result\":\"gate_fail\",\"failure_code\":null}\n",
+        )
+        .expect("write audits");
+        let options = OpsOptions {
+            subcommand: OpsSubcommand::GaReadiness,
+            metrics_input,
+            audit_input,
+            audit_v2_input: None,
+            output: output.clone(),
+            trend_output: None,
+            replay_summary_input: None,
+            provider_inputs: Vec::new(),
+            bundle_catalog_input: None,
+            registry_input: None,
+            exceptions_input: None,
+            benchmark_input: None,
+            security_review_input: None,
+            policy_input: None,
+            migration_guide_path: None,
+            provider_rollout_path: None,
+            candidate_checklist_path: None,
+            ops_handbook_path: None,
+            support_model_path: None,
+            sunset_notice_path: None,
+            phase201_backcast_path: None,
+            cost_ceiling_minutes: None,
+            availability_target_pct: 99,
+            p95_target_ms: 1_500,
+            false_positive_target_pct: 5,
+        };
+
+        run_ga_readiness(&options).expect("ga readiness should ignore gate_fail outcomes");
+
+        let markdown = fs::read_to_string(PathBuf::from(&output)).expect("read output");
+        assert!(markdown.contains("- ga_ready: true"));
+        assert!(markdown.contains("- [x] Audit failures absent: true"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn verify_v1_calibration_recommends_lts_for_high_stability() {
         let metrics = vec![
             MetricLogRecord {
@@ -4297,7 +4374,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("xtask-provider-{seq}.json"));
         fs::write(
             &path,
-            r#"{"schema_version":1,"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"example/repo"}"#,
+            r#"{"schema_version":1,"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"example/repo","v1":{"provider":"generic"},"v2":{"publish_format":"patchgate.provider.generic.v2"}}"#,
         )
         .expect("write provider payload");
 
@@ -4305,6 +4382,23 @@ mod tests {
             .expect("summarize provider inputs");
         assert_eq!(summaries[0].schema_mode, "dual");
         assert_eq!(summaries[0].repo, "example/repo");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn summarize_provider_inputs_rejects_invalid_v2_contract_shape() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-provider-invalid-{seq}.json"));
+        fs::write(
+            &path,
+            r#"{"publish_format":"not-a-patchgate-contract","repo":"example/repo"}"#,
+        )
+        .expect("write malformed provider payload");
+
+        let summaries = summarize_provider_inputs(std::slice::from_ref(&path))
+            .expect("summarize provider inputs");
+        assert_eq!(summaries[0].schema_mode, "unknown");
 
         let _ = fs::remove_file(path);
     }

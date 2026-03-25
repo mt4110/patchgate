@@ -83,8 +83,11 @@
   - `migration_guide_path`
 
 `compatibility.v2.bridge_mode` を `audit` / `full` にする場合は
-`observability.audit_v2_jsonl_path` が必要です。
-`provider` / `full` の場合は `integrations.ci.generic_schema = "v2" | "dual"` が必要です。
+`observability.audit_v2_jsonl_path` が必要です
+（プレビュー用スモークテストなどで CLI フラグや bridge のランタイム上書きで注入する場合を除く）。
+`provider` / `full` の場合は `integrations.ci.generic_schema = "v2" | "dual"` が、
+完全に構成された bridge 実行では必要です
+（こちらもプレビュー実行では CLI オーバーライドで代替可能です）。
 `full` の場合は webhook / notification adapter も shadow metadata を付与します。
 
 ## Validation categories

@@ -1376,7 +1376,13 @@ fn render_plugin_template(
     let project_name = derive_project_name(plugin_id);
     match lang {
         PluginTemplateLang::Python => vec![
-            ("README.md", PYTHON_TEMPLATE_README.to_string()),
+            (
+                "README.md",
+                render_embedded_template(
+                    PYTHON_TEMPLATE_README,
+                    &[("plugin_id=sample", &format!("plugin_id={plugin_id}"))],
+                ),
+            ),
             (
                 "sample-input.json",
                 render_plugin_sample_input(PYTHON_TEMPLATE_SAMPLE_INPUT, plugin_id),
@@ -8844,6 +8850,7 @@ profile = "none"
         assert!(output.join("sample-input.v2.json").exists());
         assert!(readme.contains("sample-input.v2.json"));
         assert!(readme.contains("V2 shadow preview"));
+        assert!(readme.contains("plugin_id=sample-plugin"));
         assert!(sample_input.contains("\"plugin_id\":\"sample-plugin\""));
         assert!(shadow_sample_input.contains("\"plugin_id\":\"sample-plugin\""));
         assert!(shadow_sample_input.contains("\"api_version\":\"patchgate.plugin.v2-shadow\""));
