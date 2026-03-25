@@ -653,13 +653,12 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
         ));
     }
     if cfg.compatibility.v2.shadow_mode
-        && cfg.compatibility.v2.bridge_mode == "off"
         && cfg.compatibility.v2.migration_guide_path.trim().is_empty()
     {
         return Err(validation_error(
             ValidationCategory::Dependency,
             "compatibility.v2",
-            "shadow_mode requires bridge_mode != \"off\" or a non-empty migration_guide_path to document the rollout",
+            "shadow_mode requires a non-empty migration_guide_path to document the rollout",
         ));
     }
     if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {
@@ -1389,6 +1388,7 @@ generic_schema = "bridge"
 [compatibility.v2]
 shadow_mode = true
 bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
 [integrations.ci]
 generic_schema = "v1"
 "#,
@@ -1397,6 +1397,33 @@ generic_schema = "v1"
         let loaded = load_from_typed(&path).expect("cli overrides may satisfy bridge outputs");
         assert_eq!(loaded.compatibility.v2.bridge_mode, "full");
         assert_eq!(loaded.integrations.ci.generic_schema, "v1");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_requires_migration_guide_path_when_shadow_mode_enabled() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+"#,
+        );
+
+        let err = load_from_typed(&path)
+            .expect_err("must reject shadow mode without a migration guide path");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation {
+                category, field, ..
+            } => {
+                assert_eq!(category, ValidationCategory::Dependency);
+                assert_eq!(field, "compatibility.v2");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
 
         let _ = fs::remove_file(path);
     }

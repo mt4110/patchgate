@@ -32,8 +32,8 @@ use patchgate_config::{
     POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
-    CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority, Runner, ScopeMode,
-    Severity,
+    failure_codes, CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority,
+    Runner, ScopeMode, Severity,
 };
 
 #[derive(Parser, Debug)]
@@ -551,18 +551,18 @@ enum FailureCode {
 impl FailureCode {
     fn as_str(self) -> &'static str {
         match self {
-            FailureCode::InputInvalidOption => "PG-IN-001",
-            FailureCode::ConfigLoadFailed => "PG-CFG-001",
-            FailureCode::GitDiffFailed => "PG-GIT-001",
-            FailureCode::RuntimeEvaluationFailed => "PG-RT-001",
-            FailureCode::OutputWriteFailed => "PG-OUT-001",
-            FailureCode::PublishInputFailed => "PG-PUB-001",
-            FailureCode::PublishApiFailed => "PG-PUB-002",
-            FailureCode::PublishSsoRequired => "PG-PUB-SSO-001",
-            FailureCode::PublishOrgPolicyBlocked => "PG-PUB-ORG-001",
-            FailureCode::PublishWebhookFailed => "PG-PUB-WEB-001",
-            FailureCode::NotificationFailed => "PG-NOT-001",
-            FailureCode::WaiverExpired => "PG-GOV-001",
+            FailureCode::InputInvalidOption => failure_codes::INPUT_INVALID_OPTION,
+            FailureCode::ConfigLoadFailed => failure_codes::CONFIG_LOAD_FAILED,
+            FailureCode::GitDiffFailed => failure_codes::GIT_DIFF_FAILED,
+            FailureCode::RuntimeEvaluationFailed => failure_codes::RUNTIME_EVALUATION_FAILED,
+            FailureCode::OutputWriteFailed => failure_codes::OUTPUT_WRITE_FAILED,
+            FailureCode::PublishInputFailed => failure_codes::PUBLISH_INPUT_FAILED,
+            FailureCode::PublishApiFailed => failure_codes::PUBLISH_API_FAILED,
+            FailureCode::PublishSsoRequired => failure_codes::PUBLISH_SSO_REQUIRED,
+            FailureCode::PublishOrgPolicyBlocked => failure_codes::PUBLISH_ORG_POLICY_BLOCKED,
+            FailureCode::PublishWebhookFailed => failure_codes::PUBLISH_WEBHOOK_FAILED,
+            FailureCode::NotificationFailed => failure_codes::NOTIFICATION_FAILED,
+            FailureCode::WaiverExpired => failure_codes::WAIVER_EXPIRED,
         }
     }
 
@@ -2590,29 +2590,11 @@ fn print_contract_diff_report(
 ) -> std::result::Result<(), String> {
     match format {
         "json" => {
-            let json = serde_json::to_string_pretty(report)
-                .map_err(|err| format!("failed to encode json: {err}"))?;
+            let json = render_contract_diff_report_json(report)?;
             println!("{json}");
         }
         "text" => {
-            println!("patchgate policy diff-contract");
-            println!("- policy_path: {}", report.policy_path);
-            println!("- v1_contract_enabled: {}", report.v1_contract.enabled);
-            for detail in &report.v1_contract.details {
-                println!("  - v1: {detail}");
-            }
-            println!("- v2_contract_enabled: {}", report.v2_contract.enabled);
-            for detail in &report.v2_contract.details {
-                println!("  - v2: {detail}");
-            }
-            println!("- migration_delta:");
-            for item in &report.migration_delta {
-                println!("  - {item}");
-            }
-            println!("- next_actions:");
-            for action in &report.next_actions {
-                println!("  - {action}");
-            }
+            print!("{}", render_contract_diff_report_text(report));
         }
         other => {
             return Err(format!(
@@ -2621,6 +2603,41 @@ fn print_contract_diff_report(
         }
     }
     Ok(())
+}
+
+fn render_contract_diff_report_json(
+    report: &ContractDiffReport,
+) -> std::result::Result<String, String> {
+    serde_json::to_string_pretty(report).map_err(|err| format!("failed to encode json: {err}"))
+}
+
+fn render_contract_diff_report_text(report: &ContractDiffReport) -> String {
+    let mut out = String::new();
+    out.push_str("patchgate policy diff-contract\n");
+    out.push_str(&format!("- policy_path: {}\n", report.policy_path));
+    out.push_str(&format!(
+        "- v1_contract_enabled: {}\n",
+        report.v1_contract.enabled
+    ));
+    for detail in &report.v1_contract.details {
+        out.push_str(&format!("  - v1: {detail}\n"));
+    }
+    out.push_str(&format!(
+        "- v2_contract_enabled: {}\n",
+        report.v2_contract.enabled
+    ));
+    for detail in &report.v2_contract.details {
+        out.push_str(&format!("  - v2: {detail}\n"));
+    }
+    out.push_str("- migration_delta:\n");
+    for item in &report.migration_delta {
+        out.push_str(&format!("  - {item}\n"));
+    }
+    out.push_str("- next_actions:\n");
+    for action in &report.next_actions {
+        out.push_str(&format!("  - {action}\n"));
+    }
+    out
 }
 
 fn resolve_optional_repo_path(repo_root: &Path, raw: &str) -> Option<PathBuf> {
@@ -6165,24 +6182,25 @@ mod tests {
     use super::{
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
-        build_delivery_idempotency_key, build_history_summary, build_history_trend,
-        changed_file_limit_fail_open_report, ci_template_catalog, delivery_bridge_headers,
-        detect_head_sha_from_env, detect_pr_number_from_env, detect_sandbox_capabilities,
-        gate_exit_code, is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
-        notification_payload, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        publish_generic_ci_payload, recover_cache_db, redacted_endpoint, render_github_comment,
-        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init, run_policy_lint,
-        run_policy_verify_v1, run_policy_verify_v2, sign_webhook_payload,
-        sorted_findings_for_comment, write_text_atomic, CiProvider, Cli, DeadLetterWriteOptions,
-        DeliveryBridgeContext, DeliveryReplayArgs, FailureCode, GenericCiSchemaMode,
-        NotificationKind, OptionSource, PluginInitArgs, PolicyAutofix, PolicyExitCode,
-        PolicyLintArgs, PolicyVerifyV1Args, PolicyVerifyV2Args, PublishRequestInput,
-        ReadinessProfile, ResolvedScanOptions, RetryPolicy, ScanArgs, ScanError, ScanErrorKind,
-        ScanMetricRecord, ScopeMode,
+        build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
+        build_history_trend, changed_file_limit_fail_open_report, ci_template_catalog,
+        delivery_bridge_headers, detect_head_sha_from_env, detect_pr_number_from_env,
+        detect_sandbox_capabilities, gate_exit_code, is_likely_cache_corruption,
+        load_dead_letter_jsonl, load_policy_config, notification_payload, parse_mode,
+        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, render_contract_diff_report_json,
+        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
+        sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
+        DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
+        GenericCiSchemaMode, NotificationKind, OptionSource, PluginInitArgs, PolicyAutofix,
+        PolicyDiffContractArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
+        PolicyVerifyV2Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
+        RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -7591,6 +7609,107 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_diff_contract_reports_missing_bridge_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-diff-contract-missing-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[compatibility.v2]
+shadow_mode = false
+bridge_mode = "off"
+"#,
+        )
+        .expect("write policy");
+
+        let loaded =
+            load_policy_config(Some(policy_path.as_path()), None).expect("load policy config");
+        let report = build_contract_diff_report(&repo_root, policy_path.as_path(), &loaded.config);
+        let text = render_contract_diff_report_text(&report);
+        let json = render_contract_diff_report_json(&report).expect("render json");
+
+        assert!(!report.v2_contract.enabled);
+        assert!(text.contains("patchgate policy diff-contract"));
+        assert!(text.contains("- v2_contract_enabled: false"));
+        assert!(text.contains("Enable compatibility.v2.shadow_mode before attempting dual-run."));
+        assert!(json.contains("\"policy_path\""));
+        assert!(json.contains("\"v2_contract\""));
+        assert!(json.contains("\"next_actions\""));
+
+        let code = run_policy_diff_contract(
+            &repo_root,
+            None,
+            PolicyDiffContractArgs {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_diff_contract_succeeds_for_ready_bridge_configs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-diff-contract-ready-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let loaded =
+            load_policy_config(Some(policy_path.as_path()), None).expect("load policy config");
+        let report = build_contract_diff_report(&repo_root, policy_path.as_path(), &loaded.config);
+        let text = render_contract_diff_report_text(&report);
+
+        assert!(report.v2_contract.enabled);
+        assert!(text.contains("- v2_contract_enabled: true"));
+        assert!(text
+            .contains("Contract bridge inputs are present; continue with shadow traffic review."));
+
+        let code = run_policy_diff_contract(
+            &repo_root,
+            None,
+            PolicyDiffContractArgs {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "json".to_string(),
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);

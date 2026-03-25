@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use patchgate_core::failure_codes::KNOWN_FAILURE_CODES;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CASE: &str = "default-worktree";
@@ -1000,21 +1001,6 @@ fn aggregate_failure_code_counts(
 
     failure_codes
 }
-
-const KNOWN_FAILURE_CODES: &[&str] = &[
-    "PG-IN-001",
-    "PG-CFG-001",
-    "PG-GIT-001",
-    "PG-RT-001",
-    "PG-OUT-001",
-    "PG-PUB-001",
-    "PG-PUB-002",
-    "PG-PUB-SSO-001",
-    "PG-PUB-ORG-001",
-    "PG-PUB-WEB-001",
-    "PG-NOT-001",
-    "PG-GOV-001",
-];
 
 fn is_known_failure_code(code: &str) -> bool {
     KNOWN_FAILURE_CODES.contains(&code)

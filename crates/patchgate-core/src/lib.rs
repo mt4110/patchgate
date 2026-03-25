@@ -1,3 +1,4 @@
+pub mod failure_codes;
 pub mod model;
 pub mod runner;
 

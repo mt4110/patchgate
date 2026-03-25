@@ -343,12 +343,14 @@ policy_version = 2
 [compatibility.v2]
 shadow_mode = true
 bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
 
 [integrations.ci]
 provider = "generic"
 generic_schema = "v1"
 "#,
     )?;
+    repo.write_file("docs/v2-migration-alpha.md", "# v2 migration\n")?;
     repo.append_line(
         "src/lib.rs",
         "pub fn changed_for_bridge_override() -> i32 { 13 }",
