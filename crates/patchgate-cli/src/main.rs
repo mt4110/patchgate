@@ -2335,6 +2335,7 @@ fn build_v2_readiness_report(
         resolve_optional_repo_path(repo_root, migration_guide_path.as_str())
             .is_some_and(|path| path.exists());
     let bridge_mode = cfg.compatibility.v2.bridge_mode.as_str();
+    let uses_generic_provider = cfg.integrations.ci.provider == "generic";
     let audit_v2_output_enabled = !cfg.observability.audit_v2_jsonl_path.trim().is_empty();
 
     if !cfg.compatibility.v1.rc_frozen {
@@ -2358,7 +2359,10 @@ fn build_v2_readiness_report(
         next_actions
             .push("Use bridge_mode=provider|audit|full before claiming v2 readiness.".to_string());
     }
-    if matches!(bridge_mode, "provider" | "full") && cfg.integrations.ci.generic_schema == "v1" {
+    if uses_generic_provider
+        && matches!(bridge_mode, "provider" | "full")
+        && cfg.integrations.ci.generic_schema == "v1"
+    {
         warnings
             .push("provider bridge requires integrations.ci.generic_schema=v2|dual".to_string());
         next_actions.push("Switch integrations.ci.generic_schema to `v2` or `dual`.".to_string());
@@ -2378,7 +2382,8 @@ fn build_v2_readiness_report(
         && !cfg.compatibility.v1.allow_legacy_config_names
         && cfg.compatibility.v2.shadow_mode
         && bridge_mode != "off"
-        && (!matches!(bridge_mode, "provider" | "full")
+        && (!uses_generic_provider
+            || !matches!(bridge_mode, "provider" | "full")
             || cfg.integrations.ci.generic_schema != "v1")
         && (!matches!(bridge_mode, "audit" | "full") || audit_v2_output_enabled)
         && migration_guide_exists;
@@ -7482,6 +7487,53 @@ audit_v2_schema_version = 2
 [integrations.ci]
 provider = "generic"
 generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_does_not_require_generic_schema_for_github_provider() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-github-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "github"
+generic_schema = "v1"
 [compatibility.v1]
 rc_frozen = true
 allow_legacy_config_names = false
