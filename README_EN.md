@@ -15,6 +15,8 @@ It computes a single score (0-100) from:
 
 ## Quickstart
 
+Run the commands below **inside the `nix develop` shell**.
+
 ```bash
 nix develop
 cargo run -p patchgate-cli -- scan --mode warn
@@ -34,9 +36,19 @@ GITHUB_TOKEN=... cargo run -p patchgate-cli -- scan --github-publish
 
 ## Policy file
 
+Copy `config/policy.toml.example` into the **target project root** as `policy.toml`.
+
 ```bash
-cp config/policy.toml.example policy.toml
+cp config/policy.toml.example /path/to/project_root/policy.toml
 ```
+
+If you want to keep the policy local to that project, add it to `.gitignore` as well.
+
+```bash
+printf '\n/policy.toml\n' >> /path/to/project_root/.gitignore
+```
+
+The expected workflow is to run `patchgate` while still inside the `nix develop` shell.
 
 ## CLI
 

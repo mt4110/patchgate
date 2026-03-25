@@ -17,6 +17,8 @@
 
 ## クイックスタート
 
+以下のコマンドは、**必ず `nix develop` に入ったシェルの中で実行**してください。
+
 ```bash
 # Nix shell
 nix develop
@@ -33,11 +35,20 @@ cargo run -p patchgate-cli -- scan --format json
 
 ## policy.toml
 
-`config/policy.toml.example` をコピーして `policy.toml` として使います。
+`config/policy.toml.example` を、`patchgate` を適用したい**対象プロジェクトのルート**へ
+`policy.toml` として配置して使います。
 
 ```bash
-cp config/policy.toml.example policy.toml
+cp config/policy.toml.example /path/to/project_root/policy.toml
 ```
+
+対象プロジェクトでローカル管理にしたい場合は、`.gitignore` にも追加してください。
+
+```bash
+printf '\n/policy.toml\n' >> /path/to/project_root/.gitignore
+```
+
+`patchgate` の実行も、`nix develop` に入った状態で行う前提です。
 
 ## CLI
 
