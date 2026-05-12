@@ -664,7 +664,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
     if cfg.plugins.signature.required && !plugin_signature_has_any_key_env(&cfg.plugins.signature) {
         return Err(validation_error(
             ValidationCategory::Dependency,
-            "plugins.signature.public_key_env",
+            "plugins.signature",
             "must be non-empty or trusted_key_envs must contain at least one env when `plugins.signature.required = true`",
         ));
     }
@@ -1502,7 +1502,7 @@ public_key_env = "   "
         assert_eq!(err.category(), Some(ValidationCategory::Dependency));
         match err {
             ConfigError::Validation { field, .. } => {
-                assert_eq!(field, "plugins.signature.public_key_env")
+                assert_eq!(field, "plugins.signature")
             }
             other => panic!("unexpected error: {other}"),
         }

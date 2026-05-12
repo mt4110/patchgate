@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3084,12 +3084,21 @@ fn write_output(path: &Path, content: &str) -> Result<()> {
 }
 
 fn write_jsonl_output<T: Serialize>(path: &Path, records: &[T]) -> Result<()> {
-    let mut content = String::new();
-    for record in records {
-        content.push_str(serde_json::to_string(record)?.as_str());
-        content.push('\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    write_output(path, content.as_str())
+    let file = fs::File::create(path).with_context(|| format!("write {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        serde_json::to_writer(&mut writer, record)
+            .with_context(|| format!("encode JSONL record for {}", path.display()))?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))
 }
 
 struct SyntheticRepo {

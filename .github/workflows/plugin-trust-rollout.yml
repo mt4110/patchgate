@@ -8,7 +8,7 @@ on:
         required: true
         default: config/policy.toml.example
       require_next_key:
-        description: Require PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT for rotation dry-run
+        description: Require at least one trusted key env for rotation dry-run
         required: true
         type: boolean
         default: false
@@ -42,10 +42,35 @@ jobs:
           import hashlib
           import os
           import sys
+          import tomllib
 
-          required = ["PATCHGATE_PLUGIN_PUBLIC_KEY"]
-          if os.environ.get("REQUIRE_NEXT_KEY") == "true":
-              required.append("PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT")
+          policy_path = os.environ["POLICY_PATH"]
+          with open(policy_path, "rb") as handle:
+              policy = tomllib.load(handle)
+
+          signature = policy.get("plugins", {}).get("signature", {})
+          signature_required = bool(signature.get("required", False))
+          primary = str(signature.get("public_key_env", "PATCHGATE_PLUGIN_PUBLIC_KEY")).strip()
+          trusted = [
+              str(name).strip()
+              for name in signature.get("trusted_key_envs", [])
+              if str(name).strip()
+          ]
+          require_next_key = os.environ.get("REQUIRE_NEXT_KEY") == "true"
+
+          required = []
+          if signature_required or require_next_key:
+              for name in [primary, *trusted]:
+                  if name and name not in required:
+                      required.append(name)
+
+          if require_next_key and not trusted:
+              print("::error::require_next_key was set, but policy has no plugins.signature.trusted_key_envs entries")
+              sys.exit(1)
+
+          if not required:
+              print("plugin signature is not required by policy; skipping keyring secret validation")
+              sys.exit(0)
 
           failed = False
           for name in required:

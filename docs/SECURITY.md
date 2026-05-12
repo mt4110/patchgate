@@ -3,7 +3,7 @@
 Purpose: セキュリティポリシーと脆弱性報告の運用基準を定義します。
 
 - Status: Active
-- Last verified: 2026-03-20
+- Last verified: 2026-05-13
 
 ## Supported versions
 
