@@ -40,7 +40,9 @@
   - `max_stdout_kib`
 - `[plugins.signature]`
   - `required`
-  - `public_key_env`（ed25519 public key を base64 で渡す環境変数名）
+  - `public_key_env`（ed25519 public key を base64 で渡す主環境変数名）
+  - `trusted_key_envs`（rotation期間に追加で信頼する公開鍵env名）
+  - `revoked_key_sha256`（失効した公開鍵の raw ed25519 public key sha256 hex）
 
 ## Integration sections (Phase85-87)
 

@@ -94,6 +94,13 @@ Provider/Webhook/Notification options:
 - `--summary-output <path>` (replay結果のJSON summaryを書き出し)
 - `--dry-run`
 
+### `cargo run -p xtask -- ops siem-handoff`
+
+- `--audit-v2-input <scan-audit-v2.jsonl>`
+- `--output <siem-handoff.jsonl>`
+- `patchgate.audit.v2` をSIEM ingest向けのflat JSONLへ正規化
+- 入力が audit v2 contract 外の場合は失敗
+
 ### `patchgate policy lint`
 
 - `--path <file>`
@@ -158,6 +165,7 @@ Provider/Webhook/Notification options:
 - Metrics (`schema_version=1`): repo/mode/scope/duration/score/failure code
 - Audit (`patchgate.audit.v1`): actor/target/result/failure code
 - Audit v2 (`patchgate.audit.v2`): operation/gate/failure/diagnostics を構造化出力
+- SIEM handoff (`schema_version=1`): audit v2 を event_kind/source_format/source_schema_version/severity/failure_code つきのflat JSONLへ変換
 
 ## Failure codes
 

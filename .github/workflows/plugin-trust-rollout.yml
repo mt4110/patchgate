@@ -1,0 +1,76 @@
+name: Plugin Trust Rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      policy_path:
+        description: Policy file to validate
+        required: true
+        default: config/policy.toml.example
+      require_next_key:
+        description: Require PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT for rotation dry-run
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  keyring-audit:
+    runs-on: ubuntu-latest
+    env:
+      PATCHGATE_PLUGIN_PUBLIC_KEY: ${{ secrets.PATCHGATE_PLUGIN_PUBLIC_KEY }}
+      PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT: ${{ secrets.PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT }}
+      POLICY_PATH: ${{ inputs.policy_path }}
+      REQUIRE_NEXT_KEY: ${{ inputs.require_next_key }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate policy
+        run: |
+          cargo run -p patchgate-cli -- policy lint \
+            --path "$POLICY_PATH" \
+            --require-current-version
+
+      - name: Validate plugin keyring secrets
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import sys
+
+          required = ["PATCHGATE_PLUGIN_PUBLIC_KEY"]
+          if os.environ.get("REQUIRE_NEXT_KEY") == "true":
+              required.append("PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT")
+
+          failed = False
+          for name in required:
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  print(f"::error::{name} is not configured")
+                  failed = True
+                  continue
+              try:
+                  raw = base64.b64decode(value, validate=True)
+              except Exception as exc:
+                  print(f"::error::{name} is not valid base64: {exc}")
+                  failed = True
+                  continue
+              if len(raw) != 32:
+                  print(f"::error::{name} decoded length is {len(raw)} bytes, expected 32")
+                  failed = True
+                  continue
+              print(f"{name}: sha256={hashlib.sha256(raw).hexdigest()}")
+
+          if failed:
+              sys.exit(1)
+          PY
+
+      - name: Run plugin trust tests
+        run: |
+          cargo test -p patchgate-config --lib
+          cargo test -p patchgate-core plugin_signature_verification

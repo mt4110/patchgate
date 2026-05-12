@@ -12,9 +12,10 @@
    - PR109/117/118相当: release provenance artifact + precheck検証 + LTS SLA age check
    - PR103/107/111-120相当: contract test / calibration / replay / readiness hardening まで baseline完了
 2. 設計済み（フォローアップ管理用）:
-   - [PR Plan: Phase101-110](../phase101_110.md)
-   - [PR Plan: Phase111-120](../phase111_120.md)
-   - [PR Plan: Phase121-130](../phase121_130.md)
+   - 詳細PR Planは private archive へ移動済みのため、公開docsからはリンクしない
+   - PR Plan: Phase101-110（private archive: `.private_docs/phase101_110.md`）
+   - PR Plan: Phase111-120（private archive: `.private_docs/phase111_120.md`）
+   - PR Plan: Phase121-130（private archive: `.private_docs/phase121_130.md`）
 3. したがって現時点は「Phase101-120のベースライン実装完了」かつ「Phase121-130の先行実装着手」
 
 ## ソフトウェアのゴール（現フェーズ）
@@ -64,6 +65,8 @@
      - `.github/workflows/*`
    - 完了判定:
      - 鍵ローテーションと失効手順が workflow / docs / validation に接続される
+   - 進捗:
+     - `trusted_key_envs` / `revoked_key_sha256` と plugin trust rollout workflow を追加済み
 
 ## 実装ごとのテストゲート（毎回必須）
 

@@ -739,6 +739,10 @@ pub struct PluginSignatureConfig {
     pub required: bool,
     #[serde(default = "default_plugin_public_key_env")]
     pub public_key_env: String,
+    #[serde(default)]
+    pub trusted_key_envs: Vec<String>,
+    #[serde(default)]
+    pub revoked_key_sha256: Vec<String>,
 }
 
 impl Default for PluginSignatureConfig {
@@ -746,6 +750,8 @@ impl Default for PluginSignatureConfig {
         Self {
             required: default_false(),
             public_key_env: default_plugin_public_key_env(),
+            trusted_key_envs: Vec::new(),
+            revoked_key_sha256: Vec::new(),
         }
     }
 }

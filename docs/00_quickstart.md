@@ -45,6 +45,7 @@ patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.
 - Freeze scoreboard: `cargo run -p xtask -- ops freeze-scoreboard --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/v1.1-readiness.md`
 - V2 readiness: `patchgate policy verify-v2 --path policy.toml --format text`
 - Fleet review: `cargo run -p xtask -- ops fleet-review --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/fleet-review.md`
+- SIEM handoff: `cargo run -p xtask -- ops siem-handoff --audit-v2-input artifacts/scan-audit-v2.jsonl --output artifacts/siem-handoff.jsonl`
 - RC/GA packets: `cargo run -p xtask -- ops rc-readiness ...` / `cargo run -p xtask -- ops ga-packet ...`
 
 ## 7) SDK template

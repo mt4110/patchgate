@@ -14,6 +14,7 @@ patchgate scan \
 
 `policy.toml` 側で `plugins.enabled = true` と `plugins.entries[]` を設定します。
 署名検証を有効にする場合は `[plugins.signature] required = true` と `entries[].signature_path` を設定します。
+鍵rotation中は `plugins.signature.trusted_key_envs` に新鍵envを追加し、失効時は `plugins.signature.revoked_key_sha256` に公開鍵fingerprintを追加します。
 
 ### Pluginテンプレートを生成
 
@@ -101,6 +102,16 @@ cargo run -p xtask -- ops audit-drift-report \
   --audit-input artifacts/scan-audit.jsonl \
   --output artifacts/audit-drift-report.md
 ```
+
+### SIEM handoff JSONL を生成
+
+```bash
+cargo run -p xtask -- ops siem-handoff \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --output artifacts/siem-handoff.jsonl
+```
+
+出力は `patchgate.audit.v2` をSIEM投入しやすい flat JSONL に正規化します。GitHub Actionsでは `.github/workflows/siem-handoff.yml` を参照実装として使えます。
 
 ### `verify-v1` の safe autofix preview を出力
 

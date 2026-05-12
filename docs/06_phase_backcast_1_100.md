@@ -65,14 +65,17 @@ Phase1-20 で先に固める対象:
 
 - [PR Plan: Phase1-10](07_pr_plan_phase1_10.md)
 - [PR Plan: Phase11-20](08_pr_plan_phase11_20.md)
-- [PR Plan: Phase21-30](../phase21_30.md)
-- [PR Plan: Phase31-40](../phase31_40.md)
-- [PR Plan: Phase41-50](../phase41_50.md)
-- [PR Plan: Phase51-60](../phase51_60.md)
-- [PR Plan: Phase61-70](../phase61_70.md)
-- [PR Plan: Phase71-80](../phase71_80.md)
-- [PR Plan: Phase81-90](../phase81_90.md)
-- [PR Plan: Phase91-100](../phase91_100.md)
+
+Phase21以降の詳細PR Planは private archive へ移動済みのため、公開docsからはリンクしません。
+
+- PR Plan: Phase21-30（private archive: `.private_docs/phase21_30.md`）
+- PR Plan: Phase31-40（private archive: `.private_docs/phase31_40.md`）
+- PR Plan: Phase41-50（private archive: `.private_docs/phase41_50.md`）
+- PR Plan: Phase51-60（private archive: `.private_docs/phase51_60.md`）
+- PR Plan: Phase61-70（private archive: `.private_docs/phase61_70.md`）
+- PR Plan: Phase71-80（private archive: `.private_docs/phase71_80.md`）
+- PR Plan: Phase81-90（private archive: `.private_docs/phase81_90.md`）
+- PR Plan: Phase91-100（private archive: `.private_docs/phase91_100.md`）
 
 ## Phase 1-10 (MVP基盤固定)
 

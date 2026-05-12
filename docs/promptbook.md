@@ -4,7 +4,7 @@ Purpose: AI支援開発のためのプロンプト集。
 
 ## Planning Prompts
 
-- 「`phase31_40.md` に沿って、GitHub publish の retry/backoff、degraded mode、dry-run を一気通貫で実装し、`cargo test --workspace` まで完了してください。」
+- 「private archive の Phase31-40 plan に沿って、GitHub publish の retry/backoff、degraded mode、dry-run を一気通貫で実装し、`cargo test --workspace` まで完了してください。」
 - 「`patchgate scan --github-dry-run` の payload をレビューし、Check Run conclusion mapping が `docs/03_cli_reference.md` の表と一致するか検証してください。」
 
 ## Debugging Prompts

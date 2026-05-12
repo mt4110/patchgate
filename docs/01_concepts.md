@@ -111,6 +111,7 @@
 - bridge primitives:
   - generic provider: `v1` / `v2` / `dual`
   - audit export: `patchgate.audit.v1` + `patchgate.audit.v2`
+  - SIEM handoff: `xtask ops siem-handoff` による flat JSONL 正規化
   - policy gate: `verify-v1` + `verify-v2`
 - governance packets:
   - `fleet-review.md`
