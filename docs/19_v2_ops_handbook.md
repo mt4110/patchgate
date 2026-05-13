@@ -19,7 +19,7 @@
 4. shadow review shows v2 regression
 5. provider / plugin / delivery bridge artifact check fails
 6. provider rollout checklist triggers rollback
-7. fleet review exceeds cost ceiling or exposes unverified provenance
+7. fleet review exceeds cost ceiling, fails provider negotiation, exposes unverified provenance, or has expired exceptions
 8. GA packet fails LTS/support/sunset checks
 
 ## Steady-state loop
@@ -30,7 +30,7 @@
 4. refresh freeze boundary inventory when scope decisions change
 5. review shadow output
 6. verify provider, audit, plugin shadow, webhook, and notification bridge artifacts
-7. review fleet packet
+7. review fleet packet, including segment cost, retention tier, exception governance, and Phase181+ RC prep blockers
 8. decide hold / widen / rollback
 
 ## GA command

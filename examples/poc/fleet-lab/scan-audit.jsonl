@@ -1,0 +1,2 @@
+{"schema_version":1,"audit_format":"patchgate.audit.v1","unix_ts":1778619600,"actor":"bot","repo":"example/repo","target":"scan","mode":"warn","scope":"worktree","result":"pass","failure_code":null}
+{"schema_version":1,"audit_format":"patchgate.audit.v1","unix_ts":1778619660,"actor":"bot","repo":"example/repo-internal","target":"scan","mode":"warn","scope":"worktree","result":"pass","failure_code":null}

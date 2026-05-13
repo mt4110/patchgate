@@ -1,19 +1,32 @@
 {
   "schema_version": 1,
+  "trusted_provenance": ["sigstore", "slsa"],
   "plugins": [
     {
       "plugin_id": "example/security-rules",
       "version": "0.3.0",
       "owner": "platform-security",
+      "source_repo": "example/security-rules",
       "provenance": "sigstore",
-      "verified": true
+      "digest": "sha256:8e3f7f6ad9b89e90f2a4c8a6f65f7fd9bb86f3a943f3e91db9c90886a58e0f11",
+      "attestation": "https://attestations.example/security-rules/0.3.0.intoto.jsonl",
+      "verified": true,
+      "revoked": false,
+      "sandbox_profile": "isolated",
+      "allowed_segments": ["prod", "internal"]
     },
     {
       "plugin_id": "example/compliance-report",
       "version": "0.2.1",
       "owner": "platform-ops",
+      "source_repo": "example/compliance-report",
       "provenance": "slsa",
-      "verified": true
+      "digest": "sha256:b6b26d74ad2ccfc40fdb92ce9c8b0577dfd035e28f4ad6dbbc3914a7fbbad2b9",
+      "attestation": "https://attestations.example/compliance-report/0.2.1.slsa.json",
+      "verified": true,
+      "revoked": false,
+      "sandbox_profile": "restricted",
+      "allowed_segments": ["internal"]
     }
   ]
 }

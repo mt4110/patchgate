@@ -1,17 +1,74 @@
 {
   "schema_version": 1,
+  "generated_at": "2026-05-13T00:00:00Z",
+  "segments": [
+    {
+      "segment": "prod",
+      "owner": "platform-governance",
+      "cost_ceiling_minutes": 30,
+      "review_cadence": "weekly"
+    },
+    {
+      "segment": "internal",
+      "owner": "developer-experience",
+      "cost_ceiling_minutes": 20,
+      "review_cadence": "biweekly"
+    }
+  ],
+  "retention_tiers": [
+    {
+      "tier": "regulated",
+      "hot_days": 14,
+      "warm_days": 90,
+      "cold_days": 365
+    },
+    {
+      "tier": "standard",
+      "hot_days": 7,
+      "warm_days": 30,
+      "cold_days": 180
+    }
+  ],
+  "rollout_waves": [
+    {
+      "wave": "canary",
+      "order": 1,
+      "max_parallel": 1,
+      "entry_gate": "shadow-review aligned and provider dual artifact present",
+      "rollback_trigger": "provider drift, audit drift, or segment cost ceiling breach"
+    },
+    {
+      "wave": "wave-1",
+      "order": 2,
+      "max_parallel": 2,
+      "entry_gate": "canary clean for one review cycle",
+      "rollback_trigger": "new failure code, expired exception, or unverified provenance"
+    }
+  ],
   "bundles": [
     {
       "repo": "example/repo",
       "policy_bundle": "core-strict",
       "wave": "canary",
-      "segment": "prod"
+      "segment": "prod",
+      "providers": ["generic"],
+      "required_provider_modes": ["dual"],
+      "required_provider_capabilities": ["audit.shadow", "webhook.bridge", "notification.bridge"],
+      "retention_tier": "regulated",
+      "cost_ceiling_minutes": 20,
+      "phase181_rc_candidate": true
     },
     {
       "repo": "example/repo-internal",
       "policy_bundle": "core-balanced",
       "wave": "wave-1",
-      "segment": "internal"
+      "segment": "internal",
+      "providers": ["generic"],
+      "required_provider_modes": ["dual"],
+      "required_provider_capabilities": ["audit.shadow"],
+      "retention_tier": "standard",
+      "cost_ceiling_minutes": 12,
+      "phase181_rc_candidate": false
     }
   ]
 }

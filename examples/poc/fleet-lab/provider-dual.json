@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "bridge_format": "patchgate.provider.generic.bridge.v1",
+  "repo": "example/repo",
+  "emitted_at": 1778619600,
+  "capabilities": ["generic.dual", "audit.shadow", "webhook.bridge", "notification.bridge"],
+  "v1": {
+    "schema_version": 1,
+    "provider": "generic",
+    "repo": "example/repo",
+    "unix_ts": 1778619600,
+    "summary": {
+      "score": 92,
+      "threshold": 70,
+      "should_fail": false,
+      "mode": "warn",
+      "scope": "worktree",
+      "findings": 0
+    },
+    "report": {
+      "score": 92,
+      "threshold": 70
+    },
+    "markdown": "quality gate summary"
+  },
+  "v2": {
+    "schema_version": 2,
+    "publish_format": "patchgate.provider.generic.v2",
+    "repo": "example/repo",
+    "emitted_at": 1778619600,
+    "capabilities": ["audit.shadow", "webhook.bridge", "notification.bridge"],
+    "gate": {
+      "score": 92,
+      "threshold": 70,
+      "should_fail": false,
+      "mode": "warn",
+      "scope": "worktree",
+      "findings_count": 0
+    },
+    "artifacts": {
+      "report": {
+        "score": 92,
+        "threshold": 70
+      },
+      "markdown": "quality gate summary"
+    }
+  }
+}

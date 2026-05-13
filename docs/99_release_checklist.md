@@ -60,7 +60,7 @@ CI/Workflowで自動化済み:
   - [ ] plugin / provider / audit / policy / docs / SDK の破壊変更境界が説明可能
   - [ ] deferred item は owner phase または non-goal rationale を持つ
 - [ ] **V2 Bridge Evidence**: `verify-v2` / `diff-contract` / `shadow-review.md` を確認
-- [ ] **Fleet Governance Evidence**: `fleet-review.md` で bundle / provenance / exception / cost を確認
+- [ ] **Fleet Governance Evidence**: `fleet-review.md` で bundle / provider negotiation / provenance / retention / rollout wave / exception / segment cost / Phase181+ RC prep を確認
 - [ ] **RC Evidence**: `v2-rc-readiness.md` で candidate gate が green
 - [ ] **GA Evidence**: `v2-ga-packet.md` で LTS / support / sunset / decommission を確認
 - [ ] **Docs Sync**: `docs/00..05/99` がCLI実装と一致

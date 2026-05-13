@@ -36,10 +36,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p artifacts
           nix develop --command cargo run -p patchgate-cli -- scan \
             --mode enforce \
             --scope worktree \
             --format json \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl \
             --github-comment patchgate-comment.md \
             --github-publish \
             --github-retry-max-attempts 5 \
@@ -51,7 +55,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: patchgate-comment
-          path: patchgate-comment.md
+          path: |
+            patchgate-comment.md
+            artifacts/scan-metrics.jsonl
+            artifacts/scan-audit.jsonl
+            artifacts/scan-audit-v2.jsonl
 
   dry-run-publish-preview:
     runs-on: ubuntu-latest
@@ -84,3 +92,28 @@ jobs:
         with:
           name: patchgate-github-payload
           path: patchgate-github-payload.json
+
+  fleet-governance-preview:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+      - name: Build fleet governance packet from sample fixtures
+        run: |
+          mkdir -p artifacts
+          nix develop --command cargo run -p xtask -- ops fleet-review \
+            --metrics-input examples/poc/fleet-lab/scan-metrics.jsonl \
+            --audit-input examples/poc/fleet-lab/scan-audit.jsonl \
+            --audit-v2-input examples/poc/fleet-lab/scan-audit-v2.jsonl \
+            --provider-input examples/poc/fleet-lab/provider-dual.json \
+            --provider-input examples/poc/fleet-lab/provider-internal-dual.json \
+            --bundle-catalog-input examples/poc/fleet-lab/bundle-catalog.json \
+            --registry-input examples/poc/fleet-lab/plugin-registry.json \
+            --exceptions-input examples/poc/fleet-lab/exceptions.json \
+            --cost-ceiling-minutes 30 \
+            --output artifacts/fleet-review.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patchgate-fleet-review
+          path: artifacts/fleet-review.md

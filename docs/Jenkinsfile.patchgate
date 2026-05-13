@@ -10,9 +10,32 @@ pipeline {
             --mode enforce \
             --scope repo \
             --format json \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl \
             --publish \
             --ci-provider generic \
+            --ci-generic-schema dual \
             --ci-generic-output artifacts/ci-generic.json
+        '''
+      }
+    }
+
+    stage('Fleet Governance Preview') {
+      steps {
+        sh '''
+          mkdir -p artifacts
+          cargo run -p xtask -- ops fleet-review \
+            --metrics-input examples/poc/fleet-lab/scan-metrics.jsonl \
+            --audit-input examples/poc/fleet-lab/scan-audit.jsonl \
+            --audit-v2-input examples/poc/fleet-lab/scan-audit-v2.jsonl \
+            --provider-input examples/poc/fleet-lab/provider-dual.json \
+            --provider-input examples/poc/fleet-lab/provider-internal-dual.json \
+            --bundle-catalog-input examples/poc/fleet-lab/bundle-catalog.json \
+            --registry-input examples/poc/fleet-lab/plugin-registry.json \
+            --exceptions-input examples/poc/fleet-lab/exceptions.json \
+            --cost-ceiling-minutes 30 \
+            --output artifacts/fleet-review.md
         '''
       }
     }
@@ -20,7 +43,7 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'artifacts/ci-generic.json', fingerprint: true
+      archiveArtifacts artifacts: 'artifacts/*.json, artifacts/*.jsonl, artifacts/*.md', fingerprint: true
     }
   }
 }

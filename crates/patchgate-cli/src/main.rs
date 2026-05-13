@@ -507,6 +507,18 @@ struct PolicyVerifyV2Args {
     /// Notification v2 shadow envelope artifact to validate (repeatable)
     #[arg(long = "notification-envelope-input")]
     notification_envelope_inputs: Vec<PathBuf>,
+
+    /// Fleet bundle catalog artifact to validate
+    #[arg(long = "bundle-catalog-input")]
+    bundle_catalog_input: Option<PathBuf>,
+
+    /// Plugin registry provenance artifact to validate
+    #[arg(long = "registry-input")]
+    registry_input: Option<PathBuf>,
+
+    /// Organization exception governance artifact to validate
+    #[arg(long = "exceptions-input")]
+    exceptions_input: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2033,6 +2045,7 @@ struct V2ReadinessReport {
     plugin_shadow_sample_ready: Option<bool>,
     webhook_bridge_artifact_ready: Option<bool>,
     notification_bridge_artifact_ready: Option<bool>,
+    fleet_governance_artifact_ready: Option<bool>,
     artifact_checks: Vec<V2ArtifactCheck>,
     warnings: Vec<String>,
     next_actions: Vec<String>,
@@ -2054,6 +2067,7 @@ struct V2ArtifactContext {
     plugin_shadow_sample_ready: Option<bool>,
     webhook_bridge_artifact_ready: Option<bool>,
     notification_bridge_artifact_ready: Option<bool>,
+    fleet_governance_artifact_ready: Option<bool>,
     checks: Vec<V2ArtifactCheck>,
 }
 
@@ -2064,6 +2078,7 @@ impl V2ArtifactContext {
             && self.plugin_shadow_sample_ready.unwrap_or(true)
             && self.webhook_bridge_artifact_ready.unwrap_or(true)
             && self.notification_bridge_artifact_ready.unwrap_or(true)
+            && self.fleet_governance_artifact_ready.unwrap_or(true)
             && self.checks.iter().all(|check| check.valid)
     }
 
@@ -2073,6 +2088,7 @@ impl V2ArtifactContext {
             || self.plugin_shadow_sample_ready.is_some()
             || self.webhook_bridge_artifact_ready.is_some()
             || self.notification_bridge_artifact_ready.is_some()
+            || self.fleet_governance_artifact_ready.is_some()
     }
 }
 
@@ -2509,6 +2525,25 @@ fn build_v2_artifact_context(repo_root: &Path, args: &PolicyVerifyV2Args) -> V2A
         context.notification_bridge_artifact_ready = Some(notification_ready);
     }
 
+    let mut fleet_checks = Vec::new();
+    if let Some(raw_path) = args.bundle_catalog_input.as_ref() {
+        let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+        fleet_checks.push(check_bundle_catalog_artifact(path.as_path()));
+    }
+    if let Some(raw_path) = args.registry_input.as_ref() {
+        let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+        fleet_checks.push(check_registry_provenance_artifact(path.as_path()));
+    }
+    if let Some(raw_path) = args.exceptions_input.as_ref() {
+        let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+        fleet_checks.push(check_exception_governance_artifact(path.as_path()));
+    }
+    if !fleet_checks.is_empty() {
+        let fleet_ready = fleet_checks.iter().all(|check| check.valid);
+        context.checks.extend(fleet_checks);
+        context.fleet_governance_artifact_ready = Some(fleet_ready);
+    }
+
     context
 }
 
@@ -2798,6 +2833,350 @@ fn delivery_bridge_metadata_is_valid(
         && bridge.get("bridge_mode").and_then(Value::as_str) == Some("full")
 }
 
+fn check_bundle_catalog_artifact(path: &Path) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let (valid, summary) = bundle_catalog_artifact_summary(&value);
+                V2ArtifactCheck {
+                    kind: "bundle-catalog".to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary,
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: "bundle-catalog".to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: "bundle-catalog".to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn check_registry_provenance_artifact(path: &Path) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let (valid, summary) = registry_provenance_artifact_summary(&value);
+                V2ArtifactCheck {
+                    kind: "registry-provenance".to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary,
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: "registry-provenance".to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: "registry-provenance".to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn check_exception_governance_artifact(path: &Path) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let (valid, summary) = exception_governance_artifact_summary(&value);
+                V2ArtifactCheck {
+                    kind: "exception-governance".to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary,
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: "exception-governance".to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: "exception-governance".to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn value_array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn string_values(value: &Value, key: &str) -> Vec<String> {
+    value_array(value, key)
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|item| !item.trim().is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn bundle_catalog_artifact_summary(value: &Value) -> (bool, String) {
+    let bundles = value_array(value, "bundles");
+    let segments = value_array(value, "segments");
+    let retention_tiers = value_array(value, "retention_tiers");
+    let rollout_waves = value_array(value, "rollout_waves");
+    let segment_names = segments
+        .iter()
+        .filter_map(|segment| segment.get("segment").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let retention_names = retention_tiers
+        .iter()
+        .filter_map(|tier| tier.get("tier").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let wave_names = rollout_waves
+        .iter()
+        .filter_map(|wave| wave.get("wave").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let valid_segments = segments.iter().all(|segment| {
+        required_string(segment, "segment")
+            && required_string(segment, "owner")
+            && required_string(segment, "review_cadence")
+            && segment
+                .get("cost_ceiling_minutes")
+                .and_then(Value::as_u64)
+                .is_some_and(|ceiling| ceiling > 0)
+    });
+    let valid_retention = retention_tiers.iter().all(|tier| {
+        let hot = tier.get("hot_days").and_then(Value::as_u64).unwrap_or(0);
+        let warm = tier.get("warm_days").and_then(Value::as_u64).unwrap_or(0);
+        let cold = tier.get("cold_days").and_then(Value::as_u64).unwrap_or(0);
+        required_string(tier, "tier") && hot > 0 && hot <= warm && warm <= cold
+    });
+    let valid_waves = rollout_waves.iter().all(|wave| {
+        required_string(wave, "wave")
+            && required_string(wave, "entry_gate")
+            && required_string(wave, "rollback_trigger")
+            && wave
+                .get("order")
+                .and_then(Value::as_u64)
+                .is_some_and(|order| order > 0)
+            && wave
+                .get("max_parallel")
+                .and_then(Value::as_u64)
+                .is_some_and(|max_parallel| max_parallel > 0)
+    });
+    let valid_bundles = !bundles.is_empty()
+        && bundles.iter().all(|bundle| {
+            let required_modes = string_values(bundle, "required_provider_modes");
+            let providers = string_values(bundle, "providers");
+            let required_capabilities = string_values(bundle, "required_provider_capabilities");
+            required_string(bundle, "repo")
+                && required_string(bundle, "policy_bundle")
+                && required_string(bundle, "wave")
+                && required_string(bundle, "segment")
+                && required_string(bundle, "retention_tier")
+                && !providers.is_empty()
+                && !required_modes.is_empty()
+                && !required_capabilities.is_empty()
+                && (wave_names.is_empty()
+                    || bundle
+                        .get("wave")
+                        .and_then(Value::as_str)
+                        .is_some_and(|wave| wave_names.contains(wave)))
+                && (segment_names.is_empty()
+                    || bundle
+                        .get("segment")
+                        .and_then(Value::as_str)
+                        .is_some_and(|segment| segment_names.contains(segment)))
+                && (retention_names.is_empty()
+                    || bundle
+                        .get("retention_tier")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tier| retention_names.contains(tier)))
+                && required_modes
+                    .iter()
+                    .all(|mode| matches!(mode.as_str(), "v1" | "v2" | "dual"))
+                && bundle
+                    .get("cost_ceiling_minutes")
+                    .and_then(Value::as_u64)
+                    .map_or(true, |ceiling| ceiling > 0)
+        });
+    let valid = schema_version_in_range(value, 1, 10)
+        && value
+            .get("generated_at")
+            .and_then(Value::as_str)
+            .and_then(ymd_key_for_artifact)
+            .is_some()
+        && !segments.is_empty()
+        && !retention_tiers.is_empty()
+        && !rollout_waves.is_empty()
+        && segment_names.len() == segments.len()
+        && retention_names.len() == retention_tiers.len()
+        && wave_names.len() == rollout_waves.len()
+        && valid_segments
+        && valid_retention
+        && valid_waves
+        && valid_bundles;
+    (
+        valid,
+        format!(
+            "bundles={} segments={} retention_tiers={} rollout_waves={}",
+            bundles.len(),
+            segments.len(),
+            retention_tiers.len(),
+            rollout_waves.len()
+        ),
+    )
+}
+
+fn registry_provenance_artifact_summary(value: &Value) -> (bool, String) {
+    let plugins = value_array(value, "plugins");
+    let trusted = string_values(value, "trusted_provenance");
+    let valid_plugins = !plugins.is_empty()
+        && !trusted.is_empty()
+        && trusted
+            .iter()
+            .all(|provenance| !provenance.trim().is_empty())
+        && plugins.iter().all(|plugin| {
+            let provenance = plugin
+                .get("provenance")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            required_string(plugin, "plugin_id")
+                && required_string(plugin, "version")
+                && required_string(plugin, "owner")
+                && required_string(plugin, "source_repo")
+                && required_string(plugin, "provenance")
+                && required_string(plugin, "digest")
+                && required_string(plugin, "attestation")
+                && required_string(plugin, "sandbox_profile")
+                && !string_values(plugin, "allowed_segments").is_empty()
+                && plugin.get("verified").and_then(Value::as_bool) == Some(true)
+                && plugin.get("revoked").and_then(Value::as_bool) != Some(true)
+                && trusted.iter().any(|item| item == provenance)
+        });
+    let valid = schema_version_in_range(value, 1, 10) && valid_plugins;
+    (
+        valid,
+        format!(
+            "plugins={} trusted_provenance={}",
+            plugins.len(),
+            if trusted.is_empty() {
+                "none".to_string()
+            } else {
+                trusted.join(",")
+            }
+        ),
+    )
+}
+
+fn exception_governance_artifact_summary(value: &Value) -> (bool, String) {
+    let exceptions = value_array(value, "exceptions");
+    let reviewed_at = value
+        .get("reviewed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let valid_exceptions = exceptions.iter().all(|exception| {
+        let status = exception
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        required_string(exception, "repo")
+            && required_string(exception, "kind")
+            && required_string(exception, "scope")
+            && required_string(exception, "ticket")
+            && required_string(exception, "owner")
+            && required_string(exception, "segment")
+            && required_string(exception, "approved_by")
+            && required_string(exception, "expires_at")
+            && required_string(exception, "review_cadence")
+            && matches!(status, "approved" | "active" | "temporary")
+            && exception_expired(
+                exception
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                reviewed_at,
+            ) == Some(false)
+    });
+    let valid = schema_version_in_range(value, 1, 10)
+        && ymd_key_for_artifact(reviewed_at).is_some()
+        && valid_exceptions;
+    (
+        valid,
+        format!("exceptions={} reviewed_at={reviewed_at}", exceptions.len()),
+    )
+}
+
+fn ymd_key_for_artifact(raw: &str) -> Option<(u16, u8, u8)> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 10
+        || trimmed.as_bytes()[4] != b'-'
+        || trimmed.as_bytes()[7] != b'-'
+        || !trimmed[..10]
+            .bytes()
+            .enumerate()
+            .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = trimmed[0..4].parse::<u16>().ok()?;
+    let month = trimmed[5..7].parse::<u8>().ok()?;
+    let day = trimmed[8..10].parse::<u8>().ok()?;
+    if month == 0 || month > 12 {
+        return None;
+    }
+    let max_day = artifact_days_in_month(year, month)?;
+    if day == 0 || day > max_day {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn artifact_days_in_month(year: u16, month: u8) -> Option<u8> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if artifact_is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn artifact_is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn exception_expired(expires_at: &str, reviewed_at: &str) -> Option<bool> {
+    let expires = ymd_key_for_artifact(expires_at)?;
+    let reviewed = ymd_key_for_artifact(reviewed_at)?;
+    Some(expires < reviewed)
+}
+
 fn build_v2_readiness_report(
     repo_root: &Path,
     policy_path: &Path,
@@ -2887,6 +3266,13 @@ fn build_v2_readiness_report(
                 .to_string(),
         );
     }
+    if artifact_context.fleet_governance_artifact_ready == Some(false) {
+        warnings.push("fleet governance artifact check failed".to_string());
+        next_actions.push(
+            "Fix bundle catalog, registry provenance, or exception governance fixtures before fleet review."
+                .to_string(),
+        );
+    }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
         && cfg.compatibility.v1.rc_frozen
@@ -2929,6 +3315,7 @@ fn build_v2_readiness_report(
         plugin_shadow_sample_ready: artifact_context.plugin_shadow_sample_ready,
         webhook_bridge_artifact_ready: artifact_context.webhook_bridge_artifact_ready,
         notification_bridge_artifact_ready: artifact_context.notification_bridge_artifact_ready,
+        fleet_governance_artifact_ready: artifact_context.fleet_governance_artifact_ready,
         artifact_checks: artifact_context.checks,
         warnings,
         next_actions,
@@ -2989,6 +3376,10 @@ fn print_v2_readiness_report(
             print_optional_bool(
                 "- notification_bridge_artifact_ready",
                 report.notification_bridge_artifact_ready,
+            );
+            print_optional_bool(
+                "- fleet_governance_artifact_ready",
+                report.fleet_governance_artifact_ready,
             );
             if report.artifact_checks.is_empty() {
                 println!("- artifact_checks: none");
@@ -6760,18 +7151,19 @@ mod tests {
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
         build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
-        build_history_trend, changed_file_limit_fail_open_report, ci_template_catalog,
-        delivery_bridge_headers, delivery_bridge_metadata, detect_head_sha_from_env,
-        detect_pr_number_from_env, detect_sandbox_capabilities, gate_exit_code,
+        build_history_trend, bundle_catalog_artifact_summary, changed_file_limit_fail_open_report,
+        ci_template_catalog, delivery_bridge_headers, delivery_bridge_metadata,
+        detect_head_sha_from_env, detect_pr_number_from_env, detect_sandbox_capabilities,
+        exception_expired, exception_governance_artifact_summary, gate_exit_code,
         is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
         notification_payload, parse_mode, parse_policy_preset, parse_scope,
         pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
         publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
-        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
-        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        registry_provenance_artifact_summary, render_contract_diff_report_json,
+        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -8100,6 +8492,9 @@ bridge_mode = "off"
                 plugin_shadow_inputs: Vec::new(),
                 webhook_envelope_inputs: Vec::new(),
                 notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -8153,6 +8548,9 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 plugin_shadow_inputs: Vec::new(),
                 webhook_envelope_inputs: Vec::new(),
                 notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
@@ -8240,11 +8638,174 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 notification_envelope_inputs: vec![PathBuf::from(
                     "artifacts/notification-shadow.json",
                 )],
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_accepts_fleet_governance_artifact_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!(
+            "patchgate-cli-policy-verify-v2-fleet-governance-{seq}"
+        ));
+        fs::create_dir_all(repo_root.join("docs")).expect("create docs");
+        fs::create_dir_all(repo_root.join("artifacts")).expect("create artifacts");
+        fs::write(
+            repo_root.join("docs/v2-migration-alpha.md"),
+            "# v2 migration\n",
+        )
+        .expect("write guide");
+        fs::write(
+            repo_root.join("artifacts/bundle-catalog.json"),
+            r#"{"schema_version":1,"generated_at":"2026-05-13T00:00:00Z","segments":[{"segment":"prod","owner":"platform","cost_ceiling_minutes":30,"review_cadence":"weekly"}],"retention_tiers":[{"tier":"regulated","hot_days":14,"warm_days":90,"cold_days":365}],"rollout_waves":[{"wave":"canary","order":1,"max_parallel":1,"entry_gate":"shadow clean","rollback_trigger":"provider drift"}],"bundles":[{"repo":"example/repo","policy_bundle":"core-strict","wave":"canary","segment":"prod","providers":["generic"],"required_provider_modes":["dual"],"required_provider_capabilities":["audit.shadow"],"retention_tier":"regulated","cost_ceiling_minutes":20,"phase181_rc_candidate":true}]}"#,
+        )
+        .expect("write bundle catalog");
+        fs::write(
+            repo_root.join("artifacts/plugin-registry.json"),
+            r#"{"schema_version":1,"trusted_provenance":["sigstore"],"plugins":[{"plugin_id":"example/security-rules","version":"0.3.0","owner":"security","source_repo":"example/security-rules","provenance":"sigstore","digest":"sha256:abc","attestation":"https://attestations.example/security-rules","verified":true,"revoked":false,"sandbox_profile":"isolated","allowed_segments":["prod"]}]}"#,
+        )
+        .expect("write registry");
+        fs::write(
+            repo_root.join("artifacts/exceptions.json"),
+            r#"{"schema_version":1,"reviewed_at":"2026-05-13T00:00:00Z","exceptions":[{"repo":"example/repo","kind":"waiver","scope":"provider-bridge","ticket":"SEC-1","owner":"platform","segment":"prod","approved_by":"ops-lead","status":"approved","review_cadence":"weekly","expires_at":"2026-05-30T00:00:00Z"}]}"#,
+        )
+        .expect("write exceptions");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: Some(PathBuf::from("artifacts/bundle-catalog.json")),
+                registry_input: Some(PathBuf::from("artifacts/plugin-registry.json")),
+                exceptions_input: Some(PathBuf::from("artifacts/exceptions.json")),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn fleet_governance_artifact_checks_reject_thin_or_stale_evidence() {
+        let thin_catalog = serde_json::json!({
+            "schema_version": 1,
+            "bundles": [{
+                "repo": "example/repo",
+                "policy_bundle": "core-strict",
+                "wave": "canary",
+                "segment": "prod"
+            }]
+        });
+        assert!(!bundle_catalog_artifact_summary(&thin_catalog).0);
+
+        let weak_provider_contract = serde_json::json!({
+            "schema_version": 1,
+            "segments": [{"segment": "prod", "owner": "platform", "cost_ceiling_minutes": 30, "review_cadence": "weekly"}],
+            "retention_tiers": [{"tier": "regulated", "hot_days": 14, "warm_days": 90, "cold_days": 365}],
+            "rollout_waves": [{"wave": "canary", "order": 1, "max_parallel": 1, "entry_gate": "shadow clean", "rollback_trigger": "provider drift"}],
+            "bundles": [{
+                "repo": "example/repo",
+                "policy_bundle": "core-strict",
+                "wave": "canary",
+                "segment": "prod",
+                "providers": ["generic"],
+                "required_provider_modes": ["dual"],
+                "retention_tier": "regulated"
+            }]
+        });
+        assert!(!bundle_catalog_artifact_summary(&weak_provider_contract).0);
+
+        let incomplete_registry = serde_json::json!({
+            "schema_version": 1,
+            "trusted_provenance": ["sigstore"],
+            "plugins": [{
+                "plugin_id": "example/security-rules",
+                "version": "0.3.0",
+                "owner": "security",
+                "source_repo": "example/security-rules",
+                "provenance": "sigstore",
+                "digest": "sha256:abc",
+                "attestation": "https://attestations.example/security-rules",
+                "verified": true,
+                "revoked": false
+            }]
+        });
+        assert!(!registry_provenance_artifact_summary(&incomplete_registry).0);
+        let untrusted_registry = serde_json::json!({
+            "schema_version": 1,
+            "plugins": [{
+                "plugin_id": "example/security-rules",
+                "version": "0.3.0",
+                "owner": "security",
+                "source_repo": "example/security-rules",
+                "provenance": "sigstore",
+                "digest": "sha256:abc",
+                "attestation": "https://attestations.example/security-rules",
+                "verified": true,
+                "revoked": false,
+                "sandbox_profile": "isolated",
+                "allowed_segments": ["prod"]
+            }]
+        });
+        assert!(!registry_provenance_artifact_summary(&untrusted_registry).0);
+        assert_eq!(
+            exception_expired("2026-99-99T00:00:00Z", "2026-05-13T00:00:00Z"),
+            None
+        );
+
+        let stale_exception = serde_json::json!({
+            "schema_version": 1,
+            "reviewed_at": "2026-05-13T00:00:00Z",
+            "exceptions": [{
+                "repo": "example/repo",
+                "kind": "waiver",
+                "scope": "provider-bridge",
+                "ticket": "SEC-1",
+                "owner": "platform",
+                "approved_by": "ops-lead",
+                "status": "approved",
+                "expires_at": "2026-04-30T00:00:00Z"
+            }]
+        });
+        assert!(!exception_governance_artifact_summary(&stale_exception).0);
     }
 
     #[test]
@@ -8300,6 +8861,9 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 plugin_shadow_inputs: Vec::new(),
                 webhook_envelope_inputs: Vec::new(),
                 notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -8360,6 +8924,9 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 plugin_shadow_inputs: Vec::new(),
                 webhook_envelope_inputs: vec![PathBuf::from("artifacts/webhook-shadow.json")],
                 notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -8413,6 +8980,9 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 plugin_shadow_inputs: Vec::new(),
                 webhook_envelope_inputs: Vec::new(),
                 notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
