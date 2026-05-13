@@ -12,3 +12,9 @@ result-*
 # macOS clutter
 ._*
 __MACOSX/
+.gemini/
+.codex/
+.private_docs/
+.private_docs/*
+.vscode/
+.idea/

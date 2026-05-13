@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +43,7 @@ enum OpsSubcommand {
     FleetReview,
     RcReadiness,
     GaPacket,
+    SiemHandoff,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +218,29 @@ struct AuditGateV2 {
 struct AuditFailureV2 {
     code: Option<String>,
     category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SiemHandoffRecord {
+    schema_version: u8,
+    event_kind: String,
+    source_format: String,
+    source_schema_version: u8,
+    event_time_unix: u64,
+    repo: String,
+    actor: String,
+    target: String,
+    mode: String,
+    scope: String,
+    result: String,
+    severity: String,
+    score: Option<u8>,
+    threshold: Option<u8>,
+    changed_files: Option<usize>,
+    failure_code: Option<String>,
+    failure_category: Option<String>,
+    diagnostic_count: usize,
+    diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -462,7 +486,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -578,12 +602,13 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `replay-normalize`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `replay-normalize`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
         "audit-report" => OpsSubcommand::AuditReport,
         "audit-drift-report" => OpsSubcommand::AuditDriftReport,
+        "siem-handoff" => OpsSubcommand::SiemHandoff,
         "slo-report" => OpsSubcommand::SloReport,
         "ga-readiness" => OpsSubcommand::GaReadiness,
         "verify-v1-calibrate" => OpsSubcommand::VerifyV1Calibrate,
@@ -819,6 +844,7 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
         OpsSubcommand::WeeklySummary => run_weekly_summary(options),
         OpsSubcommand::AuditReport => run_audit_report(options),
         OpsSubcommand::AuditDriftReport => run_audit_drift_report(options),
+        OpsSubcommand::SiemHandoff => run_siem_handoff(options),
         OpsSubcommand::SloReport => run_slo_report(options),
         OpsSubcommand::GaReadiness => run_ga_readiness(options),
         OpsSubcommand::VerifyV1Calibrate => run_verify_v1_calibrate(options),
@@ -1119,6 +1145,105 @@ fn run_audit_drift_report(options: &OpsOptions) -> Result<()> {
     write_output(&options.output, md.as_str())?;
     println!("audit drift report written: {}", options.output.display());
     Ok(())
+}
+
+fn run_siem_handoff(options: &OpsOptions) -> Result<()> {
+    let audit_v2_input = options
+        .audit_v2_input
+        .as_deref()
+        .ok_or_else(|| anyhow!("siem-handoff requires --audit-v2-input"))?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    validate_siem_handoff_input(&audits_v2)?;
+    let records = build_siem_handoff_records(&audits_v2);
+    write_jsonl_output(&options.output, &records)?;
+    println!(
+        "siem handoff written: {} (events={})",
+        options.output.display(),
+        records.len()
+    );
+    Ok(())
+}
+
+fn validate_siem_handoff_input(audits_v2: &[AuditLogV2Record]) -> Result<()> {
+    for (idx, row) in audits_v2.iter().enumerate() {
+        let row_number = idx + 1;
+        if !(2..=10).contains(&row.schema_version) {
+            bail!(
+                "siem-handoff input row {row_number} has unsupported audit v2 schema_version {}",
+                row.schema_version
+            );
+        }
+        if row.audit_format != "patchgate.audit.v2" {
+            bail!(
+                "siem-handoff input row {row_number} has unsupported audit_format `{}`",
+                row.audit_format
+            );
+        }
+        if !matches!(
+            row.operation.result.as_str(),
+            "pass" | "gate_fail" | "error"
+        ) {
+            bail!(
+                "siem-handoff input row {row_number} has unsupported result `{}`",
+                row.operation.result
+            );
+        }
+        if let Some(code) = row.failure.code.as_ref() {
+            if !is_known_failure_code(code) {
+                bail!("siem-handoff input row {row_number} has unknown failure_code `{code}`");
+            }
+        }
+        for (field, value) in [
+            ("actor", row.actor.as_str()),
+            ("repo", row.repo.as_str()),
+            ("operation.target", row.operation.target.as_str()),
+            ("operation.mode", row.operation.mode.as_str()),
+            ("operation.scope", row.operation.scope.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("siem-handoff input row {row_number} has empty {field}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_siem_handoff_records(audits_v2: &[AuditLogV2Record]) -> Vec<SiemHandoffRecord> {
+    audits_v2.iter().map(siem_handoff_record).collect()
+}
+
+fn siem_handoff_record(row: &AuditLogV2Record) -> SiemHandoffRecord {
+    SiemHandoffRecord {
+        schema_version: 1,
+        event_kind: "quality_gate.audit".to_string(),
+        source_format: row.audit_format.clone(),
+        source_schema_version: row.schema_version,
+        event_time_unix: row.emitted_at,
+        repo: row.repo.clone(),
+        actor: row.actor.clone(),
+        target: row.operation.target.clone(),
+        mode: row.operation.mode.clone(),
+        scope: row.operation.scope.clone(),
+        result: row.operation.result.clone(),
+        severity: siem_severity(row).to_string(),
+        score: row.gate.score,
+        threshold: row.gate.threshold,
+        changed_files: row.gate.changed_files,
+        failure_code: row.failure.code.clone(),
+        failure_category: row.failure.category.clone(),
+        diagnostic_count: row.diagnostics.len(),
+        diagnostics: row.diagnostics.clone(),
+    }
+}
+
+fn siem_severity(row: &AuditLogV2Record) -> &'static str {
+    if row.failure.code.is_some() || row.operation.result == "error" {
+        "error"
+    } else if row.operation.result == "gate_fail" {
+        "warning"
+    } else {
+        "info"
+    }
 }
 
 fn run_slo_report(options: &OpsOptions) -> Result<()> {
@@ -2958,6 +3083,24 @@ fn write_output(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_jsonl_output<T: Serialize>(path: &Path, records: &[T]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = fs::File::create(path).with_context(|| format!("write {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        serde_json::to_writer(&mut writer, record)
+            .with_context(|| format!("encode JSONL record for {}", path.display()))?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))
+}
+
 struct SyntheticRepo {
     root: PathBuf,
 }
@@ -3283,14 +3426,14 @@ mod tests {
         aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
         average_duration_for_summary, build_audit_drift_summary,
         build_combined_audit_drift_summary, build_compatibility_assessment,
-        build_freeze_scoreboard, build_shadow_alignment, build_verify_v1_calibration,
-        candidate_repos, canonical_repo_path, checklist_box, fleet_repo_posture_label,
-        load_json_file, load_jsonl_records, load_release_policy_summary, percentile_u128,
-        provider_bridge_ready_for_repos, run_ga_readiness, security_review_is_approved,
-        summarize_provider_inputs, validate_workload_identity, AuditFailureV2, AuditGateV2,
-        AuditLogRecord, AuditLogV2Record, AuditOperationV2, BenchSample, CompatibilityPosture,
-        DeadLetterReplaySummaryRecord, MetricLogRecord, OpsOptions, OpsSubcommand,
-        ProviderArtifactSummary, TEMP_SEQ,
+        build_freeze_scoreboard, build_shadow_alignment, build_siem_handoff_records,
+        build_verify_v1_calibration, candidate_repos, canonical_repo_path, checklist_box,
+        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
+        percentile_u128, provider_bridge_ready_for_repos, run_ga_readiness,
+        security_review_is_approved, summarize_provider_inputs, validate_siem_handoff_input,
+        validate_workload_identity, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
+        AuditOperationV2, BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord,
+        MetricLogRecord, OpsOptions, OpsSubcommand, ProviderArtifactSummary, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -3460,6 +3603,106 @@ mod tests {
 
         assert_eq!(record.schema_version, 2);
         assert_eq!(record.audit_format, "patchgate.audit.v2");
+    }
+
+    #[test]
+    fn siem_handoff_maps_audit_v2_to_flat_events() {
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 42,
+            actor: "ci".to_string(),
+            repo: "owner/repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "enforce".to_string(),
+                scope: "worktree".to_string(),
+                result: "gate_fail".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(64),
+                threshold: Some(70),
+                changed_files: Some(3),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec!["dangerous_change triggered".to_string()],
+        }];
+
+        let records = build_siem_handoff_records(&audits_v2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_kind, "quality_gate.audit");
+        assert_eq!(records[0].source_schema_version, 2);
+        assert_eq!(records[0].event_time_unix, 42);
+        assert_eq!(records[0].severity, "warning");
+        assert_eq!(records[0].diagnostic_count, 1);
+        assert_eq!(records[0].score, Some(64));
+    }
+
+    #[test]
+    fn siem_handoff_rejects_non_v2_audit_contract() {
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            emitted_at: 42,
+            actor: "ci".to_string(),
+            repo: "owner/repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "enforce".to_string(),
+                scope: "worktree".to_string(),
+                result: "gate_fail".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(64),
+                threshold: Some(70),
+                changed_files: Some(3),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+
+        let err = validate_siem_handoff_input(&audits_v2).expect_err("must reject v1 contract");
+        assert!(err
+            .to_string()
+            .contains("unsupported audit v2 schema_version"));
+    }
+
+    #[test]
+    fn siem_handoff_rejects_unknown_failure_code() {
+        let audits_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 42,
+            actor: "ci".to_string(),
+            repo: "owner/repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "enforce".to_string(),
+                scope: "worktree".to_string(),
+                result: "error".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: None,
+                threshold: None,
+                changed_files: None,
+            },
+            failure: AuditFailureV2 {
+                code: Some("PG-UNKNOWN-001".to_string()),
+                category: Some("runtime".to_string()),
+            },
+            diagnostics: vec![],
+        }];
+
+        let err =
+            validate_siem_handoff_input(&audits_v2).expect_err("must reject unknown failure code");
+        assert!(err.to_string().contains("unknown failure_code"));
     }
 
     #[test]

@@ -661,13 +661,14 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "shadow_mode requires a non-empty migration_guide_path to document the rollout",
         ));
     }
-    if cfg.plugins.signature.required && cfg.plugins.signature.public_key_env.trim().is_empty() {
+    if cfg.plugins.signature.required && !plugin_signature_has_any_key_env(&cfg.plugins.signature) {
         return Err(validation_error(
             ValidationCategory::Dependency,
-            "plugins.signature.public_key_env",
-            "must be non-empty when `plugins.signature.required = true`",
+            "plugins.signature",
+            "must be non-empty or trusted_key_envs must contain at least one env when `plugins.signature.required = true`",
         ));
     }
+    validate_plugin_signature_rotation(&cfg.plugins.signature)?;
 
     for (idx, plugin) in cfg.plugins.entries.iter().enumerate() {
         if plugin.id.trim().is_empty() {
@@ -1212,6 +1213,65 @@ fn validate_url_entry(field: &'static str, index: usize, value: &str) -> Result<
     Ok(())
 }
 
+fn plugin_signature_has_any_key_env(signature: &PluginSignatureConfig) -> bool {
+    !signature.public_key_env.trim().is_empty()
+        || signature
+            .trusted_key_envs
+            .iter()
+            .any(|env| !env.trim().is_empty())
+}
+
+fn validate_plugin_signature_rotation(signature: &PluginSignatureConfig) -> Result<()> {
+    let mut seen_key_envs = BTreeSet::new();
+    let primary = signature.public_key_env.trim();
+    if !primary.is_empty() {
+        seen_key_envs.insert(primary.to_string());
+    }
+
+    for (idx, env) in signature.trusted_key_envs.iter().enumerate() {
+        let trimmed = env.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.signature.trusted_key_envs",
+                format!("entry[{idx}] must be non-empty"),
+            ));
+        }
+        if !seen_key_envs.insert(trimmed.to_string()) {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.signature.trusted_key_envs",
+                format!("entry[{idx}] duplicates another plugin signature key env"),
+            ));
+        }
+    }
+
+    let mut seen_revocations = BTreeSet::new();
+    for (idx, fingerprint) in signature.revoked_key_sha256.iter().enumerate() {
+        let trimmed = fingerprint.trim();
+        if !is_sha256_hex(trimmed) {
+            return Err(validation_error(
+                ValidationCategory::Type,
+                "plugins.signature.revoked_key_sha256",
+                format!("entry[{idx}] must be a 64-character sha256 hex fingerprint"),
+            ));
+        }
+        if !seen_revocations.insert(trimmed.to_ascii_lowercase()) {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.signature.revoked_key_sha256",
+                format!("entry[{idx}] duplicates another revoked key fingerprint"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn validate_dependency_penalty(
     field: &'static str,
     value: u8,
@@ -1442,7 +1502,73 @@ public_key_env = "   "
         assert_eq!(err.category(), Some(ValidationCategory::Dependency));
         match err {
             ConfigError::Validation { field, .. } => {
-                assert_eq!(field, "plugins.signature.public_key_env")
+                assert_eq!(field, "plugins.signature")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_allows_plugin_signature_rotation_keyring() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.signature]
+required = true
+public_key_env = "   "
+trusted_key_envs = ["PATCHGATE_PLUGIN_PUBLIC_KEY_ACTIVE", "PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT"]
+revoked_key_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
+"#,
+        );
+        let loaded = load_from_typed(&path).expect("rotation keyring should be valid");
+        assert_eq!(
+            loaded.plugins.signature.trusted_key_envs,
+            vec![
+                "PATCHGATE_PLUGIN_PUBLIC_KEY_ACTIVE".to_string(),
+                "PATCHGATE_PLUGIN_PUBLIC_KEY_NEXT".to_string()
+            ]
+        );
+        assert_eq!(loaded.plugins.signature.revoked_key_sha256.len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_empty_plugin_signature_rotation_env() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.signature]
+required = true
+trusted_key_envs = ["PATCHGATE_PLUGIN_PUBLIC_KEY_ACTIVE", "  "]
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("must reject empty rotation env");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "plugins.signature.trusted_key_envs")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_plugin_revocation_fingerprint() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins.signature]
+required = true
+revoked_key_sha256 = ["not-a-sha256"]
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("must reject invalid revocation fingerprint");
+        assert_eq!(err.category(), Some(ValidationCategory::Type));
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "plugins.signature.revoked_key_sha256")
             }
             other => panic!("unexpected error: {other}"),
         }

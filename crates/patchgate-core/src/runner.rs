@@ -572,20 +572,10 @@ fn verify_plugin_signature(
     if !policy.plugins.signature.required {
         return Ok(());
     }
-    let key_env = policy.plugins.signature.public_key_env.trim();
-    if key_env.is_empty() {
-        anyhow::bail!("plugins.signature.public_key_env is empty");
+    let key_envs = plugin_signature_key_envs(&policy.plugins.signature);
+    if key_envs.is_empty() {
+        anyhow::bail!("plugins.signature.public_key_env or trusted_key_envs is empty");
     }
-    let key_b64 = std::env::var(key_env)
-        .with_context(|| format!("missing plugin public key env var: {key_env}"))?;
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64.trim())
-        .context("failed to decode plugin public key (base64)")?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("plugin public key must be 32 bytes (ed25519)"))?;
-    let verifying_key = VerifyingKey::from_bytes(&key_array)
-        .context("failed to parse plugin public key (ed25519)")?;
 
     let command_path = resolve_signed_plugin_artifact_path(ctx, plugin);
     let signature_path = if PathBuf::from(plugin.signature_path.as_str()).is_absolute() {
@@ -610,10 +600,80 @@ fn verify_plugin_signature(
         .context("failed to decode plugin signature (base64)")?;
     let signature = Signature::try_from(signature_bytes.as_slice())
         .context("failed to parse plugin signature (ed25519)")?;
-    verifying_key
-        .verify(command_bytes.as_slice(), &signature)
-        .context("plugin signature verification failed")?;
-    Ok(())
+
+    let revoked_key_sha256 = policy
+        .plugins
+        .signature
+        .revoked_key_sha256
+        .iter()
+        .map(|fingerprint| fingerprint.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut attempts = Vec::new();
+    for key_env in key_envs {
+        let (fingerprint, verifying_key) = match load_plugin_public_key_from_env(key_env.as_str()) {
+            Ok(key) => key,
+            Err(err) => {
+                attempts.push(format!("{key_env}: {err:#}"));
+                continue;
+            }
+        };
+        if revoked_key_sha256.contains(fingerprint.as_str()) {
+            attempts.push(format!(
+                "{key_env}: plugin public key fingerprint {fingerprint} is revoked"
+            ));
+            continue;
+        }
+        if verifying_key
+            .verify(command_bytes.as_slice(), &signature)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        attempts.push(format!(
+            "{key_env}: signature mismatch for key fingerprint {fingerprint}"
+        ));
+    }
+
+    anyhow::bail!(
+        "plugin signature verification failed with configured keyring: {}",
+        attempts.join("; ")
+    )
+}
+
+fn plugin_signature_key_envs(signature: &patchgate_config::PluginSignatureConfig) -> Vec<String> {
+    let mut envs = Vec::new();
+    let mut seen = BTreeSet::new();
+    let primary = signature.public_key_env.trim();
+    if !primary.is_empty() && seen.insert(primary.to_string()) {
+        envs.push(primary.to_string());
+    }
+    for env in &signature.trusted_key_envs {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            envs.push(trimmed.to_string());
+        }
+    }
+    envs
+}
+
+fn load_plugin_public_key_from_env(env_name: &str) -> Result<(String, VerifyingKey)> {
+    let key_b64 = std::env::var(env_name)
+        .with_context(|| format!("missing plugin public key env var: {env_name}"))?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .context("failed to decode plugin public key (base64)")?;
+    let key_array: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("plugin public key must be 32 bytes (ed25519)"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .context("failed to parse plugin public key (ed25519)")?;
+    let fingerprint = plugin_public_key_fingerprint(&key_bytes);
+    Ok((fingerprint, verifying_key))
+}
+
+fn plugin_public_key_fingerprint(key_bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(key_bytes))
 }
 
 fn resolve_signed_plugin_artifact_path(
@@ -3302,6 +3362,72 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn plugin_signature_verification_accepts_rotated_trusted_key() {
+        let mut policy = Config::default();
+        policy.plugins.signature.required = true;
+        let old_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_ROTATION_OLD_{}",
+            std::process::id()
+        );
+        let new_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_ROTATION_NEW_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = old_key_env.clone();
+        policy.plugins.signature.trusted_key_envs = vec![new_key_env.clone()];
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-signature-rotation-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        let signature_path = temp_root.join("plugin.sig");
+        std::fs::write(&plugin_path, "#!/usr/bin/env sh\necho ok\n").expect("write plugin");
+
+        let old_signing_key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let new_signing_key = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
+        let old_public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(old_signing_key.verifying_key().as_bytes());
+        let new_public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(new_signing_key.verifying_key().as_bytes());
+        policy
+            .plugins
+            .signature
+            .revoked_key_sha256
+            .push(plugin_public_key_fingerprint(
+                old_signing_key.verifying_key().as_bytes(),
+            ));
+        std::env::set_var(old_key_env.as_str(), old_public_key_b64);
+        std::env::set_var(new_key_env.as_str(), new_public_key_b64);
+
+        let command_bytes = std::fs::read(&plugin_path).expect("read plugin");
+        let signature = new_signing_key.sign(command_bytes.as_slice());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        std::fs::write(&signature_path, signature_b64).expect("write signature");
+
+        let plugin = patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        };
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+
+        verify_plugin_signature(&policy, &ctx, &plugin).expect("rotated key should verify");
+
+        std::env::remove_var(old_key_env);
+        std::env::remove_var(new_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn plugin_signature_verification_prefers_executable_over_file_args() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3484,6 +3610,63 @@ mod tests {
                     ]
             }));
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_signature_verification_rejects_revoked_key() {
+        let mut policy = Config::default();
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_REVOKED_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-signature-revoked-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        let signature_path = temp_root.join("plugin.sig");
+        std::fs::write(&plugin_path, "#!/usr/bin/env sh\necho ok\n").expect("write plugin");
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let public_key = signing_key.verifying_key();
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(public_key.as_bytes());
+        policy
+            .plugins
+            .signature
+            .revoked_key_sha256
+            .push(plugin_public_key_fingerprint(public_key.as_bytes()));
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let command_bytes = std::fs::read(&plugin_path).expect("read plugin");
+        let signature = signing_key.sign(command_bytes.as_slice());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        std::fs::write(&signature_path, signature_b64).expect("write signature");
+
+        let plugin = patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: signature_path.to_string_lossy().to_string(),
+        };
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+
+        let err = verify_plugin_signature(&policy, &ctx, &plugin)
+            .expect_err("revoked key must not verify");
+        assert!(format!("{err:#}").contains("is revoked"));
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[cfg(not(windows))]

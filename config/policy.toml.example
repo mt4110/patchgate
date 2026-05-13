@@ -182,6 +182,8 @@ max_stdout_kib = 256
 [plugins.signature]
 required = false
 public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
+trusted_key_envs = []
+revoked_key_sha256 = []
 
 [integrations.ci]
 provider = "github" # github | generic
