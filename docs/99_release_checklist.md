@@ -54,6 +54,11 @@ CI/Workflowで自動化済み:
 - [ ] **GA Readiness**: `ga-readiness.yml` artifact確認
 - [ ] **Compatibility Evidence**: `compatibility-report.md` で posture が意図と一致
 - [ ] **Freeze Evidence**: `v1.1-readiness.md` で freeze_ready / v2_seed_ready を確認
+- [ ] **Freeze Boundary Gate**: `v1.1-freeze-boundary.md` で scope inventory / deferred backlog / breaking-change boundary / v2 risk register を確認
+  - [ ] `cargo run -p xtask -- ops freeze-boundary --output artifacts/v1.1-freeze-boundary.md`
+  - [ ] v1.1に入れる候補と、deferred / non-goal / v2-seed の分類が一致
+  - [ ] plugin / provider / audit / policy / docs / SDK の破壊変更境界が説明可能
+  - [ ] deferred item は owner phase または non-goal rationale を持つ
 - [ ] **V2 Bridge Evidence**: `verify-v2` / `diff-contract` / `shadow-review.md` を確認
 - [ ] **Fleet Governance Evidence**: `fleet-review.md` で bundle / provenance / exception / cost を確認
 - [ ] **RC Evidence**: `v2-rc-readiness.md` で candidate gate が green

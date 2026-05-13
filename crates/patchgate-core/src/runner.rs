@@ -424,13 +424,6 @@ fn execute_plugin(
             plugin.id, plugin.command
         )
     })?;
-    let stdin_writer = child.stdin.take().map(|mut stdin| {
-        thread::spawn(move || -> std::io::Result<()> {
-            stdin.write_all(&input_json)?;
-            Ok(())
-        })
-    });
-
     let stdout = child
         .stdout
         .take()
@@ -448,6 +441,12 @@ fn execute_plugin(
     });
     let stderr_reader = thread::spawn(move || {
         read_stream_with_limit(stderr, max_output_bytes, Some(stderr_limit_probe))
+    });
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&input_json)?;
+            Ok(())
+        })
     });
 
     let termination = wait_for_child_with_timeout(
@@ -3183,6 +3182,57 @@ mod tests {
         });
         let result = join_stdin_writer(handle, &ChildTermination::Exited(status));
         assert!(result.is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_timeout_applies_when_stdin_writer_blocks_on_unread_input() {
+        let policy = Config::default();
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-unread-stdin-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(&plugin_path, "#!/usr/bin/env sh\nexec sleep 5\n")
+            .expect("write plugin script");
+        let plugin = patchgate_config::PluginEntry {
+            id: "unread-stdin".to_string(),
+            command: "sh".to_string(),
+            args: vec![plugin_path.to_string_lossy().to_string()],
+            timeout_ms: 100,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: String::new(),
+        };
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: (0..20_000)
+                .map(|i| ChangedFile {
+                    path: format!("src/file_{i}.rs"),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 0,
+                    added_lines: Vec::new(),
+                    removed_lines: Vec::new(),
+                })
+                .collect(),
+            fingerprint: "large-plugin-input".to_string(),
+        };
+
+        let start = Instant::now();
+        let invocation =
+            execute_plugin(&policy, &ctx, &diff, "warn", &plugin).expect("execute plugin");
+
+        assert_eq!(invocation.status, PluginInvocationStatus::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "plugin timeout should apply while stdin writer is blocked"
+        );
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

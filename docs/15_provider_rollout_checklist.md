@@ -8,6 +8,8 @@
 - `patchgate policy diff-contract --format text`
 - `cargo run -p xtask -- ops compatibility-report ...`
 - `cargo run -p xtask -- ops freeze-scoreboard ...`
+- `cargo run -p xtask -- ops freeze-boundary --output artifacts/v1.1-freeze-boundary.md`
+- `docs/24_v11_freeze_boundary.md` で generic provider v1 が v1.1 stable boundary、v2 provider payload が v2-seed boundary に分類されていることを確認
 
 ## Shadow rollout
 
@@ -22,6 +24,7 @@
 - `audit-drift-report.md` に未知コードがない
 - `freeze_ready = true`
 - `v2_seed_ready = true`
+- provider breaking-change boundary が `v1.1-freeze-boundary.md` と一致
 
 ## Rollback trigger
 

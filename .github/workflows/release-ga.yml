@@ -125,6 +125,8 @@ jobs:
             --audit-input artifacts/scan-audit.jsonl \
             --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
             --output artifacts/v1.1-readiness.md
+          cargo run -p xtask -- ops freeze-boundary \
+            --output artifacts/v1.1-freeze-boundary.md
           cargo run -p xtask -- ops audit-drift-report \
             --audit-input artifacts/scan-audit.jsonl \
             --audit-v2-input artifacts/scan-audit-v2.jsonl \
@@ -151,6 +153,7 @@ jobs:
             --migration-guide-path docs/16_v2_migration_guide_alpha.md \
             --provider-rollout-path docs/15_provider_rollout_checklist.md \
             --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+            --freeze-boundary-path artifacts/v1.1-freeze-boundary.md \
             --output artifacts/v2-rc-readiness.md
           cargo run -p xtask -- ops ga-packet \
             --metrics-input artifacts/scan-metrics.jsonl \

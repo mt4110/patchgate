@@ -5,7 +5,9 @@
 ## 1. Freeze v1.1
 
 - `patchgate policy verify-v1 --readiness-profile strict`
+- `cargo run -p xtask -- ops freeze-boundary --output artifacts/v1.1-freeze-boundary.md`
 - `cargo run -p xtask -- ops freeze-scoreboard ...`
+- `docs/24_v11_freeze_boundary.md` の deferred / non-goal / v2-seed 分類を確認
 
 ## 2. Enable shadow mode
 
@@ -34,6 +36,7 @@ audit_v2_schema_version = 2
 - dual-run の event count が安定
 - `compatibility-report.md` が `start-v2-seed`
 - audit drift が 0
+- `v1.1-freeze-boundary.md` の v2 option と risk register が RC gate に接続済み
 
 ## 5. Rollback
 

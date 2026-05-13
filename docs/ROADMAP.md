@@ -16,6 +16,7 @@ This roadmap tracks the patchgate pivot.
 - [V2 Ops Handbook](19_v2_ops_handbook.md)
 - [V1 Sunset Notice](21_v1_sunset_notice.md)
 - [V2 Support Model](22_v2_support_model.md)
+- [v1.1 Freeze Boundary](24_v11_freeze_boundary.md)
 - [Phase Backcast (201+)](20_phase201_plus_backcast.md)
 - [PR Plan: Phase1-10](07_pr_plan_phase1_10.md)
 - [PR Plan: Phase11-20](08_pr_plan_phase11_20.md)
@@ -47,12 +48,14 @@ Phase21以降の詳細PR Planは private archive へ移動済みのため、公�
 - Phase101-120: baseline implementation completed
 - Phase101-120 follow-up: docs / cross-repo rollout / ops settlement continue
 - Phase121-130: implementation started
-- Phase131-150: design fixed / implementation follow-up ongoing
+- Phase131-140: trust / SIEM follow-up merged
+- Phase141-150: freeze boundary artifact connected
 - Phase151-200: design fixed, fleet/RC/GA artifact implementation started
 - Next execution focus:
   - PR151 compatibility evidence pack
   - PR152 weekly/release compatibility artifact wiring
   - PR153 v1.1 freeze evidence refresh
+  - PR141-150 freeze boundary inventory / risk register review
   - PR156 replay evidence normalization
   - PR161-165 bridge / verify-v2 / contract diff prototype
   - PR171-179 fleet governance packet
