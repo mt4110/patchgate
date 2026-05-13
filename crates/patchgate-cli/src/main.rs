@@ -3134,19 +3134,20 @@ fn exception_governance_artifact_summary(value: &Value) -> (bool, String) {
 
 fn ymd_key_for_artifact(raw: &str) -> Option<(u16, u8, u8)> {
     let trimmed = raw.trim();
-    if trimmed.len() < 10
-        || trimmed.as_bytes()[4] != b'-'
-        || trimmed.as_bytes()[7] != b'-'
-        || !trimmed[..10]
-            .bytes()
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..10]
+            .iter()
             .enumerate()
             .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
     {
         return None;
     }
-    let year = trimmed[0..4].parse::<u16>().ok()?;
-    let month = trimmed[5..7].parse::<u8>().ok()?;
-    let day = trimmed[8..10].parse::<u8>().ok()?;
+    let year = artifact_parse_ascii_u16(&bytes[0..4])?;
+    let month = artifact_parse_ascii_u8(&bytes[5..7])?;
+    let day = artifact_parse_ascii_u8(&bytes[8..10])?;
     if month == 0 || month > 12 {
         return None;
     }
@@ -3155,6 +3156,19 @@ fn ymd_key_for_artifact(raw: &str) -> Option<(u16, u8, u8)> {
         return None;
     }
     Some((year, month, day))
+}
+
+fn artifact_parse_ascii_u16(bytes: &[u8]) -> Option<u16> {
+    bytes.iter().try_fold(0u16, |acc, byte| {
+        byte.is_ascii_digit()
+            .then_some(acc * 10 + u16::from(*byte - b'0'))
+    })
+}
+
+fn artifact_parse_ascii_u8(bytes: &[u8]) -> Option<u8> {
+    bytes.iter().try_fold(0u8, |acc, byte| {
+        byte.is_ascii_digit().then_some(acc * 10 + (*byte - b'0'))
+    })
 }
 
 fn artifact_days_in_month(year: u16, month: u8) -> Option<u8> {
@@ -8788,6 +8802,10 @@ migration_guide_path = "docs/v2-migration-alpha.md"
         assert!(!registry_provenance_artifact_summary(&untrusted_registry).0);
         assert_eq!(
             exception_expired("2026-99-99T00:00:00Z", "2026-05-13T00:00:00Z"),
+            None
+        );
+        assert_eq!(
+            exception_expired("2026-05-1é", "2026-05-13T00:00:00Z"),
             None
         );
 

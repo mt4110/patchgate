@@ -509,6 +509,7 @@ struct ShadowAlignment {
 #[derive(Debug, Clone)]
 struct ProviderArtifactSummary {
     repo: String,
+    provider: String,
     schema_mode: String,
     capabilities: BTreeSet<String>,
 }
@@ -533,6 +534,8 @@ struct FleetRepoRow {
 #[derive(Debug, Clone)]
 struct ProviderNegotiationStatus {
     repo: String,
+    required_providers: Vec<String>,
+    provided_providers: Vec<String>,
     required_modes: Vec<String>,
     required_capabilities: Vec<String>,
     provided_modes: Vec<String>,
@@ -2651,11 +2654,7 @@ fn fleet_repo_posture_label(
 }
 
 fn bundle_retention_tier(entry: &FleetBundleEntry) -> String {
-    if entry.retention_tier.trim().is_empty() {
-        "standard".to_string()
-    } else {
-        entry.retention_tier.clone()
-    }
+    entry.retention_tier.clone()
 }
 
 fn format_csv(values: &[String]) -> String {
@@ -2687,14 +2686,27 @@ fn provider_negotiation_statuses(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
+            let provided_providers = matching
+                .iter()
+                .map(|summary| summary.provider.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
             let provided_capabilities = matching
                 .iter()
                 .flat_map(|summary| summary.capabilities.iter().cloned())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
+            let required_providers = entry.providers.clone();
             let required_modes = entry.required_provider_modes.clone();
             let required_capabilities = entry.required_provider_capabilities.clone();
+            let provider_ready = required_providers.is_empty()
+                || provided_providers.iter().any(|provider| {
+                    required_providers
+                        .iter()
+                        .any(|required| required == provider)
+                });
             let mode_ready = required_modes.is_empty()
                 || provided_modes
                     .iter()
@@ -2706,11 +2718,13 @@ fn provider_negotiation_statuses(
             });
             ProviderNegotiationStatus {
                 repo: entry.repo.clone(),
+                required_providers,
+                provided_providers,
                 required_modes,
                 required_capabilities,
                 provided_modes,
                 provided_capabilities,
-                ready: mode_ready && capability_ready,
+                ready: provider_ready && mode_ready && capability_ready,
             }
         })
         .collect()
@@ -2751,6 +2765,10 @@ fn segment_cost_statuses(
 
 fn cost_within_ceiling(actual_minutes: f64, ceiling_minutes: Option<u64>) -> bool {
     ceiling_minutes.map_or(true, |ceiling| actual_minutes <= ceiling as f64)
+}
+
+fn audit_v2_evidence_ready(repo_rows: &[FleetRepoRow], required: bool) -> bool {
+    !required || repo_rows.iter().all(|row| row.audit_events_v2 > 0)
 }
 
 fn retention_tier_is_valid(tier: &AuditRetentionTierPolicy) -> bool {
@@ -2866,19 +2884,20 @@ fn registry_provenance_ready(index: Option<&PluginRegistryIndex>) -> Option<bool
 
 fn ymd_key(raw: &str) -> Option<(u16, u8, u8)> {
     let trimmed = raw.trim();
-    if trimmed.len() < 10
-        || trimmed.as_bytes()[4] != b'-'
-        || trimmed.as_bytes()[7] != b'-'
-        || !trimmed[..10]
-            .bytes()
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..10]
+            .iter()
             .enumerate()
             .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
     {
         return None;
     }
-    let year = trimmed[0..4].parse::<u16>().ok()?;
-    let month = trimmed[5..7].parse::<u8>().ok()?;
-    let day = trimmed[8..10].parse::<u8>().ok()?;
+    let year = parse_ascii_u16(&bytes[0..4])?;
+    let month = parse_ascii_u8(&bytes[5..7])?;
+    let day = parse_ascii_u8(&bytes[8..10])?;
     if month == 0 || month > 12 {
         return None;
     }
@@ -2887,6 +2906,19 @@ fn ymd_key(raw: &str) -> Option<(u16, u8, u8)> {
         return None;
     }
     Some((year, month, day))
+}
+
+fn parse_ascii_u16(bytes: &[u8]) -> Option<u16> {
+    bytes.iter().try_fold(0u16, |acc, byte| {
+        byte.is_ascii_digit()
+            .then_some(acc * 10 + u16::from(*byte - b'0'))
+    })
+}
+
+fn parse_ascii_u8(bytes: &[u8]) -> Option<u8> {
+    bytes.iter().try_fold(0u8, |acc, byte| {
+        byte.is_ascii_digit().then_some(acc * 10 + (*byte - b'0'))
+    })
 }
 
 fn days_in_month(year: u16, month: u8) -> Option<u8> {
@@ -3123,6 +3155,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     );
     let segment_cost_ok = segment_cost_rows.iter().all(|row| row.ok);
     let repo_cost_ok = repo_rows.iter().all(|row| row.repo_cost_ok);
+    let audit_v2_ready = audit_v2_evidence_ready(&repo_rows, options.audit_v2_input.is_some());
     let retention_ready = bundle_catalog.as_ref().map(|catalog| {
         let tier_names = catalog
             .retention_tiers
@@ -3154,6 +3187,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         && cost_ceiling_ok
         && repo_cost_ok
         && segment_cost_ok
+        && audit_v2_ready
         && provider_negotiation_ready
         && catalog_governance_ready.unwrap_or(true)
         && retention_ready.unwrap_or(true)
@@ -3183,6 +3217,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         ));
     }
     md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!("- audit_v2_evidence_ready: {}\n", audit_v2_ready));
     md.push_str(&format!(
         "- provider_negotiation_ready: {}\n",
         provider_negotiation_ready
@@ -3315,8 +3350,9 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         for summary in &provider_summaries {
             let capabilities = summary.capabilities.iter().cloned().collect::<Vec<_>>();
             md.push_str(&format!(
-                "- artifact repo={} schema_mode={} capabilities={}\n",
+                "- artifact repo={} provider={} schema_mode={} capabilities={}\n",
                 summary.repo,
+                summary.provider,
                 summary.schema_mode,
                 format_csv(&capabilities)
             ));
@@ -3326,9 +3362,11 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         md.push_str("\n### Negotiation Contract\n");
         for status in &provider_negotiations {
             md.push_str(&format!(
-                "- repo={} ready={} required_modes={} provided_modes={} required_capabilities={} provided_capabilities={}\n",
+                "- repo={} ready={} required_providers={} provided_providers={} required_modes={} provided_modes={} required_capabilities={} provided_capabilities={}\n",
                 status.repo,
                 status.ready,
+                format_csv(&status.required_providers),
+                format_csv(&status.provided_providers),
                 format_csv(&status.required_modes),
                 format_csv(&status.provided_modes),
                 format_csv(&status.required_capabilities),
@@ -3660,6 +3698,11 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     }
     if !audit_drift_clean {
         md.push_str("- Federated audit aggregation is not clean; inspect schema, format, result, and failure code drift.\n");
+    }
+    if !audit_v2_ready {
+        md.push_str(
+            "- One or more repos are missing audit v2 evidence while audit v2 input is required.\n",
+        );
     }
     if provider_summaries.iter().all(|row| row.schema_mode == "v1")
         && !provider_summaries.is_empty()
@@ -4102,6 +4145,23 @@ fn provider_capabilities(value: &serde_json::Value, schema_mode: &str) -> BTreeS
     capabilities
 }
 
+fn provider_identity(value: &serde_json::Value, schema_mode: &str) -> String {
+    if let Some(provider) = value.get("provider").and_then(serde_json::Value::as_str) {
+        return provider.to_string();
+    }
+    if let Some(provider) = value
+        .get("v1")
+        .and_then(|v1| v1.get("provider"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return provider.to_string();
+    }
+    match schema_mode {
+        "dual" | "v2" => "generic".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSummary>> {
     let mut out = Vec::new();
     for path in paths {
@@ -4136,6 +4196,7 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
             .unwrap_or("unknown");
         out.push(ProviderArtifactSummary {
             repo: repo.to_string(),
+            provider: provider_identity(&value, schema_mode),
             schema_mode: schema_mode.to_string(),
             capabilities: provider_capabilities(&value, schema_mode),
         });
@@ -4961,7 +5022,7 @@ mod tests {
 
     use super::{
         aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
-        average_duration_for_summary, build_audit_drift_summary,
+        audit_v2_evidence_ready, average_duration_for_summary, build_audit_drift_summary,
         build_combined_audit_drift_summary, build_compatibility_assessment,
         build_freeze_boundary_markdown, build_freeze_scoreboard, build_shadow_alignment,
         build_siem_handoff_records, build_verify_v1_calibration, bundle_catalog_governance_ready,
@@ -4974,10 +5035,10 @@ mod tests {
         summarize_provider_inputs, validate_siem_handoff_input, validate_workload_identity,
         workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
         AuditOperationV2, AuditRetentionTierPolicy, BenchSample, CompatibilityPosture,
-        DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry, FleetSegmentPolicy,
-        GovernanceExceptionEntry, GovernanceExceptionsPacket, MetricLogRecord, OpsOptions,
-        OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary,
-        RolloutWavePolicy, TEMP_SEQ,
+        DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry, FleetRepoRow,
+        FleetSegmentPolicy, GovernanceExceptionEntry, GovernanceExceptionsPacket, MetricLogRecord,
+        OpsOptions, OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex,
+        ProviderArtifactSummary, RolloutWavePolicy, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -6197,11 +6258,13 @@ mod tests {
         let summaries = vec![
             ProviderArtifactSummary {
                 repo: "repo-b".to_string(),
+                provider: "generic".to_string(),
                 schema_mode: "dual".to_string(),
                 capabilities: std::collections::BTreeSet::new(),
             },
             ProviderArtifactSummary {
                 repo: "repo-a".to_string(),
+                provider: "generic".to_string(),
                 schema_mode: "v1".to_string(),
                 capabilities: std::collections::BTreeSet::new(),
             },
@@ -6224,6 +6287,7 @@ mod tests {
             .expect("summarize provider inputs");
         assert_eq!(summaries[0].schema_mode, "dual");
         assert_eq!(summaries[0].repo, "example/repo");
+        assert_eq!(summaries[0].provider, "generic");
         assert!(summaries[0].capabilities.contains("generic.dual"));
 
         let _ = fs::remove_file(path);
@@ -6272,6 +6336,7 @@ mod tests {
         capabilities.insert("audit.shadow".to_string());
         let summaries = vec![ProviderArtifactSummary {
             repo: "example/repo".to_string(),
+            provider: "generic".to_string(),
             schema_mode: "dual".to_string(),
             capabilities,
         }];
@@ -6279,6 +6344,12 @@ mod tests {
         let statuses = provider_negotiation_statuses(Some(&catalog), &summaries);
         assert_eq!(statuses.len(), 1);
         assert!(statuses[0].ready);
+
+        let mut wrong_provider = summaries.clone();
+        wrong_provider[0].provider = "other".to_string();
+        let statuses = provider_negotiation_statuses(Some(&catalog), &wrong_provider);
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].ready);
     }
 
     #[test]
@@ -6370,6 +6441,45 @@ mod tests {
     }
 
     #[test]
+    fn audit_v2_evidence_is_required_when_input_is_present() {
+        let rows = vec![
+            FleetRepoRow {
+                repo: "example/repo".to_string(),
+                posture: "stabilize-v1".to_string(),
+                runs: 1,
+                audit_events_v1: 1,
+                audit_events_v2: 1,
+                gate_failures: 0,
+                average_score: 90.0,
+                ci_minutes: 1.0,
+                segment: "prod".to_string(),
+                wave: "canary".to_string(),
+                retention_tier: "regulated".to_string(),
+                repo_cost_ceiling_minutes: Some(10),
+                repo_cost_ok: true,
+            },
+            FleetRepoRow {
+                repo: "example/without-v2".to_string(),
+                posture: "stabilize-v1".to_string(),
+                runs: 1,
+                audit_events_v1: 1,
+                audit_events_v2: 0,
+                gate_failures: 0,
+                average_score: 90.0,
+                ci_minutes: 1.0,
+                segment: "prod".to_string(),
+                wave: "canary".to_string(),
+                retention_tier: "regulated".to_string(),
+                repo_cost_ceiling_minutes: Some(10),
+                repo_cost_ok: true,
+            },
+        ];
+
+        assert!(audit_v2_evidence_ready(&rows, false));
+        assert!(!audit_v2_evidence_ready(&rows, true));
+    }
+
+    #[test]
     fn registry_and_exception_governance_require_complete_evidence() {
         let registry = PluginRegistryIndex {
             schema_version: 1,
@@ -6408,6 +6518,10 @@ mod tests {
         );
         assert_eq!(
             exception_is_expired("2026-99-99T00:00:00Z", "2026-05-13T00:00:00Z"),
+            None
+        );
+        assert_eq!(
+            exception_is_expired("2026-05-1é", "2026-05-13T00:00:00Z"),
             None
         );
         let packet = GovernanceExceptionsPacket {
