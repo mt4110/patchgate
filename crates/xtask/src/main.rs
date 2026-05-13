@@ -2701,12 +2701,11 @@ fn provider_negotiation_statuses(
             let required_providers = entry.providers.clone();
             let required_modes = entry.required_provider_modes.clone();
             let required_capabilities = entry.required_provider_capabilities.clone();
-            let provider_ready = required_providers.is_empty()
-                || provided_providers.iter().any(|provider| {
-                    required_providers
-                        .iter()
-                        .any(|required| required == provider)
-                });
+            let provider_ready = required_providers.iter().all(|required| {
+                provided_providers
+                    .iter()
+                    .any(|provider| provider == required)
+            });
             let mode_ready = required_modes.is_empty()
                 || provided_modes
                     .iter()
@@ -2765,6 +2764,18 @@ fn segment_cost_statuses(
 
 fn cost_within_ceiling(actual_minutes: f64, ceiling_minutes: Option<u64>) -> bool {
     ceiling_minutes.map_or(true, |ceiling| actual_minutes <= ceiling as f64)
+}
+
+fn repo_cost_ceiling_minutes(
+    entry: Option<&FleetBundleEntry>,
+    segment: &str,
+    segment_cost_ceiling_by_name: &BTreeMap<String, u64>,
+    fallback_ceiling_minutes: Option<u64>,
+) -> Option<u64> {
+    entry
+        .and_then(|entry| entry.cost_ceiling_minutes)
+        .or_else(|| segment_cost_ceiling_by_name.get(segment).copied())
+        .or(fallback_ceiling_minutes)
 }
 
 fn audit_v2_evidence_ready(repo_rows: &[FleetRepoRow], required: bool) -> bool {
@@ -3058,6 +3069,16 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let segment_cost_ceiling_by_name = bundle_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .segments
+                .iter()
+                .map(|segment| (segment.segment.clone(), segment.cost_ceiling_minutes))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let empty_metrics: &[MetricLogRecord] = &[];
     let empty_audits: &[AuditLogRecord] = &[];
     let empty_audits_v2: &[AuditLogV2Record] = &[];
@@ -3108,9 +3129,12 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .get(repo.as_str())
             .map(|entry| (entry.wave.clone(), bundle_retention_tier(entry)))
             .unwrap_or_else(|| ("unassigned".to_string(), "standard".to_string()));
-        let repo_cost_ceiling_minutes = bundle_map
-            .get(repo.as_str())
-            .and_then(|entry| entry.cost_ceiling_minutes);
+        let repo_cost_ceiling_minutes = repo_cost_ceiling_minutes(
+            bundle_map.get(repo.as_str()).copied(),
+            segment.as_str(),
+            &segment_cost_ceiling_by_name,
+            options.cost_ceiling_minutes,
+        );
         let repo_cost_ok = cost_within_ceiling(ci_minutes, repo_cost_ceiling_minutes);
         repo_rows.push(FleetRepoRow {
             repo: repo.clone(),
@@ -5030,14 +5054,14 @@ mod tests {
         exception_governance_statuses, exception_is_expired, fleet_repo_posture_label,
         load_json_file, load_jsonl_records, load_release_policy_summary, parse_ops_options,
         percentile_u128, provider_bridge_ready_for_repos, provider_negotiation_statuses,
-        registry_provenance_ready, retention_tier_is_valid, run_ga_readiness,
-        security_review_is_approved, segment_cost_statuses, summarize_delivery_bridge_inputs,
-        summarize_provider_inputs, validate_siem_handoff_input, validate_workload_identity,
-        workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
-        AuditOperationV2, AuditRetentionTierPolicy, BenchSample, CompatibilityPosture,
-        DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry, FleetRepoRow,
-        FleetSegmentPolicy, GovernanceExceptionEntry, GovernanceExceptionsPacket, MetricLogRecord,
-        OpsOptions, OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex,
+        registry_provenance_ready, repo_cost_ceiling_minutes, retention_tier_is_valid,
+        run_ga_readiness, security_review_is_approved, segment_cost_statuses,
+        summarize_delivery_bridge_inputs, summarize_provider_inputs, validate_siem_handoff_input,
+        validate_workload_identity, workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord,
+        AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy, BenchSample,
+        CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry,
+        FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry, GovernanceExceptionsPacket,
+        MetricLogRecord, OpsOptions, OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex,
         ProviderArtifactSummary, RolloutWavePolicy, TEMP_SEQ,
     };
 
@@ -6350,6 +6374,26 @@ mod tests {
         let statuses = provider_negotiation_statuses(Some(&catalog), &wrong_provider);
         assert_eq!(statuses.len(), 1);
         assert!(!statuses[0].ready);
+
+        let mut multi_provider_catalog = catalog.clone();
+        multi_provider_catalog.bundles[0]
+            .providers
+            .push("internal".to_string());
+        let statuses = provider_negotiation_statuses(Some(&multi_provider_catalog), &summaries);
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].ready);
+
+        let mut complete_provider_set = summaries.clone();
+        complete_provider_set.push(ProviderArtifactSummary {
+            repo: "example/repo".to_string(),
+            provider: "internal".to_string(),
+            schema_mode: "dual".to_string(),
+            capabilities: std::collections::BTreeSet::new(),
+        });
+        let statuses =
+            provider_negotiation_statuses(Some(&multi_provider_catalog), &complete_provider_set);
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].ready);
     }
 
     #[test]
@@ -6390,6 +6434,16 @@ mod tests {
         assert_eq!(bundle_catalog_governance_ready(Some(&catalog)), Some(false));
         assert!(cost_within_ceiling(20.0, Some(20)));
         assert!(!cost_within_ceiling(20.1, Some(20)));
+        let mut segment_ceilings = std::collections::BTreeMap::new();
+        segment_ceilings.insert("prod".to_string(), 30);
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "prod", &segment_ceilings, Some(60)),
+            Some(30)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "unknown", &segment_ceilings, Some(60)),
+            Some(60)
+        );
 
         let complete_catalog = FleetBundleCatalog {
             schema_version: 1,
@@ -6429,6 +6483,15 @@ mod tests {
         assert_eq!(
             bundle_catalog_governance_ready(Some(&complete_catalog)),
             Some(true)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(
+                complete_catalog.bundles.first(),
+                "prod",
+                &segment_ceilings,
+                Some(60)
+            ),
+            Some(20)
         );
         let mut missing_provider_contract = complete_catalog.clone();
         missing_provider_contract.bundles[0]
