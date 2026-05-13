@@ -44,7 +44,7 @@ patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.
 - Compatibility report: `cargo run -p xtask -- ops compatibility-report --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/compatibility-report.md`
 - Freeze scoreboard: `cargo run -p xtask -- ops freeze-scoreboard --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/v1.1-readiness.md`
 - Freeze boundary inventory: `cargo run -p xtask -- ops freeze-boundary --output artifacts/v1.1-freeze-boundary.md`
-- V2 readiness: `patchgate policy verify-v2 --path policy.toml --format text`
+- V2 readiness: `patchgate policy verify-v2 --path policy.toml --provider-input artifacts/provider-dual.json --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --plugin-shadow-input sdk/templates/python-plugin/sample-input.v2.json --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json --format text`
 - Fleet review: `cargo run -p xtask -- ops fleet-review --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --output artifacts/fleet-review.md`
 - SIEM handoff: `cargo run -p xtask -- ops siem-handoff --audit-v2-input artifacts/scan-audit-v2.jsonl --output artifacts/siem-handoff.jsonl`
 - RC/GA packets: `cargo run -p xtask -- ops rc-readiness ...` / `cargo run -p xtask -- ops ga-packet ...`

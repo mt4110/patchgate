@@ -483,6 +483,30 @@ struct PolicyVerifyV2Args {
     /// Output format: text|json
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Generic provider v2 or dual artifact to validate (repeatable)
+    #[arg(long = "provider-input")]
+    provider_inputs: Vec<PathBuf>,
+
+    /// Audit v1 JSONL artifact for dual-write validation
+    #[arg(long)]
+    audit_input: Option<PathBuf>,
+
+    /// Audit v2 JSONL artifact for dual-write validation
+    #[arg(long = "audit-v2-input")]
+    audit_v2_input: Option<PathBuf>,
+
+    /// Plugin v2 shadow sample input to validate (repeatable)
+    #[arg(long = "plugin-shadow-input")]
+    plugin_shadow_inputs: Vec<PathBuf>,
+
+    /// Webhook v2 shadow envelope artifact to validate (repeatable)
+    #[arg(long = "webhook-envelope-input")]
+    webhook_envelope_inputs: Vec<PathBuf>,
+
+    /// Notification v2 shadow envelope artifact to validate (repeatable)
+    #[arg(long = "notification-envelope-input")]
+    notification_envelope_inputs: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -839,6 +863,8 @@ struct WebhookEnvelope<'a> {
     unix_ts: u64,
     repo: &'a str,
     report: &'a Report,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge: Option<DeliveryBridgeMetadata<'a>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -860,7 +886,7 @@ impl<'a> DeliveryBridgeContext<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct NotificationBridgeMetadata<'a> {
+struct DeliveryBridgeMetadata<'a> {
     schema_version: u8,
     bridge_format: &'a str,
     shadow_of: &'a str,
@@ -2002,8 +2028,52 @@ struct V2ReadinessReport {
     audit_schema_version: u8,
     audit_v2_schema_version: u8,
     audit_v2_output_enabled: bool,
+    provider_artifact_ready: Option<bool>,
+    audit_dual_write_artifact_ready: Option<bool>,
+    plugin_shadow_sample_ready: Option<bool>,
+    webhook_bridge_artifact_ready: Option<bool>,
+    notification_bridge_artifact_ready: Option<bool>,
+    artifact_checks: Vec<V2ArtifactCheck>,
     warnings: Vec<String>,
     next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct V2ArtifactCheck {
+    kind: String,
+    path: String,
+    present: bool,
+    valid: bool,
+    summary: String,
+}
+
+#[derive(Debug, Default)]
+struct V2ArtifactContext {
+    provider_artifact_ready: Option<bool>,
+    audit_dual_write_artifact_ready: Option<bool>,
+    plugin_shadow_sample_ready: Option<bool>,
+    webhook_bridge_artifact_ready: Option<bool>,
+    notification_bridge_artifact_ready: Option<bool>,
+    checks: Vec<V2ArtifactCheck>,
+}
+
+impl V2ArtifactContext {
+    fn ready(&self) -> bool {
+        self.provider_artifact_ready.unwrap_or(true)
+            && self.audit_dual_write_artifact_ready.unwrap_or(true)
+            && self.plugin_shadow_sample_ready.unwrap_or(true)
+            && self.webhook_bridge_artifact_ready.unwrap_or(true)
+            && self.notification_bridge_artifact_ready.unwrap_or(true)
+            && self.checks.iter().all(|check| check.valid)
+    }
+
+    fn has_checks(&self) -> bool {
+        self.provider_artifact_ready.is_some()
+            || self.audit_dual_write_artifact_ready.is_some()
+            || self.plugin_shadow_sample_ready.is_some()
+            || self.webhook_bridge_artifact_ready.is_some()
+            || self.notification_bridge_artifact_ready.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2272,7 +2342,13 @@ fn run_policy_verify_v2(
         }
     };
 
-    let report = build_v2_readiness_report(repo_root, policy_path.as_path(), &loaded.config);
+    let artifact_context = build_v2_artifact_context(repo_root, &args);
+    let report = build_v2_readiness_report(
+        repo_root,
+        policy_path.as_path(),
+        &loaded.config,
+        artifact_context,
+    );
     if let Err(err) = print_v2_readiness_report(&report, args.format.as_str()) {
         eprintln!("patchgate policy verify-v2 error: {err}");
         return if err.contains("unsupported --format") {
@@ -2329,10 +2405,404 @@ fn run_policy_diff_contract(
     PolicyExitCode::Ok
 }
 
+fn build_v2_artifact_context(repo_root: &Path, args: &PolicyVerifyV2Args) -> V2ArtifactContext {
+    let mut context = V2ArtifactContext::default();
+
+    if !args.provider_inputs.is_empty() {
+        let mut provider_ready = true;
+        for raw_path in &args.provider_inputs {
+            let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+            let check = check_provider_artifact(path.as_path());
+            provider_ready &= check.valid;
+            context.checks.push(check);
+        }
+        context.provider_artifact_ready = Some(provider_ready);
+    }
+
+    match (args.audit_input.as_ref(), args.audit_v2_input.as_ref()) {
+        (Some(audit_input), Some(audit_v2_input)) => {
+            let audit_path = resolve_repo_relative_path(repo_root, audit_input.clone());
+            let audit_v2_path = resolve_repo_relative_path(repo_root, audit_v2_input.clone());
+            let audit = check_audit_jsonl_artifact(
+                "audit-v1",
+                audit_path.as_path(),
+                audit_v1_artifact_row_is_valid,
+            );
+            let audit_v2 = check_audit_jsonl_artifact(
+                "audit-v2",
+                audit_v2_path.as_path(),
+                audit_v2_artifact_row_is_valid,
+            );
+            let event_delta = audit.rows as isize - audit_v2.rows as isize;
+            context.audit_dual_write_artifact_ready =
+                Some(audit.check.valid && audit_v2.check.valid && event_delta.abs() <= 1);
+            context.checks.push(audit.check);
+            context.checks.push(audit_v2.check);
+        }
+        (Some(audit_input), None) => {
+            let audit_path = resolve_repo_relative_path(repo_root, audit_input.clone());
+            context.checks.push(
+                check_audit_jsonl_artifact(
+                    "audit-v1",
+                    audit_path.as_path(),
+                    audit_v1_artifact_row_is_valid,
+                )
+                .check,
+            );
+            context.audit_dual_write_artifact_ready = Some(false);
+        }
+        (None, Some(audit_v2_input)) => {
+            let audit_v2_path = resolve_repo_relative_path(repo_root, audit_v2_input.clone());
+            context.checks.push(
+                check_audit_jsonl_artifact(
+                    "audit-v2",
+                    audit_v2_path.as_path(),
+                    audit_v2_artifact_row_is_valid,
+                )
+                .check,
+            );
+            context.audit_dual_write_artifact_ready = Some(false);
+        }
+        (None, None) => {}
+    }
+
+    if !args.plugin_shadow_inputs.is_empty() {
+        let mut plugin_ready = true;
+        for raw_path in &args.plugin_shadow_inputs {
+            let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+            let check = check_plugin_shadow_sample(path.as_path());
+            plugin_ready &= check.valid;
+            context.checks.push(check);
+        }
+        context.plugin_shadow_sample_ready = Some(plugin_ready);
+    }
+
+    if !args.webhook_envelope_inputs.is_empty() {
+        let mut webhook_ready = true;
+        for raw_path in &args.webhook_envelope_inputs {
+            let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+            let check = check_delivery_bridge_artifact(
+                "webhook-bridge",
+                path.as_path(),
+                "patchgate.webhook.v2-shadow",
+                "scan.completed",
+            );
+            webhook_ready &= check.valid;
+            context.checks.push(check);
+        }
+        context.webhook_bridge_artifact_ready = Some(webhook_ready);
+    }
+
+    if !args.notification_envelope_inputs.is_empty() {
+        let mut notification_ready = true;
+        for raw_path in &args.notification_envelope_inputs {
+            let path = resolve_repo_relative_path(repo_root, raw_path.clone());
+            let check = check_delivery_bridge_artifact(
+                "notification-bridge",
+                path.as_path(),
+                "patchgate.notification.v2-shadow",
+                "scan.completed.notification",
+            );
+            notification_ready &= check.valid;
+            context.checks.push(check);
+        }
+        context.notification_bridge_artifact_ready = Some(notification_ready);
+    }
+
+    context
+}
+
+fn check_provider_artifact(path: &Path) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let schema_mode = classify_provider_artifact(&value);
+                let repo = value
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let valid = matches!(schema_mode, "dual" | "v2");
+                V2ArtifactCheck {
+                    kind: "provider".to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary: format!("schema_mode={schema_mode} repo={repo}"),
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: "provider".to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: "provider".to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn classify_provider_artifact(value: &Value) -> &'static str {
+    if value.get("bridge_format").and_then(Value::as_str)
+        == Some("patchgate.provider.generic.bridge.v1")
+        && value.get("v1").is_some()
+        && value.get("v2").is_some()
+    {
+        "dual"
+    } else if value.get("publish_format").and_then(Value::as_str)
+        == Some("patchgate.provider.generic.v2")
+        && value.get("gate").is_some()
+        && value.get("artifacts").is_some()
+    {
+        "v2"
+    } else if value.get("provider").and_then(Value::as_str) == Some("generic")
+        && value.get("summary").is_some()
+        && value.get("report").is_some()
+    {
+        "v1"
+    } else {
+        "unknown"
+    }
+}
+
+struct JsonlArtifactCheck {
+    check: V2ArtifactCheck,
+    rows: usize,
+}
+
+fn check_audit_jsonl_artifact(
+    kind: &str,
+    path: &Path,
+    row_is_valid: fn(&Value) -> bool,
+) -> JsonlArtifactCheck {
+    match load_jsonl_values_for_artifact(path) {
+        Ok(rows) => {
+            let invalid_rows = rows.iter().filter(|row| !row_is_valid(row)).count();
+            let row_count = rows.len();
+            JsonlArtifactCheck {
+                check: V2ArtifactCheck {
+                    kind: kind.to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid: row_count > 0 && invalid_rows == 0,
+                    summary: format!("rows={row_count} invalid_rows={invalid_rows}"),
+                },
+                rows: row_count,
+            }
+        }
+        Err(err) => JsonlArtifactCheck {
+            check: V2ArtifactCheck {
+                kind: kind.to_string(),
+                path: path.display().to_string(),
+                present: path.exists(),
+                valid: false,
+                summary: err,
+            },
+            rows: 0,
+        },
+    }
+}
+
+fn load_jsonl_values_for_artifact(path: &Path) -> std::result::Result<Vec<Value>, String> {
+    let file = fs::File::open(path).map_err(|err| format!("open failed: {err}"))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|err| format!("read line {} failed: {err}", idx + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(line.as_str())
+            .map_err(|err| format!("decode line {} failed: {err}", idx + 1))?;
+        rows.push(value);
+    }
+    Ok(rows)
+}
+
+fn audit_v1_artifact_row_is_valid(row: &Value) -> bool {
+    schema_version_in_range(row, 1, 10)
+        && row.get("audit_format").and_then(Value::as_str) == Some("patchgate.audit.v1")
+        && required_string(row, "actor")
+        && required_string(row, "repo")
+        && required_string(row, "target")
+        && required_string(row, "mode")
+        && required_string(row, "scope")
+        && required_string(row, "result")
+}
+
+fn audit_v2_artifact_row_is_valid(row: &Value) -> bool {
+    let Some(operation) = row.get("operation") else {
+        return false;
+    };
+    schema_version_in_range(row, 2, 10)
+        && row.get("audit_format").and_then(Value::as_str) == Some("patchgate.audit.v2")
+        && required_string(row, "actor")
+        && required_string(row, "repo")
+        && required_string(operation, "target")
+        && required_string(operation, "mode")
+        && required_string(operation, "scope")
+        && required_string(operation, "result")
+        && row.get("gate").is_some()
+        && row.get("failure").is_some()
+}
+
+fn schema_version_in_range(row: &Value, min: u64, max: u64) -> bool {
+    row.get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| (min..=max).contains(&version))
+}
+
+fn required_string(row: &Value, key: &str) -> bool {
+    row.get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn check_plugin_shadow_sample(path: &Path) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let valid = plugin_shadow_sample_is_valid(&value);
+                let plugin_id = value
+                    .get("plugin_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let bridge_mode = value
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("bridge_mode"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                V2ArtifactCheck {
+                    kind: "plugin-shadow".to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary: format!("plugin_id={plugin_id} bridge_mode={bridge_mode}"),
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: "plugin-shadow".to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: "plugin-shadow".to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn plugin_shadow_sample_is_valid(value: &Value) -> bool {
+    value.get("schema_version").and_then(Value::as_u64) == Some(2)
+        && value.get("api_version").and_then(Value::as_str) == Some("patchgate.plugin.v2-shadow")
+        && value.get("shadow_of").and_then(Value::as_str) == Some("patchgate.plugin.v1")
+        && required_string(value, "plugin_id")
+        && value
+            .get("changed_files")
+            .and_then(Value::as_array)
+            .is_some()
+        && value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("bridge_mode"))
+            .and_then(Value::as_str)
+            == Some("shadow")
+}
+
+fn check_delivery_bridge_artifact(
+    kind: &str,
+    path: &Path,
+    expected_bridge_format: &str,
+    expected_shadow_of: &str,
+) -> V2ArtifactCheck {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(raw.as_str()) {
+            Ok(value) => {
+                let valid = delivery_bridge_artifact_is_valid(
+                    &value,
+                    expected_bridge_format,
+                    expected_shadow_of,
+                );
+                let bridge_format = value
+                    .get("bridge")
+                    .and_then(|bridge| bridge.get("bridge_format"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let bridge_mode = value
+                    .get("bridge")
+                    .and_then(|bridge| bridge.get("bridge_mode"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                V2ArtifactCheck {
+                    kind: kind.to_string(),
+                    path: path.display().to_string(),
+                    present: true,
+                    valid,
+                    summary: format!("bridge_format={bridge_format} bridge_mode={bridge_mode}"),
+                }
+            }
+            Err(err) => V2ArtifactCheck {
+                kind: kind.to_string(),
+                path: path.display().to_string(),
+                present: true,
+                valid: false,
+                summary: format!("invalid json: {err}"),
+            },
+        },
+        Err(err) => V2ArtifactCheck {
+            kind: kind.to_string(),
+            path: path.display().to_string(),
+            present: false,
+            valid: false,
+            summary: format!("read failed: {err}"),
+        },
+    }
+}
+
+fn delivery_bridge_artifact_is_valid(
+    value: &Value,
+    expected_bridge_format: &str,
+    expected_shadow_of: &str,
+) -> bool {
+    required_string(value, "repo")
+        && value.get("event").and_then(Value::as_str) == Some(expected_shadow_of)
+        && value.get("bridge").is_some_and(|bridge| {
+            delivery_bridge_metadata_is_valid(bridge, expected_bridge_format, expected_shadow_of)
+        })
+        && if expected_shadow_of == "scan.completed" {
+            value.get("report").is_some()
+        } else {
+            value.get("summary").is_some()
+        }
+}
+
+fn delivery_bridge_metadata_is_valid(
+    bridge: &Value,
+    expected_bridge_format: &str,
+    expected_shadow_of: &str,
+) -> bool {
+    bridge.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && bridge.get("bridge_format").and_then(Value::as_str) == Some(expected_bridge_format)
+        && bridge.get("shadow_of").and_then(Value::as_str) == Some(expected_shadow_of)
+        && bridge.get("bridge_mode").and_then(Value::as_str) == Some("full")
+}
+
 fn build_v2_readiness_report(
     repo_root: &Path,
     policy_path: &Path,
     cfg: &Config,
+    artifact_context: V2ArtifactContext,
 ) -> V2ReadinessReport {
     let mut warnings = Vec::new();
     let mut next_actions = Vec::new();
@@ -2382,6 +2852,41 @@ fn build_v2_readiness_report(
         warnings.push("compatibility.v2.migration_guide_path is missing or unresolved".to_string());
         next_actions.push("Add a migration guide artifact for the v2 shadow rollout.".to_string());
     }
+    if artifact_context.provider_artifact_ready == Some(false) {
+        warnings.push("provider bridge artifact check failed".to_string());
+        next_actions.push(
+            "Generate a generic provider artifact with `--ci-generic-schema dual` or `v2`."
+                .to_string(),
+        );
+    }
+    if artifact_context.audit_dual_write_artifact_ready == Some(false) {
+        warnings.push("audit dual-write artifact check failed".to_string());
+        next_actions.push(
+            "Regenerate audit v1/v2 JSONL with matching scan scope, then run shadow-review."
+                .to_string(),
+        );
+    }
+    if artifact_context.plugin_shadow_sample_ready == Some(false) {
+        warnings.push("plugin v2 shadow sample check failed".to_string());
+        next_actions.push(
+            "Regenerate SDK template samples or provide a valid `sample-input.v2.json`."
+                .to_string(),
+        );
+    }
+    if artifact_context.webhook_bridge_artifact_ready == Some(false) {
+        warnings.push("webhook bridge artifact check failed".to_string());
+        next_actions.push(
+            "Capture or provide a webhook envelope with `patchgate.webhook.v2-shadow` metadata."
+                .to_string(),
+        );
+    }
+    if artifact_context.notification_bridge_artifact_ready == Some(false) {
+        warnings.push("notification bridge artifact check failed".to_string());
+        next_actions.push(
+            "Capture or provide a notification envelope with `patchgate.notification.v2-shadow` metadata."
+                .to_string(),
+        );
+    }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
         && cfg.compatibility.v1.rc_frozen
@@ -2392,10 +2897,16 @@ fn build_v2_readiness_report(
             || !matches!(bridge_mode, "provider" | "full")
             || cfg.integrations.ci.generic_schema != "v1")
         && (!matches!(bridge_mode, "audit" | "full") || audit_v2_output_enabled)
-        && migration_guide_exists;
+        && migration_guide_exists
+        && artifact_context.ready();
 
     if ready {
-        next_actions.push("v2 shadow/bridge prerequisites are satisfied.".to_string());
+        if artifact_context.has_checks() {
+            next_actions
+                .push("v2 shadow/bridge policy and artifact checks are satisfied.".to_string());
+        } else {
+            next_actions.push("v2 shadow/bridge prerequisites are satisfied.".to_string());
+        }
     }
 
     V2ReadinessReport {
@@ -2413,6 +2924,12 @@ fn build_v2_readiness_report(
         audit_schema_version: cfg.observability.audit_schema_version,
         audit_v2_schema_version: cfg.observability.audit_v2_schema_version,
         audit_v2_output_enabled,
+        provider_artifact_ready: artifact_context.provider_artifact_ready,
+        audit_dual_write_artifact_ready: artifact_context.audit_dual_write_artifact_ready,
+        plugin_shadow_sample_ready: artifact_context.plugin_shadow_sample_ready,
+        webhook_bridge_artifact_ready: artifact_context.webhook_bridge_artifact_ready,
+        notification_bridge_artifact_ready: artifact_context.notification_bridge_artifact_ready,
+        artifact_checks: artifact_context.checks,
         warnings,
         next_actions,
     }
@@ -2456,6 +2973,35 @@ fn print_v2_readiness_report(
                 "- audit_v2_output_enabled: {}",
                 report.audit_v2_output_enabled
             );
+            print_optional_bool("- provider_artifact_ready", report.provider_artifact_ready);
+            print_optional_bool(
+                "- audit_dual_write_artifact_ready",
+                report.audit_dual_write_artifact_ready,
+            );
+            print_optional_bool(
+                "- plugin_shadow_sample_ready",
+                report.plugin_shadow_sample_ready,
+            );
+            print_optional_bool(
+                "- webhook_bridge_artifact_ready",
+                report.webhook_bridge_artifact_ready,
+            );
+            print_optional_bool(
+                "- notification_bridge_artifact_ready",
+                report.notification_bridge_artifact_ready,
+            );
+            if report.artifact_checks.is_empty() {
+                println!("- artifact_checks: none");
+            } else {
+                println!("- artifact_checks:");
+                for check in &report.artifact_checks {
+                    println!(
+                        "  - {}: present={} valid={} path={}",
+                        check.kind, check.present, check.valid, check.path
+                    );
+                    println!("    - {}", check.summary);
+                }
+            }
             if report.warnings.is_empty() {
                 println!("- warnings: none");
             } else {
@@ -2476,6 +3022,13 @@ fn print_v2_readiness_report(
         }
     }
     Ok(())
+}
+
+fn print_optional_bool(label: &str, value: Option<bool>) {
+    match value {
+        Some(value) => println!("{label}: {value}"),
+        None => println!("{label}: not_checked"),
+    }
 }
 
 fn build_contract_diff_report(
@@ -5118,6 +5671,11 @@ fn dispatch_signed_webhooks(
         unix_ts,
         repo: telemetry_repo,
         report: &sanitized_report,
+        bridge: delivery_bridge_metadata(
+            options.bridge,
+            "patchgate.webhook.v2-shadow",
+            "scan.completed",
+        ),
     };
     let payload_value = serde_json::to_value(&envelope)?;
     let payload_raw = mask_sensitive(serde_json::to_string(&envelope)?.as_str());
@@ -5369,12 +5927,14 @@ fn notification_payload(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
                 "bridge".to_string(),
-                serde_json::to_value(NotificationBridgeMetadata {
-                    schema_version: 1,
-                    bridge_format: "patchgate.notification.v2-shadow",
-                    shadow_of: "scan.completed.notification",
-                    bridge_mode: bridge.bridge_mode,
-                })?,
+                serde_json::to_value(
+                    delivery_bridge_metadata(
+                        bridge,
+                        "patchgate.notification.v2-shadow",
+                        "scan.completed.notification",
+                    )
+                    .expect("bridge metadata must exist when bridge is enabled"),
+                )?,
             );
         }
         payload
@@ -5382,6 +5942,23 @@ fn notification_payload(
         payload
     };
     Ok(payload)
+}
+
+fn delivery_bridge_metadata<'a>(
+    bridge: DeliveryBridgeContext<'a>,
+    bridge_format: &'a str,
+    shadow_of: &'a str,
+) -> Option<DeliveryBridgeMetadata<'a>> {
+    if bridge.enabled {
+        Some(DeliveryBridgeMetadata {
+            schema_version: 1,
+            bridge_format,
+            shadow_of,
+            bridge_mode: bridge.bridge_mode,
+        })
+    } else {
+        None
+    }
 }
 
 fn header_name_to_title_case(name: &str) -> String {
@@ -6184,16 +6761,17 @@ mod tests {
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
         build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
         build_history_trend, changed_file_limit_fail_open_report, ci_template_catalog,
-        delivery_bridge_headers, detect_head_sha_from_env, detect_pr_number_from_env,
-        detect_sandbox_capabilities, gate_exit_code, is_likely_cache_corruption,
-        load_dead_letter_jsonl, load_policy_config, notification_payload, parse_mode,
-        parse_policy_preset, parse_scope, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
-        recover_cache_db, redacted_endpoint, render_contract_diff_report_json,
-        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        delivery_bridge_headers, delivery_bridge_metadata, detect_head_sha_from_env,
+        detect_pr_number_from_env, detect_sandbox_capabilities, gate_exit_code,
+        is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
+        notification_payload, parse_mode, parse_policy_preset, parse_scope,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
+        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
+        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -6201,6 +6779,7 @@ mod tests {
         PolicyDiffContractArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
         PolicyVerifyV2Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
         RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
+        WebhookEnvelope,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -7515,6 +8094,12 @@ bridge_mode = "off"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
             },
         );
         assert_eq!(code, PolicyExitCode::MigrationRequired);
@@ -7562,9 +8147,222 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_accepts_dual_contract_artifact_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-artifacts-{seq}"));
+        fs::create_dir_all(repo_root.join("docs")).expect("create docs");
+        fs::create_dir_all(repo_root.join("artifacts")).expect("create artifacts");
+        fs::write(
+            repo_root.join("docs/v2-migration-alpha.md"),
+            "# v2 migration\n",
+        )
+        .expect("write guide");
+        fs::write(
+            repo_root.join("artifacts/provider-dual.json"),
+            r#"{"schema_version":1,"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"example/repo","v1":{"provider":"generic","summary":{},"report":{}},"v2":{"schema_version":2,"publish_format":"patchgate.provider.generic.v2","repo":"example/repo","gate":{},"artifacts":{}}}"#,
+        )
+        .expect("write provider");
+        fs::write(
+            repo_root.join("artifacts/scan-audit.jsonl"),
+            r#"{"schema_version":1,"audit_format":"patchgate.audit.v1","unix_ts":1,"actor":"user","repo":"example/repo","target":"scan","mode":"warn","scope":"staged","result":"pass"}"#,
+        )
+        .expect("write audit");
+        fs::write(
+            repo_root.join("artifacts/scan-audit-v2.jsonl"),
+            r#"{"schema_version":2,"audit_format":"patchgate.audit.v2","emitted_at":1,"actor":"user","repo":"example/repo","operation":{"target":"scan","mode":"warn","scope":"staged","result":"pass"},"gate":{},"failure":{},"diagnostics":[]}"#,
+        )
+        .expect("write audit v2");
+        fs::write(
+            repo_root.join("artifacts/plugin-shadow.v2.json"),
+            r#"{"schema_version":2,"api_version":"patchgate.plugin.v2-shadow","shadow_of":"patchgate.plugin.v1","plugin_id":"sample","repo_root":".","mode":"warn","scope":"staged","changed_files":[],"metadata":{"bridge_mode":"shadow"}}"#,
+        )
+        .expect("write plugin shadow sample");
+        fs::write(
+            repo_root.join("artifacts/webhook-shadow.json"),
+            r#"{"event":"scan.completed","unix_ts":1,"repo":"example/repo","report":{},"bridge":{"schema_version":1,"bridge_format":"patchgate.webhook.v2-shadow","shadow_of":"scan.completed","bridge_mode":"full"}}"#,
+        )
+        .expect("write webhook bridge envelope");
+        fs::write(
+            repo_root.join("artifacts/notification-shadow.json"),
+            r#"{"event":"scan.completed.notification","repo":"example/repo","summary":{},"bridge":{"schema_version":1,"bridge_format":"patchgate.notification.v2-shadow","shadow_of":"scan.completed.notification","bridge_mode":"full"}}"#,
+        )
+        .expect("write notification bridge envelope");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "json".to_string(),
+                provider_inputs: vec![PathBuf::from("artifacts/provider-dual.json")],
+                audit_input: Some(PathBuf::from("artifacts/scan-audit.jsonl")),
+                audit_v2_input: Some(PathBuf::from("artifacts/scan-audit-v2.jsonl")),
+                plugin_shadow_inputs: vec![PathBuf::from("artifacts/plugin-shadow.v2.json")],
+                webhook_envelope_inputs: vec![PathBuf::from("artifacts/webhook-shadow.json")],
+                notification_envelope_inputs: vec![PathBuf::from(
+                    "artifacts/notification-shadow.json",
+                )],
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_rejects_v1_only_provider_artifact_input() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-v1-provider-{seq}"));
+        fs::create_dir_all(repo_root.join("docs")).expect("create docs");
+        fs::create_dir_all(repo_root.join("artifacts")).expect("create artifacts");
+        fs::write(
+            repo_root.join("docs/v2-migration-alpha.md"),
+            "# v2 migration\n",
+        )
+        .expect("write guide");
+        fs::write(
+            repo_root.join("artifacts/provider-v1.json"),
+            r#"{"schema_version":1,"provider":"generic","repo":"example/repo","summary":{},"report":{},"markdown":""}"#,
+        )
+        .expect("write provider v1");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                provider_inputs: vec![PathBuf::from("artifacts/provider-v1.json")],
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_rejects_invalid_delivery_bridge_artifact_input() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-delivery-{seq}"));
+        fs::create_dir_all(repo_root.join("docs")).expect("create docs");
+        fs::create_dir_all(repo_root.join("artifacts")).expect("create artifacts");
+        fs::write(
+            repo_root.join("docs/v2-migration-alpha.md"),
+            "# v2 migration\n",
+        )
+        .expect("write guide");
+        fs::write(
+            repo_root.join("artifacts/webhook-shadow.json"),
+            r#"{"event":"scan.completed","repo":"example/repo","report":{},"bridge":{"schema_version":1,"bridge_format":"patchgate.webhook.v2-shadow","shadow_of":"scan.completed","bridge_mode":"provider"}}"#,
+        )
+        .expect("write invalid webhook bridge envelope");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "text".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: vec![PathBuf::from("artifacts/webhook-shadow.json")],
+                notification_envelope_inputs: Vec::new(),
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -7609,6 +8407,12 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
@@ -8834,6 +9638,59 @@ profile = "none"
                 .and_then(|value| value.get("bridge_mode"))
                 .and_then(Value::as_str),
             Some("full")
+        );
+    }
+
+    #[test]
+    fn webhook_envelope_includes_bridge_metadata_in_shadow_mode() {
+        let report = Report::new(
+            vec![],
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 0,
+                max_penalty: 35,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let envelope = WebhookEnvelope {
+            event: "scan.completed",
+            unix_ts: 1,
+            repo: "example/repo",
+            report: &report,
+            bridge: delivery_bridge_metadata(
+                DeliveryBridgeContext {
+                    enabled: true,
+                    shadow_mode: true,
+                    bridge_mode: "full",
+                },
+                "patchgate.webhook.v2-shadow",
+                "scan.completed",
+            ),
+        };
+        let value = serde_json::to_value(&envelope).expect("encode webhook envelope");
+
+        assert_eq!(
+            value
+                .get("bridge")
+                .and_then(|bridge| bridge.get("bridge_format"))
+                .and_then(Value::as_str),
+            Some("patchgate.webhook.v2-shadow")
+        );
+        assert_eq!(
+            value
+                .get("bridge")
+                .and_then(|bridge| bridge.get("shadow_of"))
+                .and_then(Value::as_str),
+            Some("scan.completed")
         );
     }
 

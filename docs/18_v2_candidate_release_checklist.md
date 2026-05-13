@@ -11,6 +11,8 @@
 - [ ] `xtask ops rc-readiness`
 - [ ] provider dual-schema artifact compatibility verified
 - [ ] audit dual-write artifact compatibility verified
+- [ ] plugin v2 shadow envelope sample verified
+- [ ] webhook / notification bridge metadata verified
 - [ ] migration guide updated
 - [ ] rollback packet updated
 - [ ] v1.1 freeze boundary inventory reviewed

@@ -19,12 +19,13 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{
     CheckId, CheckScore, Finding, Location, PluginChangedFile, PluginFinding, PluginInput,
-    PluginInvocation, PluginInvocationStatus, PluginOutput, Report, ReportMeta, Severity,
-    SupplyChainSignal,
+    PluginInputV2Shadow, PluginInvocation, PluginInvocationStatus, PluginOutput,
+    PluginShadowContract, Report, ReportMeta, Severity, SupplyChainSignal,
 };
 
 const MAX_STORED_LINE_SAMPLES: usize = 32;
 const MAX_STORED_LINE_CHARS: usize = 240;
+const PLUGIN_SHADOW_BRIDGE_MODE: &str = "shadow";
 
 #[derive(Debug, Clone, Copy)]
 pub enum ScopeMode {
@@ -297,6 +298,7 @@ fn evaluate_plugins(
                     status: PluginInvocationStatus::Error,
                     duration_ms: start.elapsed().as_millis(),
                     sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                    shadow_contract: plugin_shadow_contract(policy, ctx, diff, mode, plugin)?,
                     findings: Vec::new(),
                     diagnostics: vec!["execution failed".to_string()],
                     error: Some(message),
@@ -336,36 +338,21 @@ fn execute_plugin(
     plugin: &patchgate_config::PluginEntry,
 ) -> Result<PluginInvocation> {
     let start = Instant::now();
+    let input = build_plugin_input(ctx, diff, mode, plugin);
+    let shadow_contract = plugin_shadow_contract_from_input(policy, &input)?;
     if let Err(err) = verify_plugin_signature(policy, ctx, plugin) {
         return Ok(PluginInvocation {
             plugin_id: plugin.id.clone(),
             status: PluginInvocationStatus::Error,
             duration_ms: start.elapsed().as_millis(),
             sandbox_profile: policy.plugins.sandbox.profile.clone(),
+            shadow_contract,
             findings: Vec::new(),
             diagnostics: vec![format!("signature verification failed: {err:#}")],
             error: Some(format!("signature verification failed: {err:#}")),
         });
     }
 
-    let input = PluginInput {
-        schema_version: 1,
-        api_version: "patchgate.plugin.v1".to_string(),
-        plugin_id: plugin.id.clone(),
-        repo_root: ctx.repo_root.to_string_lossy().to_string(),
-        mode: mode.to_string(),
-        scope: ctx.scope.as_str().to_string(),
-        changed_files: diff
-            .files
-            .iter()
-            .map(|f| PluginChangedFile {
-                path: f.path.clone(),
-                status: change_status_as_str(f.status).to_string(),
-                added: f.added,
-                deleted: f.deleted,
-            })
-            .collect(),
-    };
     let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
     let max_output_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
     let sandbox_profile = policy.plugins.sandbox.profile.as_str();
@@ -380,6 +367,7 @@ fn execute_plugin(
                     status: PluginInvocationStatus::Error,
                     duration_ms: start.elapsed().as_millis(),
                     sandbox_profile: sandbox_profile.to_string(),
+                    shadow_contract,
                     findings: Vec::new(),
                     diagnostics: vec![message.clone()],
                     error: Some(message),
@@ -472,6 +460,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::TimedOut,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            shadow_contract,
             findings: Vec::new(),
             diagnostics: vec![format!("timeout after {}ms", plugin.timeout_ms)],
             error: Some(format!("plugin timed out after {}ms", plugin.timeout_ms)),
@@ -503,6 +492,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::Error,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            shadow_contract,
             findings: Vec::new(),
             diagnostics: vec![message.clone()],
             error: Some(message),
@@ -526,6 +516,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::Error,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            shadow_contract,
             findings: Vec::new(),
             diagnostics: vec!["plugin process returned non-zero exit".to_string()],
             error: Some(reason),
@@ -557,10 +548,68 @@ fn execute_plugin(
         status,
         duration_ms,
         sandbox_profile: sandbox_profile.to_string(),
+        shadow_contract,
         findings: plugin_output.findings,
         diagnostics,
         error: None,
     })
+}
+
+fn build_plugin_input(
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+    plugin: &patchgate_config::PluginEntry,
+) -> PluginInput {
+    PluginInput {
+        schema_version: 1,
+        api_version: "patchgate.plugin.v1".to_string(),
+        plugin_id: plugin.id.clone(),
+        repo_root: ctx.repo_root.to_string_lossy().to_string(),
+        mode: mode.to_string(),
+        scope: ctx.scope.as_str().to_string(),
+        changed_files: diff
+            .files
+            .iter()
+            .map(|f| PluginChangedFile {
+                path: f.path.clone(),
+                status: change_status_as_str(f.status).to_string(),
+                added: f.added,
+                deleted: f.deleted,
+            })
+            .collect(),
+    }
+}
+
+fn plugin_shadow_contract(
+    policy: &Config,
+    ctx: &Context,
+    diff: &DiffData,
+    mode: &str,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<Option<PluginShadowContract>> {
+    let input = build_plugin_input(ctx, diff, mode, plugin);
+    plugin_shadow_contract_from_input(policy, &input)
+}
+
+fn plugin_shadow_contract_from_input(
+    policy: &Config,
+    input: &PluginInput,
+) -> Result<Option<PluginShadowContract>> {
+    if !policy.compatibility.v2.shadow_mode {
+        return Ok(None);
+    }
+    let bridge_mode = PLUGIN_SHADOW_BRIDGE_MODE.to_string();
+    let shadow_input = PluginInputV2Shadow::from_v1(input, bridge_mode.clone());
+    let shadow_json =
+        serde_json::to_vec(&shadow_input).context("failed to encode plugin shadow input")?;
+    Ok(Some(PluginShadowContract {
+        input_api_version: input.api_version.clone(),
+        shadow_api_version: shadow_input.api_version,
+        shadow_of: shadow_input.shadow_of,
+        bridge_mode,
+        shadow_envelope_sha256: format!("{:x}", Sha256::digest(shadow_json.as_slice())),
+    }))
 }
 
 fn verify_plugin_signature(
@@ -3122,6 +3171,42 @@ mod tests {
         assert!(!plugin_invocation_is_execution_failure(
             &PluginInvocationStatus::Skipped
         ));
+    }
+
+    #[test]
+    fn plugin_shadow_contract_hashes_v2_envelope_without_changing_v1_input() {
+        let mut policy = Config::default();
+        policy.compatibility.v2.shadow_mode = true;
+        policy.compatibility.v2.bridge_mode = "full".to_string();
+        let input = PluginInput {
+            schema_version: 1,
+            api_version: "patchgate.plugin.v1".to_string(),
+            plugin_id: "sample".to_string(),
+            repo_root: ".".to_string(),
+            mode: "warn".to_string(),
+            scope: "worktree".to_string(),
+            changed_files: vec![PluginChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: "modified".to_string(),
+                added: 2,
+                deleted: 1,
+            }],
+        };
+
+        let contract = plugin_shadow_contract_from_input(&policy, &input)
+            .expect("contract")
+            .expect("shadow contract");
+        let shadow = PluginInputV2Shadow::from_v1(&input, PLUGIN_SHADOW_BRIDGE_MODE);
+
+        assert_eq!(input.api_version, "patchgate.plugin.v1");
+        assert_eq!(shadow.api_version, "patchgate.plugin.v2-shadow");
+        assert_eq!(shadow.shadow_of, "patchgate.plugin.v1");
+        assert_eq!(shadow.metadata.bridge_mode, "shadow");
+        assert_eq!(contract.input_api_version, "patchgate.plugin.v1");
+        assert_eq!(contract.shadow_api_version, "patchgate.plugin.v2-shadow");
+        assert_eq!(contract.shadow_of, "patchgate.plugin.v1");
+        assert_eq!(contract.bridge_mode, "shadow");
+        assert_eq!(contract.shadow_envelope_sha256.len(), 64);
     }
 
     #[test]

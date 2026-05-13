@@ -158,6 +158,12 @@ patchgate policy verify-v1 \
 ```bash
 patchgate policy verify-v2 \
   --path config/policy.toml.example \
+  --provider-input artifacts/provider-dual.json \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --plugin-shadow-input sdk/templates/python-plugin/sample-input.v2.json \
+  --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json \
+  --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json \
   --format text
 ```
 
@@ -229,6 +235,9 @@ v2 option matrix、risk register、release checklist freeze gate をまとめま
 cargo run -p xtask -- ops shadow-review \
   --audit-input artifacts/scan-audit.jsonl \
   --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --provider-input artifacts/provider-dual.json \
+  --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json \
+  --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json \
   --output artifacts/shadow-review.md
 ```
 

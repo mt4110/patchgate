@@ -58,6 +58,15 @@ jobs:
             --ci-provider generic \
             --ci-generic-schema dual \
             --ci-generic-output artifacts/provider-dual.json
+          cargo run -p patchgate-cli -- policy verify-v2 \
+            --path artifacts/policy.v2.toml \
+            --provider-input artifacts/provider-dual.json \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --plugin-shadow-input sdk/templates/python-plugin/sample-input.v2.json \
+            --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json \
+            --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json \
+            --format json > artifacts/verify-v2-artifacts.json
           cargo run -p patchgate-cli -- history summary \
             --input artifacts/scan-metrics.jsonl \
             --format json > artifacts/history-summary.json
@@ -134,6 +143,9 @@ jobs:
           cargo run -p xtask -- ops shadow-review \
             --audit-input artifacts/scan-audit.jsonl \
             --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json \
+            --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json \
             --output artifacts/shadow-review.md
           cargo run -p xtask -- ops fleet-review \
             --metrics-input artifacts/scan-metrics.jsonl \

@@ -151,11 +151,22 @@ pub struct PluginInvocation {
     pub status: PluginInvocationStatus,
     pub duration_ms: u128,
     pub sandbox_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_contract: Option<PluginShadowContract>,
     #[serde(default)]
     pub findings: Vec<PluginFinding>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginShadowContract {
+    pub input_api_version: String,
+    pub shadow_api_version: String,
+    pub shadow_of: String,
+    pub bridge_mode: String,
+    pub shadow_envelope_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,6 +196,42 @@ pub struct PluginInput {
     pub mode: String,
     pub scope: String,
     pub changed_files: Vec<PluginChangedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginInputV2Shadow {
+    pub schema_version: u8,
+    pub api_version: String,
+    pub shadow_of: String,
+    pub plugin_id: String,
+    pub repo_root: String,
+    pub mode: String,
+    pub scope: String,
+    pub changed_files: Vec<PluginChangedFile>,
+    pub metadata: PluginShadowMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginShadowMetadata {
+    pub bridge_mode: String,
+}
+
+impl PluginInputV2Shadow {
+    pub fn from_v1(input: &PluginInput, bridge_mode: impl Into<String>) -> Self {
+        Self {
+            schema_version: 2,
+            api_version: "patchgate.plugin.v2-shadow".to_string(),
+            shadow_of: input.api_version.clone(),
+            plugin_id: input.plugin_id.clone(),
+            repo_root: input.repo_root.clone(),
+            mode: input.mode.clone(),
+            scope: input.scope.clone(),
+            changed_files: input.changed_files.clone(),
+            metadata: PluginShadowMetadata {
+                bridge_mode: bridge_mode.into(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

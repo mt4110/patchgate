@@ -28,3 +28,4 @@ Templates:
 
 - generated template には `sample-input.v2.json` も含まれます
 - これは `patchgate.plugin.v2-shadow` の preview envelope で、現時点では migration 設計用サンプルです
+- runtime stdin は v1 のまま維持し、v2 shadow envelope は diagnostics と `verify-v2 --plugin-shadow-input` で検証します

@@ -130,8 +130,15 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
+- `--provider-input <provider-dual-or-v2.json>` (repeatable)
+- `--audit-input <scan-audit.jsonl>`
+- `--audit-v2-input <scan-audit-v2.jsonl>`
+- `--plugin-shadow-input <sample-input.v2.json>` (repeatable)
+- `--webhook-envelope-input <webhook-shadow-envelope.json>` (repeatable)
+- `--notification-envelope-input <notification-shadow-envelope.json>` (repeatable)
 - v2 shadow / bridge の準備状態を検証
 - 主に `compatibility.v2.*`, `integrations.ci.generic_schema`, `observability.audit_v2_*` を確認
+- artifact input を渡した場合は provider dual/v2、audit dual-write、plugin v2 shadow envelope、webhook / notification bridge envelope の実体も確認
 
 ### `patchgate policy diff-contract`
 

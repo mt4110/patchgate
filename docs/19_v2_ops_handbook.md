@@ -17,9 +17,10 @@
 2. freeze boundary inventory has an unresolved deferred / non-goal mismatch
 3. audit drift introduces unknown codes
 4. shadow review shows v2 regression
-5. provider rollout checklist triggers rollback
-6. fleet review exceeds cost ceiling or exposes unverified provenance
-7. GA packet fails LTS/support/sunset checks
+5. provider / plugin / delivery bridge artifact check fails
+6. provider rollout checklist triggers rollback
+7. fleet review exceeds cost ceiling or exposes unverified provenance
+8. GA packet fails LTS/support/sunset checks
 
 ## Steady-state loop
 
@@ -28,8 +29,9 @@
 3. rebuild compatibility report
 4. refresh freeze boundary inventory when scope decisions change
 5. review shadow output
-6. review fleet packet
-7. decide hold / widen / rollback
+6. verify provider, audit, plugin shadow, webhook, and notification bridge artifacts
+7. review fleet packet
+8. decide hold / widen / rollback
 
 ## GA command
 
