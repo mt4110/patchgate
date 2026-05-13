@@ -3096,6 +3096,7 @@ fn registry_provenance_artifact_summary(value: &Value) -> (bool, String) {
 
 fn exception_governance_artifact_summary(value: &Value) -> (bool, String) {
     let exceptions = value_array(value, "exceptions");
+    let exceptions_is_array = value.get("exceptions").is_some_and(Value::is_array);
     let reviewed_at = value
         .get("reviewed_at")
         .and_then(Value::as_str)
@@ -3125,6 +3126,7 @@ fn exception_governance_artifact_summary(value: &Value) -> (bool, String) {
     });
     let valid = schema_version_in_range(value, 1, 10)
         && ymd_key_for_artifact(reviewed_at).is_some()
+        && exceptions_is_array
         && valid_exceptions;
     (
         valid,
@@ -8824,6 +8826,13 @@ migration_guide_path = "docs/v2-migration-alpha.md"
             }]
         });
         assert!(!exception_governance_artifact_summary(&stale_exception).0);
+
+        let malformed_exception_packet = serde_json::json!({
+            "schema_version": 1,
+            "reviewed_at": "2026-05-13T00:00:00Z",
+            "exceptions": {"repo": "example/repo"}
+        });
+        assert!(!exception_governance_artifact_summary(&malformed_exception_packet).0);
     }
 
     #[test]

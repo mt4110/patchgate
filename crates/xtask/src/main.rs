@@ -2750,6 +2750,7 @@ fn segment_cost_statuses(
                 .get(segment.as_str())
                 .copied()
                 .or(fallback_ceiling_minutes);
+            let ceiling_minutes = active_cost_ceiling_minutes(ceiling_minutes);
             let actual_minutes = *duration_ms as f64 / 60_000.0;
             let ok = cost_within_ceiling(actual_minutes, ceiling_minutes);
             SegmentCostStatus {
@@ -2762,8 +2763,13 @@ fn segment_cost_statuses(
         .collect()
 }
 
+fn active_cost_ceiling_minutes(ceiling_minutes: Option<u64>) -> Option<u64> {
+    ceiling_minutes.filter(|ceiling| *ceiling > 0)
+}
+
 fn cost_within_ceiling(actual_minutes: f64, ceiling_minutes: Option<u64>) -> bool {
-    ceiling_minutes.map_or(true, |ceiling| actual_minutes <= ceiling as f64)
+    active_cost_ceiling_minutes(ceiling_minutes)
+        .map_or(true, |ceiling| actual_minutes <= ceiling as f64)
 }
 
 fn repo_cost_ceiling_minutes(
@@ -2772,10 +2778,9 @@ fn repo_cost_ceiling_minutes(
     segment_cost_ceiling_by_name: &BTreeMap<String, u64>,
     fallback_ceiling_minutes: Option<u64>,
 ) -> Option<u64> {
-    entry
-        .and_then(|entry| entry.cost_ceiling_minutes)
-        .or_else(|| segment_cost_ceiling_by_name.get(segment).copied())
-        .or(fallback_ceiling_minutes)
+    active_cost_ceiling_minutes(entry.and_then(|entry| entry.cost_ceiling_minutes))
+        .or_else(|| active_cost_ceiling_minutes(segment_cost_ceiling_by_name.get(segment).copied()))
+        .or_else(|| active_cost_ceiling_minutes(fallback_ceiling_minutes))
 }
 
 fn audit_v2_evidence_ready(repo_rows: &[FleetRepoRow], required: bool) -> bool {
@@ -5045,24 +5050,25 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
-        audit_v2_evidence_ready, average_duration_for_summary, build_audit_drift_summary,
-        build_combined_audit_drift_summary, build_compatibility_assessment,
-        build_freeze_boundary_markdown, build_freeze_scoreboard, build_shadow_alignment,
-        build_siem_handoff_records, build_verify_v1_calibration, bundle_catalog_governance_ready,
-        candidate_repos, canonical_repo_path, checklist_box, cost_within_ceiling,
-        exception_governance_statuses, exception_is_expired, fleet_repo_posture_label,
-        load_json_file, load_jsonl_records, load_release_policy_summary, parse_ops_options,
-        percentile_u128, provider_bridge_ready_for_repos, provider_negotiation_statuses,
-        registry_provenance_ready, repo_cost_ceiling_minutes, retention_tier_is_valid,
-        run_ga_readiness, security_review_is_approved, segment_cost_statuses,
-        summarize_delivery_bridge_inputs, summarize_provider_inputs, validate_siem_handoff_input,
-        validate_workload_identity, workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord,
-        AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy, BenchSample,
-        CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry,
-        FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry, GovernanceExceptionsPacket,
-        MetricLogRecord, OpsOptions, OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex,
-        ProviderArtifactSummary, RolloutWavePolicy, TEMP_SEQ,
+        active_cost_ceiling_minutes, aggregate_failure_code_counts, audit_drift_is_clean,
+        audit_stream_contracts_are_clean, audit_v2_evidence_ready, average_duration_for_summary,
+        build_audit_drift_summary, build_combined_audit_drift_summary,
+        build_compatibility_assessment, build_freeze_boundary_markdown, build_freeze_scoreboard,
+        build_shadow_alignment, build_siem_handoff_records, build_verify_v1_calibration,
+        bundle_catalog_governance_ready, candidate_repos, canonical_repo_path, checklist_box,
+        cost_within_ceiling, exception_governance_statuses, exception_is_expired,
+        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
+        parse_ops_options, percentile_u128, provider_bridge_ready_for_repos,
+        provider_negotiation_statuses, registry_provenance_ready, repo_cost_ceiling_minutes,
+        retention_tier_is_valid, run_ga_readiness, security_review_is_approved,
+        segment_cost_statuses, summarize_delivery_bridge_inputs, summarize_provider_inputs,
+        validate_siem_handoff_input, validate_workload_identity, workspace_root, AuditFailureV2,
+        AuditGateV2, AuditLogRecord, AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy,
+        BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog,
+        FleetBundleEntry, FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry,
+        GovernanceExceptionsPacket, MetricLogRecord, OpsOptions, OpsSubcommand,
+        PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary, RolloutWavePolicy,
+        TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -6431,9 +6437,14 @@ mod tests {
         let rows = segment_cost_statuses(&durations, Some(&catalog), None);
         assert_eq!(rows[0].segment, "prod");
         assert!(!rows[0].ok);
+        let rows = segment_cost_statuses(&durations, None, Some(0));
+        assert_eq!(rows[0].ceiling_minutes, None);
+        assert!(rows[0].ok);
         assert_eq!(bundle_catalog_governance_ready(Some(&catalog)), Some(false));
         assert!(cost_within_ceiling(20.0, Some(20)));
         assert!(!cost_within_ceiling(20.1, Some(20)));
+        assert_eq!(active_cost_ceiling_minutes(Some(0)), None);
+        assert!(cost_within_ceiling(20.1, Some(0)));
         let mut segment_ceilings = std::collections::BTreeMap::new();
         segment_ceilings.insert("prod".to_string(), 30);
         assert_eq!(
@@ -6443,6 +6454,10 @@ mod tests {
         assert_eq!(
             repo_cost_ceiling_minutes(None, "unknown", &segment_ceilings, Some(60)),
             Some(60)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "unknown", &segment_ceilings, Some(0)),
+            None
         );
 
         let complete_catalog = FleetBundleCatalog {
