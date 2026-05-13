@@ -212,6 +212,17 @@ cargo run -p xtask -- ops freeze-scoreboard \
 `freeze_ready` は v1.1 freeze を継続できるかを示し、
 `v2_seed_ready` は replay 証跡まで含めて v2 seed を始めてよいかを示します。
 
+### v1.1 freeze boundary inventory を生成
+
+```bash
+cargo run -p xtask -- ops freeze-boundary \
+  --output artifacts/v1.1-freeze-boundary.md
+```
+
+出力は v1.1 に入れる候補、deferred / non-goal の整理、plugin / provider の破壊変更境界、
+v2 option matrix、risk register、release checklist freeze gate をまとめます。
+`freeze-scoreboard` は telemetry 判定、この artifact は scope boundary の説明責務を持ちます。
+
 ### v1/v2 shadow review を生成
 
 ```bash

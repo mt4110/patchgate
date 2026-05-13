@@ -8,12 +8,14 @@ Phase151-200 の目標を逆算する設計です。
 - Phase1-120: baseline 実装完了
 - Phase121-150: self-healing / trust / compatibility 境界の設計が確定
 - v1.1 に残す境界と、v2 で壊してよい境界の候補が docs 上で説明可能
+- `docs/24_v11_freeze_boundary.md` と `artifacts/v1.1-freeze-boundary.md` で scope inventory / deferred backlog / breaking-change boundary / risk register を確認できる
 
 ## Phase150 の出口状態
 
 - v1.1 に入れる候補 / defer する候補が inventory 化されている
 - plugin / provider / docs / SDK の breaking-change 境界が文章化されている
 - v2 seed に進むには、運用 telemetry を artifact として束ねる必要がある
+- release checklist 上の freeze gate が `freeze-scoreboard` と `freeze-boundary` の二層で説明できる
 
 ## Phase151-200 で解くこと
 
@@ -49,9 +51,11 @@ Phase151-200 の目標を逆算する設計です。
 1. `xtask ops compatibility-report` を追加し、SLO / audit / replay 証跡を 1 つの判断 artifact に束ねる
 2. weekly ops / GA readiness / release precheck で compatibility report を生成する
 3. Phase151-200 の PR 設計を先に固定し、v2 着手順序をぶらさない
+4. Phase141-150 の freeze boundary artifact を release checklist に添付し、v2 risk register を RC gate の入力にする
 
 ## 完了判定（Phase151+ の入口）
 
 - `compatibility-report.md` が週次運用と release precheck で生成される
+- `v1.1-freeze-boundary.md` が release checklist の freeze gate と一致する
 - posture (`stabilize-v1` / `hold-v1.1-line` / `start-v2-seed`) の判定根拠が docs と artifact で一致する
 - Phase151-200 の各 phase plan に、次の 50 PR の順序と責務が定義されている

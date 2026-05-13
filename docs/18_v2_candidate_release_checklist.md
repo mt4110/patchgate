@@ -4,6 +4,7 @@
 - [ ] `patchgate policy diff-contract`
 - [ ] `xtask ops compatibility-report`
 - [ ] `xtask ops freeze-scoreboard`
+- [ ] `xtask ops freeze-boundary`
 - [ ] `xtask ops audit-drift-report`
 - [ ] `xtask ops shadow-review`
 - [ ] `xtask ops fleet-review`
@@ -12,10 +13,17 @@
 - [ ] audit dual-write artifact compatibility verified
 - [ ] migration guide updated
 - [ ] rollback packet updated
+- [ ] v1.1 freeze boundary inventory reviewed
+- [ ] v2 option matrix and risk register attached to RC packet via `--freeze-boundary-path`
 - [ ] RC security review approved (`Continue` checked)
 - [ ] benchmark sign-off attached
 
 ## Reference Command
+
+```bash
+cargo run -p xtask -- ops freeze-boundary \
+  --output artifacts/v1.1-freeze-boundary.md
+```
 
 ```bash
 cargo run -p xtask -- ops rc-readiness \
@@ -29,6 +37,7 @@ cargo run -p xtask -- ops rc-readiness \
   --migration-guide-path docs/16_v2_migration_guide_alpha.md \
   --provider-rollout-path docs/15_provider_rollout_checklist.md \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --freeze-boundary-path artifacts/v1.1-freeze-boundary.md \
   --output artifacts/v2-rc-readiness.md
 ```
 

@@ -38,6 +38,7 @@ enum OpsSubcommand {
     VerifyV1Calibrate,
     CompatibilityReport,
     FreezeScoreboard,
+    FreezeBoundary,
     ReplayNormalize,
     ShadowReview,
     FleetReview,
@@ -80,6 +81,7 @@ struct OpsOptions {
     migration_guide_path: Option<PathBuf>,
     provider_rollout_path: Option<PathBuf>,
     candidate_checklist_path: Option<PathBuf>,
+    freeze_boundary_path: Option<PathBuf>,
     ops_handbook_path: Option<PathBuf>,
     support_model_path: Option<PathBuf>,
     sunset_notice_path: Option<PathBuf>,
@@ -314,6 +316,54 @@ struct FreezeScoreboard {
     next_actions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FreezeScopeItem {
+    candidate: &'static str,
+    decision: &'static str,
+    v11_boundary: &'static str,
+    evidence_artifact: &'static str,
+    release_gate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeferredBacklogItem {
+    item: &'static str,
+    disposition: &'static str,
+    owner_phase: &'static str,
+    reconciliation: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BreakingChangeBoundary {
+    surface: &'static str,
+    v11_contract: &'static str,
+    v2_change_allowed: &'static str,
+    guardrail: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2Option {
+    option: &'static str,
+    fit: &'static str,
+    tradeoff: &'static str,
+    decision: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2Risk {
+    risk: &'static str,
+    trigger: &'static str,
+    mitigation: &'static str,
+    gate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FreezeGateItem {
+    gate: &'static str,
+    required_signal: &'static str,
+    artifact: &'static str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FleetBundleCatalog {
     schema_version: u8,
@@ -486,7 +536,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -602,7 +652,7 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `replay-normalize`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `freeze-boundary`, `replay-normalize`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
@@ -614,6 +664,7 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         "verify-v1-calibrate" => OpsSubcommand::VerifyV1Calibrate,
         "compatibility-report" => OpsSubcommand::CompatibilityReport,
         "freeze-scoreboard" => OpsSubcommand::FreezeScoreboard,
+        "freeze-boundary" => OpsSubcommand::FreezeBoundary,
         "replay-normalize" => OpsSubcommand::ReplayNormalize,
         "shadow-review" => OpsSubcommand::ShadowReview,
         "fleet-review" => OpsSubcommand::FleetReview,
@@ -637,6 +688,7 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut migration_guide_path = None;
     let mut provider_rollout_path = None;
     let mut candidate_checklist_path = None;
+    let mut freeze_boundary_path = None;
     let mut ops_handbook_path = None;
     let mut support_model_path = None;
     let mut sunset_notice_path = None;
@@ -744,6 +796,12 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .ok_or_else(|| anyhow!("missing value for --candidate-checklist-path"))?;
                 candidate_checklist_path = Some(PathBuf::from(value));
             }
+            "--freeze-boundary-path" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --freeze-boundary-path"))?;
+                freeze_boundary_path = Some(PathBuf::from(value));
+            }
             "--ops-handbook-path" => {
                 let value = iter
                     .next()
@@ -828,6 +886,7 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         migration_guide_path,
         provider_rollout_path,
         candidate_checklist_path,
+        freeze_boundary_path,
         ops_handbook_path,
         support_model_path,
         sunset_notice_path,
@@ -850,6 +909,7 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
         OpsSubcommand::VerifyV1Calibrate => run_verify_v1_calibrate(options),
         OpsSubcommand::CompatibilityReport => run_compatibility_report(options),
         OpsSubcommand::FreezeScoreboard => run_freeze_scoreboard(options),
+        OpsSubcommand::FreezeBoundary => run_freeze_boundary(options),
         OpsSubcommand::ReplayNormalize => run_replay_normalize(options),
         OpsSubcommand::ShadowReview => run_shadow_review(options),
         OpsSubcommand::FleetReview => run_fleet_review(options),
@@ -1599,6 +1659,366 @@ fn run_freeze_scoreboard(options: &OpsOptions) -> Result<()> {
     Ok(())
 }
 
+fn run_freeze_boundary(options: &OpsOptions) -> Result<()> {
+    let markdown = build_freeze_boundary_markdown();
+    write_output(&options.output, markdown.as_str())?;
+    println!("freeze boundary written: {}", options.output.display());
+    Ok(())
+}
+
+fn build_freeze_boundary_markdown() -> String {
+    let mut md = String::new();
+    md.push_str("# v1.1 Freeze Boundary\n\n");
+    md.push_str("- artifact_version: 1\n");
+    md.push_str("- boundary_status: v1.1-scope-defined, v2-seed-boundary-defined\n");
+    md.push_str("- canonical_doc: docs/24_v11_freeze_boundary.md\n");
+    md.push_str(
+        "- paired_gate: artifacts/v1.1-readiness.md from `xtask ops freeze-scoreboard`\n\n",
+    );
+
+    md.push_str("## v1.1 Scope Candidate Inventory\n\n");
+    md.push_str("| Candidate | Decision | v1.1 boundary | Evidence artifact | Release gate |\n");
+    md.push_str("| --- | --- | --- | --- | --- |\n");
+    for item in freeze_scope_items() {
+        md.push_str(&format!(
+            "| {} | `{}` | {} | `{}` | {} |\n",
+            item.candidate,
+            item.decision,
+            item.v11_boundary,
+            item.evidence_artifact,
+            item.release_gate
+        ));
+    }
+
+    md.push_str("\n## Deferred Backlog / Non-Goal Reconciliation\n\n");
+    md.push_str("| Item | Disposition | Owner phase | Reconciliation |\n");
+    md.push_str("| --- | --- | --- | --- |\n");
+    for item in deferred_backlog_items() {
+        md.push_str(&format!(
+            "| {} | `{}` | {} | {} |\n",
+            item.item, item.disposition, item.owner_phase, item.reconciliation
+        ));
+    }
+
+    md.push_str("\n## Plugin / Provider Breaking-Change Boundary\n\n");
+    md.push_str("| Surface | v1.1 contract | v2 change allowed | Guardrail |\n");
+    md.push_str("| --- | --- | --- | --- |\n");
+    for item in breaking_change_boundaries() {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            item.surface, item.v11_contract, item.v2_change_allowed, item.guardrail
+        ));
+    }
+
+    md.push_str("\n## Migration Narrative\n\n");
+    md.push_str("1. Freeze v1.1 only after verify-v1, compatibility-report, freeze-scoreboard, and this boundary inventory agree.\n");
+    md.push_str("2. Keep v1.1 provider, plugin, audit, and docs contracts stable while v2 work runs in shadow or dual mode.\n");
+    md.push_str("3. Start v2 seed work from provider and audit bridge surfaces, then widen only after shadow-review and audit-drift evidence remain clean.\n");
+    md.push_str("4. Promote RC candidates with migration guide, provider rollout checklist, candidate checklist, benchmark sign-off, and security review attached.\n");
+    md.push_str("5. Roll back by returning provider output to v1, disabling bridge mode, and keeping v2 audit artifacts as diagnostic evidence.\n\n");
+
+    md.push_str("## v2 Option Matrix\n\n");
+    md.push_str("| Option | Fit | Tradeoff | Decision |\n");
+    md.push_str("| --- | --- | --- | --- |\n");
+    for item in v2_options() {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            item.option, item.fit, item.tradeoff, item.decision
+        ));
+    }
+
+    md.push_str("\n## v2 Risk Register\n\n");
+    md.push_str("| Risk | Trigger | Mitigation | Gate |\n");
+    md.push_str("| --- | --- | --- | --- |\n");
+    for item in v2_risks() {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            item.risk, item.trigger, item.mitigation, item.gate
+        ));
+    }
+
+    md.push_str("\n## Release Checklist Freeze Gate\n\n");
+    md.push_str("| Gate | Required signal | Artifact |\n");
+    md.push_str("| --- | --- | --- |\n");
+    for item in freeze_gate_items() {
+        md.push_str(&format!(
+            "| {} | {} | `{}` |\n",
+            item.gate, item.required_signal, item.artifact
+        ));
+    }
+
+    md
+}
+
+fn freeze_scope_items() -> [FreezeScopeItem; 8] {
+    [
+        FreezeScopeItem {
+            candidate: "verify-v1 strict and lts readiness profiles",
+            decision: "v1.1",
+            v11_boundary: "Keep as the release-facing compatibility gate.",
+            evidence_artifact: "docs/99_release_checklist.md, artifacts/ga-readiness.md",
+            release_gate: "strict and lts profile checks are attached.",
+        },
+        FreezeScopeItem {
+            candidate: "dead-letter replay summary and recovery packet",
+            decision: "v1.1",
+            v11_boundary:
+                "Keep replay evidence as the bridge between operations and freeze decisions.",
+            evidence_artifact:
+                "artifacts/dead-letter-replay-summary.json, artifacts/replay-evidence.json",
+            release_gate: "failed and retained replay records are zero or explicitly deferred.",
+        },
+        FreezeScopeItem {
+            candidate: "compatibility report and freeze scoreboard",
+            decision: "v1.1",
+            v11_boundary: "Use telemetry posture to decide hold versus start-v2-seed.",
+            evidence_artifact: "artifacts/compatibility-report.md, artifacts/v1.1-readiness.md",
+            release_gate: "posture is not stabilize-v1 and freeze_ready is true.",
+        },
+        FreezeScopeItem {
+            candidate: "plugin signature, sandbox, and provenance trust loop",
+            decision: "v1.1",
+            v11_boundary: "Preserve patchgate.plugin.v1 command and SDK template compatibility.",
+            evidence_artifact: "artifacts/fleet-review.md, docs/SECURITY.md",
+            release_gate: "registry provenance and sandbox profile are reviewed.",
+        },
+        FreezeScopeItem {
+            candidate: "generic provider v1 output",
+            decision: "v1.1",
+            v11_boundary: "Preserve provider, summary, and report fields for downstream CI.",
+            evidence_artifact: "docs/15_provider_rollout_checklist.md",
+            release_gate: "provider v1 remains readable before dual or v2 output is promoted.",
+        },
+        FreezeScopeItem {
+            candidate: "audit v2 and SIEM handoff",
+            decision: "v2-seed",
+            v11_boundary: "Keep audit v1 authoritative while v2 is dual-written for evidence.",
+            evidence_artifact: "artifacts/shadow-review.md, artifacts/siem-handoff.jsonl",
+            release_gate: "shadow alignment and audit drift are clean before RC.",
+        },
+        FreezeScopeItem {
+            candidate: "policy verify-v2 and diff-contract",
+            decision: "v2-seed",
+            v11_boundary: "Do not make v2 policy semantics required for v1.1 users.",
+            evidence_artifact: "docs/16_v2_migration_guide_alpha.md, artifacts/v2-rc-readiness.md",
+            release_gate: "v2 checks are preview or bridge gates until RC.",
+        },
+        FreezeScopeItem {
+            candidate: "remote source scanning or high-cost inference in hot path",
+            decision: "non-goal",
+            v11_boundary: "Keep scan execution local and CI-priced.",
+            evidence_artifact: "docs/ROADMAP.md",
+            release_gate: "no release blocker depends on remote scanning or hot-path inference.",
+        },
+    ]
+}
+
+fn deferred_backlog_items() -> [DeferredBacklogItem; 6] {
+    [
+        DeferredBacklogItem {
+            item: "fleet registry UI and operator dashboard",
+            disposition: "deferred",
+            owner_phase: "Phase171-180",
+            reconciliation:
+                "Keep fleet-review markdown and JSON inputs as the v1.1 artifact boundary.",
+        },
+        DeferredBacklogItem {
+            item: "audit v2 as the sole authoritative stream",
+            disposition: "v2-seed",
+            owner_phase: "Phase161-170",
+            reconciliation:
+                "Keep audit v1 authoritative until dual-write shadow evidence is clean.",
+        },
+        DeferredBacklogItem {
+            item: "provider v2 as the default generic output",
+            disposition: "v2-seed",
+            owner_phase: "Phase161-170",
+            reconciliation: "Use dual provider artifacts before switching downstream defaults.",
+        },
+        DeferredBacklogItem {
+            item: "full remote source scan",
+            disposition: "non-goal",
+            owner_phase: "none",
+            reconciliation:
+                "It conflicts with the local and CI-first cost model for this release line.",
+        },
+        DeferredBacklogItem {
+            item: "cloud inference in the release hot path",
+            disposition: "non-goal",
+            owner_phase: "none",
+            reconciliation: "It is not required for the deterministic v1.1 freeze gate.",
+        },
+        DeferredBacklogItem {
+            item: "automatic migration of all plugin manifests",
+            disposition: "deferred",
+            owner_phase: "Phase181-190",
+            reconciliation: "Keep SDK compatibility notices and manual rollout checks for v1.1.",
+        },
+    ]
+}
+
+fn breaking_change_boundaries() -> [BreakingChangeBoundary; 5] {
+    [
+        BreakingChangeBoundary {
+            surface: "Plugin command contract",
+            v11_contract: "patchgate.plugin.v1 remains callable by existing SDK templates.",
+            v2_change_allowed: "Manifest metadata and stronger provenance may be required.",
+            guardrail: "Keep v1 templates and contract tests active through v2 seed.",
+        },
+        BreakingChangeBoundary {
+            surface: "Generic provider artifact",
+            v11_contract: "v1 provider, summary, and report fields remain stable.",
+            v2_change_allowed:
+                "publish_format, gate, artifacts, or bridge payloads may be introduced.",
+            guardrail: "Use generic_schema dual before making v2 the default.",
+        },
+        BreakingChangeBoundary {
+            surface: "Audit stream",
+            v11_contract: "patchgate.audit.v1 JSONL remains the authoritative release signal.",
+            v2_change_allowed: "operation, gate, failure, and diagnostics may become structured.",
+            guardrail: "Require shadow-review and audit-drift-report before promotion.",
+        },
+        BreakingChangeBoundary {
+            surface: "Policy configuration",
+            v11_contract: "policy_version and compatibility.v1 remain accepted.",
+            v2_change_allowed:
+                "Bridge defaults and stricter compatibility.v2 semantics may change.",
+            guardrail: "Run verify-v1, verify-v2, and diff-contract during migration.",
+        },
+        BreakingChangeBoundary {
+            surface: "Docs and SDK templates",
+            v11_contract: "v1.1 setup and plugin init flows stay valid.",
+            v2_change_allowed: "Parallel v2 examples may be introduced.",
+            guardrail: "Keep compatibility notices and migration guide updated together.",
+        },
+    ]
+}
+
+fn v2_options() -> [V2Option; 5] {
+    [
+        V2Option {
+            option: "provider-first bridge",
+            fit: "Best first step when downstream CI consumers need schema proof.",
+            tradeoff: "Does not prove audit semantics by itself.",
+            decision: "Start here for seed work.",
+        },
+        V2Option {
+            option: "audit-first bridge",
+            fit: "Best when SIEM and ops diagnostics are the release risk.",
+            tradeoff: "Provider consumers still need a separate compatibility pass.",
+            decision: "Run in parallel after provider evidence exists.",
+        },
+        V2Option {
+            option: "full dual-contract",
+            fit: "Best RC posture once provider and audit shadows are stable.",
+            tradeoff: "Higher CI and review cost.",
+            decision: "Use for RC readiness.",
+        },
+        V2Option {
+            option: "hold v1.1 line",
+            fit: "Best when telemetry is clean enough to release but replay or bridge evidence is missing.",
+            tradeoff: "Delays v2 learning.",
+            decision: "Valid freeze outcome.",
+        },
+        V2Option {
+            option: "direct v2 cutover",
+            fit: "Only acceptable for isolated experiments.",
+            tradeoff: "No ecosystem rollback margin.",
+            decision: "Do not use for the shared release line.",
+        },
+    ]
+}
+
+fn v2_risks() -> [V2Risk; 7] {
+    [
+        V2Risk {
+            risk: "Provider artifact drift",
+            trigger: "Dual or v2 payload cannot be consumed by existing CI readers.",
+            mitigation: "Keep v1 output enabled and attach provider rollout evidence.",
+            gate: "provider bridge artifact in rc-readiness.",
+        },
+        V2Risk {
+            risk: "Audit stream mismatch",
+            trigger: "v2 event counts or failure totals diverge from v1.",
+            mitigation: "Keep v1 authoritative and investigate shadow deltas.",
+            gate: "shadow-review and audit-drift-report.",
+        },
+        V2Risk {
+            risk: "Plugin trust regression",
+            trigger: "Unsigned, unverified, or revoked plugin provenance enters a release wave.",
+            mitigation: "Require registry provenance and sandbox profile review.",
+            gate: "fleet-review registry provenance.",
+        },
+        V2Risk {
+            risk: "Migration narrative gap",
+            trigger: "Checklist, migration guide, and provider rollout docs disagree.",
+            mitigation: "Update docs together and block RC until paths resolve.",
+            gate: "candidate checklist and migration guide.",
+        },
+        V2Risk {
+            risk: "Replay residue",
+            trigger: "Dead-letter replay has failed or retained records.",
+            mitigation: "Drain, justify, or defer before v2 seed promotion.",
+            gate: "compatibility-report and replay evidence packet.",
+        },
+        V2Risk {
+            risk: "Performance or cost regression",
+            trigger: "Benchmark comparison regresses or fleet cost ceiling is exceeded.",
+            mitigation: "Hold rollout wave and reduce dual-run scope.",
+            gate: "benchmark sign-off and fleet-review cost ceiling.",
+        },
+        V2Risk {
+            risk: "Security review unresolved",
+            trigger: "Security review lacks Continue approval or requires mitigation.",
+            mitigation: "Keep candidate in hold until reviewer sign-off is clean.",
+            gate: "rc-readiness security review.",
+        },
+    ]
+}
+
+fn freeze_gate_items() -> [FreezeGateItem; 7] {
+    [
+        FreezeGateItem {
+            gate: "Scope inventory reviewed",
+            required_signal: "Every v1.1 candidate is marked v1.1, deferred, non-goal, or v2-seed.",
+            artifact: "artifacts/v1.1-freeze-boundary.md",
+        },
+        FreezeGateItem {
+            gate: "Deferred backlog reconciled",
+            required_signal: "Every deferred item has an owner phase or a non-goal rationale.",
+            artifact: "artifacts/v1.1-freeze-boundary.md",
+        },
+        FreezeGateItem {
+            gate: "Breaking-change boundary accepted",
+            required_signal:
+                "Plugin, provider, audit, policy, docs, and SDK surfaces have v1.1 guardrails.",
+            artifact: "artifacts/v1.1-freeze-boundary.md",
+        },
+        FreezeGateItem {
+            gate: "Telemetry freeze ready",
+            required_signal: "freeze_ready is true and posture is not stabilize-v1.",
+            artifact: "artifacts/v1.1-readiness.md",
+        },
+        FreezeGateItem {
+            gate: "Replay evidence clean or explicitly held",
+            required_signal:
+                "Replay summary is non-dry-run with rewrite enabled, or v2 seed remains blocked.",
+            artifact: "artifacts/compatibility-report.md",
+        },
+        FreezeGateItem {
+            gate: "v2 option selected",
+            required_signal:
+                "Provider-first, audit-first, full dual-contract, or hold-v1.1-line is named.",
+            artifact: "artifacts/v1.1-freeze-boundary.md",
+        },
+        FreezeGateItem {
+            gate: "Risk register reviewed",
+            required_signal: "All v2 risks point to an artifact gate before RC.",
+            artifact: "artifacts/v1.1-freeze-boundary.md",
+        },
+    ]
+}
+
 fn run_replay_normalize(options: &OpsOptions) -> Result<()> {
     let path = options
         .replay_summary_input
@@ -2289,6 +2709,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
     let provider_rollout_present = path_exists(options.provider_rollout_path.as_deref());
     let candidate_checklist_present = path_exists(options.candidate_checklist_path.as_deref());
+    let freeze_boundary_present = path_exists(options.freeze_boundary_path.as_deref());
     let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
     let candidate_repos = candidate_repos(&metrics, &audits);
     let provider_bridge_ready =
@@ -2310,6 +2731,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         && migration_guide_present
         && provider_rollout_present
         && candidate_checklist_present
+        && freeze_boundary_present
         && rollback_packet_ready;
 
     let mut next_actions = assessment.next_actions.clone();
@@ -2341,12 +2763,15 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
             "Mark the RC security review packet with `- [x] Continue` and keep `Mitigation required` unchecked after reviewer sign-off.".to_string(),
         );
     }
-    if !migration_guide_present || !provider_rollout_present || !candidate_checklist_present {
+    if !migration_guide_present
+        || !provider_rollout_present
+        || !candidate_checklist_present
+        || !freeze_boundary_present
+    {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
-            "Sync migration guide, provider rollout checklist, and candidate checklist paths."
-                .to_string(),
+            "Sync migration guide, provider rollout checklist, candidate checklist, and freeze boundary paths.".to_string(),
         );
     }
 
@@ -2378,8 +2803,12 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         migration_drill_clean
     ));
     md.push_str(&format!(
-        "- rollback_packet_ready: {}\n\n",
+        "- rollback_packet_ready: {}\n",
         rollback_packet_ready
+    ));
+    md.push_str(&format!(
+        "- freeze_boundary_present: {}\n\n",
+        freeze_boundary_present
     ));
 
     md.push_str("## Checklist\n");
@@ -2418,6 +2847,10 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!(
         "- {} candidate checklist path resolves\n",
         checklist_box(candidate_checklist_present)
+    ));
+    md.push_str(&format!(
+        "- {} freeze boundary path resolves\n",
+        checklist_box(freeze_boundary_present)
     ));
     md.push_str(&format!(
         "- {} rollback packet is derivable from replay + shadow evidence\n",
@@ -3426,12 +3859,13 @@ mod tests {
         aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
         average_duration_for_summary, build_audit_drift_summary,
         build_combined_audit_drift_summary, build_compatibility_assessment,
-        build_freeze_scoreboard, build_shadow_alignment, build_siem_handoff_records,
-        build_verify_v1_calibration, candidate_repos, canonical_repo_path, checklist_box,
-        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
-        percentile_u128, provider_bridge_ready_for_repos, run_ga_readiness,
-        security_review_is_approved, summarize_provider_inputs, validate_siem_handoff_input,
-        validate_workload_identity, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
+        build_freeze_boundary_markdown, build_freeze_scoreboard, build_shadow_alignment,
+        build_siem_handoff_records, build_verify_v1_calibration, candidate_repos,
+        canonical_repo_path, checklist_box, fleet_repo_posture_label, load_json_file,
+        load_jsonl_records, load_release_policy_summary, parse_ops_options, percentile_u128,
+        provider_bridge_ready_for_repos, run_ga_readiness, security_review_is_approved,
+        summarize_provider_inputs, validate_siem_handoff_input, validate_workload_identity,
+        workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
         AuditOperationV2, BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord,
         MetricLogRecord, OpsOptions, OpsSubcommand, ProviderArtifactSummary, TEMP_SEQ,
     };
@@ -3712,6 +4146,57 @@ mod tests {
     }
 
     #[test]
+    fn freeze_boundary_artifact_covers_scope_and_v2_risk_sections() {
+        let markdown = build_freeze_boundary_markdown();
+
+        assert!(markdown.contains("## v1.1 Scope Candidate Inventory"));
+        assert!(markdown.contains("## Deferred Backlog / Non-Goal Reconciliation"));
+        assert!(markdown.contains("## Plugin / Provider Breaking-Change Boundary"));
+        assert!(markdown.contains("## Migration Narrative"));
+        assert!(markdown.contains("## v2 Option Matrix"));
+        assert!(markdown.contains("## v2 Risk Register"));
+        assert!(markdown.contains("## Release Checklist Freeze Gate"));
+        assert!(markdown.contains("artifacts/v1.1-freeze-boundary.md"));
+        assert!(markdown.contains("direct v2 cutover"));
+    }
+
+    #[test]
+    fn freeze_boundary_doc_tracks_generated_artifact_sections() {
+        let doc_path = workspace_root().join("docs/24_v11_freeze_boundary.md");
+        let doc = fs::read_to_string(&doc_path).expect("read freeze boundary doc");
+
+        for heading in [
+            "## v1.1 Scope Candidate Inventory",
+            "## Deferred Backlog / Non-Goal Reconciliation",
+            "## Plugin / Provider Breaking-Change Boundary",
+            "## Migration Narrative",
+            "## v2 Option Matrix",
+            "## v2 Risk Register",
+            "## Release Checklist Freeze Gate",
+        ] {
+            assert!(
+                doc.contains(heading),
+                "freeze boundary doc must include generated artifact section `{heading}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rc_readiness_accepts_freeze_boundary_path() {
+        let options = parse_ops_options(vec![
+            "rc-readiness".into(),
+            "--freeze-boundary-path".into(),
+            "artifacts/v1.1-freeze-boundary.md".into(),
+        ])
+        .expect("parse rc readiness options");
+
+        assert_eq!(
+            options.freeze_boundary_path.as_deref(),
+            Some(Path::new("artifacts/v1.1-freeze-boundary.md"))
+        );
+    }
+
+    #[test]
     fn percentile_uses_ceiling_rank_for_small_samples() {
         let values = vec![100u128, 200u128];
         assert_eq!(percentile_u128(&values, 95), 200);
@@ -3745,6 +4230,7 @@ mod tests {
             migration_guide_path: None,
             provider_rollout_path: None,
             candidate_checklist_path: None,
+            freeze_boundary_path: None,
             ops_handbook_path: None,
             support_model_path: None,
             sunset_notice_path: None,
@@ -3805,6 +4291,7 @@ mod tests {
             migration_guide_path: None,
             provider_rollout_path: None,
             candidate_checklist_path: None,
+            freeze_boundary_path: None,
             ops_handbook_path: None,
             support_model_path: None,
             sunset_notice_path: None,

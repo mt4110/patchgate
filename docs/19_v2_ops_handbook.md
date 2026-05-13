@@ -4,6 +4,7 @@
 
 - `compatibility-report.md`
 - `v1.1-readiness.md`
+- `v1.1-freeze-boundary.md`
 - `audit-drift-report.md`
 - `shadow-review.md`
 - `fleet-review.md`
@@ -13,20 +14,22 @@
 ## Escalation path
 
 1. freeze scoreboard fails
-2. audit drift introduces unknown codes
-3. shadow review shows v2 regression
-4. provider rollout checklist triggers rollback
-5. fleet review exceeds cost ceiling or exposes unverified provenance
-6. GA packet fails LTS/support/sunset checks
+2. freeze boundary inventory has an unresolved deferred / non-goal mismatch
+3. audit drift introduces unknown codes
+4. shadow review shows v2 regression
+5. provider rollout checklist triggers rollback
+6. fleet review exceeds cost ceiling or exposes unverified provenance
+7. GA packet fails LTS/support/sunset checks
 
 ## Steady-state loop
 
 1. collect metrics / audits
 2. normalize replay evidence
 3. rebuild compatibility report
-4. review shadow output
-5. review fleet packet
-6. decide hold / widen / rollback
+4. refresh freeze boundary inventory when scope decisions change
+5. review shadow output
+6. review fleet packet
+7. decide hold / widen / rollback
 
 ## GA command
 

@@ -104,6 +104,7 @@
 ## Compatibility evidence loop (Phase151+)
 
 - 週次運用・GA readiness・release precheck で compatibility report artifact を生成する
+- v1.1 freeze では `freeze-scoreboard` が telemetry gate、`freeze-boundary` が scope / deferred / breaking-change / risk register の説明責務を持つ
 - 判定 posture:
   - `stabilize-v1`: SLO / audit / replay 証跡に未解決項目がある
   - `hold-v1.1-line`: v1.1 維持は可能だが、v2 seed を始める証跡がまだ不足
@@ -114,6 +115,7 @@
   - SIEM handoff: `xtask ops siem-handoff` による flat JSONL 正規化
   - policy gate: `verify-v1` + `verify-v2`
 - governance packets:
+  - `v1.1-freeze-boundary.md`
   - `fleet-review.md`
   - `v2-rc-readiness.md`
   - `v2-ga-packet.md`

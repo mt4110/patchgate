@@ -11,9 +11,10 @@ v2 GA 後の support / escalation ルールをまとめます。
 ## Escalation
 
 1. `compatibility-report.md` と `v1.1-readiness.md` を確認
-2. `shadow-review.md` と `fleet-review.md` で drift を切り分け
-3. `v2-rc-readiness.md` または `v2-ga-packet.md` で gate failure を確認
-4. rollback trigger に一致する場合は `bridge_mode = "off"` / `generic_schema = "v1"` へ戻す
+2. `v1.1-freeze-boundary.md` で scope / deferred / risk register の前提差分を確認
+3. `shadow-review.md` と `fleet-review.md` で drift を切り分け
+4. `v2-rc-readiness.md` または `v2-ga-packet.md` で gate failure を確認
+5. rollback trigger に一致する場合は `bridge_mode = "off"` / `generic_schema = "v1"` へ戻す
 
 ## Response expectations
 
