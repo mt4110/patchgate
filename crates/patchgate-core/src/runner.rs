@@ -424,12 +424,6 @@ fn execute_plugin(
             plugin.id, plugin.command
         )
     })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&input_json)
-            .context("failed to write plugin input")?;
-    }
-
     let stdout = child
         .stdout
         .take()
@@ -448,6 +442,12 @@ fn execute_plugin(
     let stderr_reader = thread::spawn(move || {
         read_stream_with_limit(stderr, max_output_bytes, Some(stderr_limit_probe))
     });
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&input_json)?;
+            Ok(())
+        })
+    });
 
     let termination = wait_for_child_with_timeout(
         &mut child,
@@ -458,6 +458,9 @@ fn execute_plugin(
     if !matches!(termination, ChildTermination::Exited(_)) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+    if let Some(stdin_writer) = stdin_writer {
+        join_stdin_writer(stdin_writer, &termination)?;
     }
     let stdout = join_reader(stdout_reader, "stdout")?;
     let stderr = join_reader(stderr_reader, "stderr")?;
@@ -968,6 +971,22 @@ fn join_reader(
         .join()
         .map_err(|_| anyhow::anyhow!("plugin {stream_name} reader thread panicked"))?;
     output.with_context(|| format!("failed to read plugin {stream_name}"))
+}
+
+fn join_stdin_writer(
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    termination: &ChildTermination,
+) -> Result<()> {
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            if matches!(termination, ChildTermination::Exited(_)) {
+                return Err(err).context("failed to write plugin input");
+            }
+            Ok(())
+        }
+        Err(_) => Err(anyhow::anyhow!("plugin stdin writer thread panicked")),
+    }
 }
 
 fn plugin_to_core_finding(plugin_id: &str, finding: &PluginFinding) -> Finding {
@@ -3129,6 +3148,91 @@ mod tests {
         .expect("read stream");
         assert_eq!(output.len(), 16);
         assert!(!overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn join_stdin_writer_ignores_broken_pipe_on_timeout() {
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::TimedOut);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn join_stdin_writer_reports_error_when_process_exited() {
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .status()
+            .expect("status");
+        #[cfg(not(windows))]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+            .expect("status");
+        let handle = thread::spawn(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        });
+        let result = join_stdin_writer(handle, &ChildTermination::Exited(status));
+        assert!(result.is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plugin_timeout_applies_when_stdin_writer_blocks_on_unread_input() {
+        let policy = Config::default();
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-unread-stdin-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(&plugin_path, "#!/usr/bin/env sh\nexec sleep 5\n")
+            .expect("write plugin script");
+        let plugin = patchgate_config::PluginEntry {
+            id: "unread-stdin".to_string(),
+            command: "sh".to_string(),
+            args: vec![plugin_path.to_string_lossy().to_string()],
+            timeout_ms: 100,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: String::new(),
+        };
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let diff = DiffData {
+            files: (0..20_000)
+                .map(|i| ChangedFile {
+                    path: format!("src/file_{i}.rs"),
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    added: 1,
+                    deleted: 0,
+                    added_lines: Vec::new(),
+                    removed_lines: Vec::new(),
+                })
+                .collect(),
+            fingerprint: "large-plugin-input".to_string(),
+        };
+
+        let start = Instant::now();
+        let invocation =
+            execute_plugin(&policy, &ctx, &diff, "warn", &plugin).expect("execute plugin");
+
+        assert_eq!(invocation.status, PluginInvocationStatus::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "plugin timeout should apply while stdin writer is blocked"
+        );
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

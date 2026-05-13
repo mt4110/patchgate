@@ -358,10 +358,10 @@ struct V2Risk {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FreezeGateItem {
+struct FreezeGateItem<'a> {
     gate: &'static str,
     required_signal: &'static str,
-    artifact: &'static str,
+    artifact: &'a str,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1660,20 +1660,23 @@ fn run_freeze_scoreboard(options: &OpsOptions) -> Result<()> {
 }
 
 fn run_freeze_boundary(options: &OpsOptions) -> Result<()> {
-    let markdown = build_freeze_boundary_markdown();
+    let markdown = build_freeze_boundary_markdown(&options.output);
     write_output(&options.output, markdown.as_str())?;
     println!("freeze boundary written: {}", options.output.display());
     Ok(())
 }
 
-fn build_freeze_boundary_markdown() -> String {
+fn build_freeze_boundary_markdown(output_path: &Path) -> String {
+    let boundary_artifact = output_path.display().to_string();
     let mut md = String::new();
     md.push_str("# v1.1 Freeze Boundary\n\n");
     md.push_str("- artifact_version: 1\n");
     md.push_str("- boundary_status: v1.1-scope-defined, v2-seed-boundary-defined\n");
+    md.push_str(&format!("- output_path: `{boundary_artifact}`\n"));
+    md.push_str("- recommended_artifact: `artifacts/v1.1-freeze-boundary.md`\n");
     md.push_str("- canonical_doc: docs/24_v11_freeze_boundary.md\n");
     md.push_str(
-        "- paired_gate: artifacts/v1.1-readiness.md from `xtask ops freeze-scoreboard`\n\n",
+        "- paired_gate_recommended: `artifacts/v1.1-readiness.md` from `xtask ops freeze-scoreboard`\n\n",
     );
 
     md.push_str("## v1.1 Scope Candidate Inventory\n\n");
@@ -1740,7 +1743,7 @@ fn build_freeze_boundary_markdown() -> String {
     md.push_str("\n## Release Checklist Freeze Gate\n\n");
     md.push_str("| Gate | Required signal | Artifact |\n");
     md.push_str("| --- | --- | --- |\n");
-    for item in freeze_gate_items() {
+    for item in freeze_gate_items(boundary_artifact.as_str()) {
         md.push_str(&format!(
             "| {} | {} | `{}` |\n",
             item.gate, item.required_signal, item.artifact
@@ -1976,23 +1979,23 @@ fn v2_risks() -> [V2Risk; 7] {
     ]
 }
 
-fn freeze_gate_items() -> [FreezeGateItem; 7] {
+fn freeze_gate_items(boundary_artifact: &str) -> [FreezeGateItem<'_>; 7] {
     [
         FreezeGateItem {
             gate: "Scope inventory reviewed",
             required_signal: "Every v1.1 candidate is marked v1.1, deferred, non-goal, or v2-seed.",
-            artifact: "artifacts/v1.1-freeze-boundary.md",
+            artifact: boundary_artifact,
         },
         FreezeGateItem {
             gate: "Deferred backlog reconciled",
             required_signal: "Every deferred item has an owner phase or a non-goal rationale.",
-            artifact: "artifacts/v1.1-freeze-boundary.md",
+            artifact: boundary_artifact,
         },
         FreezeGateItem {
             gate: "Breaking-change boundary accepted",
             required_signal:
                 "Plugin, provider, audit, policy, docs, and SDK surfaces have v1.1 guardrails.",
-            artifact: "artifacts/v1.1-freeze-boundary.md",
+            artifact: boundary_artifact,
         },
         FreezeGateItem {
             gate: "Telemetry freeze ready",
@@ -2009,12 +2012,12 @@ fn freeze_gate_items() -> [FreezeGateItem; 7] {
             gate: "v2 option selected",
             required_signal:
                 "Provider-first, audit-first, full dual-contract, or hold-v1.1-line is named.",
-            artifact: "artifacts/v1.1-freeze-boundary.md",
+            artifact: boundary_artifact,
         },
         FreezeGateItem {
             gate: "Risk register reviewed",
             required_signal: "All v2 risks point to an artifact gate before RC.",
-            artifact: "artifacts/v1.1-freeze-boundary.md",
+            artifact: boundary_artifact,
         },
     ]
 }
@@ -4147,7 +4150,8 @@ mod tests {
 
     #[test]
     fn freeze_boundary_artifact_covers_scope_and_v2_risk_sections() {
-        let markdown = build_freeze_boundary_markdown();
+        let markdown =
+            build_freeze_boundary_markdown(Path::new("artifacts/v1.1-freeze-boundary.md"));
 
         assert!(markdown.contains("## v1.1 Scope Candidate Inventory"));
         assert!(markdown.contains("## Deferred Backlog / Non-Goal Reconciliation"));
@@ -4158,6 +4162,15 @@ mod tests {
         assert!(markdown.contains("## Release Checklist Freeze Gate"));
         assert!(markdown.contains("artifacts/v1.1-freeze-boundary.md"));
         assert!(markdown.contains("direct v2 cutover"));
+    }
+
+    #[test]
+    fn freeze_boundary_artifact_reports_selected_output_path() {
+        let markdown = build_freeze_boundary_markdown(Path::new("target/v1.1-freeze-boundary.md"));
+
+        assert!(markdown.contains("- output_path: `target/v1.1-freeze-boundary.md`"));
+        assert!(markdown.contains("| Scope inventory reviewed | Every v1.1 candidate is marked v1.1, deferred, non-goal, or v2-seed. | `target/v1.1-freeze-boundary.md` |"));
+        assert!(markdown.contains("- recommended_artifact: `artifacts/v1.1-freeze-boundary.md`"));
     }
 
     #[test]

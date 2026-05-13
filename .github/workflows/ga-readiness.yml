@@ -97,12 +97,14 @@ jobs:
             --audit-v2-input artifacts/scan-audit-v2.jsonl \
             --output artifacts/shadow-review.md
 
-      - name: Build v1.1 freeze scoreboard
+      - name: Build v1.1 freeze artifacts
         run: |
           cargo run -p xtask -- ops freeze-scoreboard \
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/v1.1-readiness.md
+          cargo run -p xtask -- ops freeze-boundary \
+            --output artifacts/v1.1-freeze-boundary.md
 
       - name: Build fleet review packet
         run: |
@@ -124,6 +126,7 @@ jobs:
             artifacts/audit-drift-report.md
             artifacts/shadow-review.md
             artifacts/v1.1-readiness.md
+            artifacts/v1.1-freeze-boundary.md
             artifacts/fleet-review.md
             artifacts/verify-v2.json
             artifacts/diff-contract.json

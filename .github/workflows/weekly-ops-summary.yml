@@ -48,6 +48,8 @@ jobs:
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
             --output artifacts/v1.1-readiness.md
+          cargo run -p xtask -- ops freeze-boundary \
+            --output artifacts/v1.1-freeze-boundary.md
           cargo run -p xtask -- ops audit-drift-report \
             --audit-input artifacts/scan-audit.jsonl \
             --audit-v2-input artifacts/scan-audit-v2.jsonl \
