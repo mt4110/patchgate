@@ -2812,6 +2812,11 @@ fn bundle_catalog_governance_ready(catalog: Option<&FleetBundleCatalog>) -> Opti
             .iter()
             .map(|wave| wave.wave.as_str())
             .collect::<BTreeSet<_>>();
+        let bundle_repo_names = catalog
+            .bundles
+            .iter()
+            .map(|entry| entry.repo.trim())
+            .collect::<BTreeSet<_>>();
         let segments_valid = !catalog.segments.is_empty()
             && segment_names.len() == catalog.segments.len()
             && catalog.segments.iter().all(|segment| {
@@ -2833,6 +2838,7 @@ fn bundle_catalog_governance_ready(catalog: Option<&FleetBundleCatalog>) -> Opti
                     && non_empty(&wave.rollback_trigger)
             });
         let bundles_valid = !catalog.bundles.is_empty()
+            && bundle_repo_names.len() == catalog.bundles.len()
             && catalog.bundles.iter().all(|entry| {
                 non_empty(&entry.repo)
                     && non_empty(&entry.policy_bundle)
@@ -4159,12 +4165,14 @@ fn provider_capabilities(value: &serde_json::Value, schema_mode: &str) -> BTreeS
             capabilities.insert("generic.v1".to_string());
             capabilities.insert("generic.v2".to_string());
             capabilities.insert("generic.dual".to_string());
+            capabilities.insert("audit.shadow".to_string());
             if let Some(v2) = value.get("v2") {
                 capabilities.extend(collect_string_array_field(v2, "capabilities"));
             }
         }
         "v2" => {
             capabilities.insert("generic.v2".to_string());
+            capabilities.insert("audit.shadow".to_string());
         }
         "v1" => {
             capabilities.insert("generic.v1".to_string());
@@ -5058,7 +5066,7 @@ mod tests {
         bundle_catalog_governance_ready, candidate_repos, canonical_repo_path, checklist_box,
         cost_within_ceiling, exception_governance_statuses, exception_is_expired,
         fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
-        parse_ops_options, percentile_u128, provider_bridge_ready_for_repos,
+        parse_ops_options, percentile_u128, provider_bridge_ready_for_repos, provider_capabilities,
         provider_negotiation_statuses, registry_provenance_ready, repo_cost_ceiling_minutes,
         retention_tier_is_valid, run_ga_readiness, security_review_is_approved,
         segment_cost_statuses, summarize_delivery_bridge_inputs, summarize_provider_inputs,
@@ -6319,8 +6327,31 @@ mod tests {
         assert_eq!(summaries[0].repo, "example/repo");
         assert_eq!(summaries[0].provider, "generic");
         assert!(summaries[0].capabilities.contains("generic.dual"));
+        assert!(summaries[0].capabilities.contains("audit.shadow"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_provider_capabilities_include_shadow_audit() {
+        let dual_value = serde_json::json!({
+            "schema_version": 1,
+            "bridge_format": "patchgate.provider.generic.bridge.v1",
+            "repo": "example/repo",
+            "v1": {"provider": "generic"},
+            "v2": {"publish_format": "patchgate.provider.generic.v2"}
+        });
+        let v2_value = serde_json::json!({
+            "schema_version": 2,
+            "publish_format": "patchgate.provider.generic.v2",
+            "repo": "example/repo",
+            "gate": {},
+            "artifacts": {}
+        });
+
+        assert!(provider_capabilities(&dual_value, "dual").contains("audit.shadow"));
+        assert!(provider_capabilities(&v2_value, "v2").contains("audit.shadow"));
+        assert!(!provider_capabilities(&dual_value, "v1").contains("audit.shadow"));
     }
 
     #[test]
@@ -6498,6 +6529,14 @@ mod tests {
         assert_eq!(
             bundle_catalog_governance_ready(Some(&complete_catalog)),
             Some(true)
+        );
+        let mut duplicate_repo_catalog = complete_catalog.clone();
+        duplicate_repo_catalog
+            .bundles
+            .push(duplicate_repo_catalog.bundles[0].clone());
+        assert_eq!(
+            bundle_catalog_governance_ready(Some(&duplicate_repo_catalog)),
+            Some(false)
         );
         assert_eq!(
             repo_cost_ceiling_minutes(

@@ -829,6 +829,7 @@ struct GenericCiPublishPayloadV2 {
     publish_format: String,
     repo: String,
     emitted_at: u64,
+    capabilities: Vec<String>,
     gate: GenericPublishGateV2,
     artifacts: GenericPublishArtifactsV2,
 }
@@ -855,6 +856,7 @@ struct GenericCiPublishBridgePayload {
     bridge_format: String,
     repo: String,
     emitted_at: u64,
+    capabilities: Vec<String>,
     v1: GenericCiPublishPayload,
     v2: GenericCiPublishPayloadV2,
 }
@@ -867,6 +869,14 @@ struct GenericPublishSummary {
     mode: String,
     scope: String,
     findings: usize,
+}
+
+fn generic_ci_v2_capabilities() -> Vec<String> {
+    vec!["generic.v2".to_string(), "audit.shadow".to_string()]
+}
+
+fn generic_ci_dual_capabilities() -> Vec<String> {
+    vec!["generic.dual".to_string(), "audit.shadow".to_string()]
 }
 
 #[derive(Debug, Serialize)]
@@ -2960,6 +2970,11 @@ fn bundle_catalog_artifact_summary(value: &Value) -> (bool, String) {
         .iter()
         .filter_map(|wave| wave.get("wave").and_then(Value::as_str))
         .collect::<std::collections::BTreeSet<_>>();
+    let bundle_repo_names = bundles
+        .iter()
+        .filter_map(|bundle| bundle.get("repo").and_then(Value::as_str))
+        .map(str::trim)
+        .collect::<std::collections::BTreeSet<_>>();
 
     let valid_segments = segments.iter().all(|segment| {
         required_string(segment, "segment")
@@ -2990,6 +3005,7 @@ fn bundle_catalog_artifact_summary(value: &Value) -> (bool, String) {
                 .is_some_and(|max_parallel| max_parallel > 0)
     });
     let valid_bundles = !bundles.is_empty()
+        && bundle_repo_names.len() == bundles.len()
         && bundles.iter().all(|bundle| {
             let required_modes = string_values(bundle, "required_provider_modes");
             let providers = string_values(bundle, "providers");
@@ -5475,6 +5491,7 @@ fn publish_generic_ci_payload(
             publish_format: "patchgate.provider.generic.v2".to_string(),
             repo: telemetry_repo.to_string(),
             emitted_at: unix_ts,
+            capabilities: generic_ci_v2_capabilities(),
             gate: GenericPublishGateV2 {
                 score: report.score,
                 threshold: report.threshold,
@@ -5510,6 +5527,7 @@ fn publish_generic_ci_payload(
                 publish_format: "patchgate.provider.generic.v2".to_string(),
                 repo: telemetry_repo.to_string(),
                 emitted_at: unix_ts,
+                capabilities: generic_ci_v2_capabilities(),
                 gate: GenericPublishGateV2 {
                     score: report.score,
                     threshold: report.threshold,
@@ -5528,6 +5546,7 @@ fn publish_generic_ci_payload(
                 bridge_format: "patchgate.provider.generic.bridge.v1".to_string(),
                 repo: telemetry_repo.to_string(),
                 emitted_at: unix_ts,
+                capabilities: generic_ci_dual_capabilities(),
                 v1: payload_v1,
                 v2: payload_v2,
             })?
@@ -8769,6 +8788,30 @@ migration_guide_path = "docs/v2-migration-alpha.md"
         });
         assert!(!bundle_catalog_artifact_summary(&weak_provider_contract).0);
 
+        let mut duplicate_repo_catalog = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00Z",
+            "segments": [{"segment": "prod", "owner": "platform", "cost_ceiling_minutes": 30, "review_cadence": "weekly"}],
+            "retention_tiers": [{"tier": "regulated", "hot_days": 14, "warm_days": 90, "cold_days": 365}],
+            "rollout_waves": [{"wave": "canary", "order": 1, "max_parallel": 1, "entry_gate": "shadow clean", "rollback_trigger": "provider drift"}],
+            "bundles": [{
+                "repo": "example/repo",
+                "policy_bundle": "core-strict",
+                "wave": "canary",
+                "segment": "prod",
+                "providers": ["generic"],
+                "required_provider_modes": ["dual"],
+                "required_provider_capabilities": ["audit.shadow"],
+                "retention_tier": "regulated"
+            }]
+        });
+        let duplicate_bundle = duplicate_repo_catalog["bundles"][0].clone();
+        duplicate_repo_catalog["bundles"]
+            .as_array_mut()
+            .expect("bundles array")
+            .push(duplicate_bundle);
+        assert!(!bundle_catalog_artifact_summary(&duplicate_repo_catalog).0);
+
         let incomplete_registry = serde_json::json!({
             "schema_version": 1,
             "trusted_provenance": ["sigstore"],
@@ -10387,6 +10430,23 @@ profile = "none"
             written.contains("\"bridge_format\": \"patchgate.provider.generic.bridge.v1\""),
             "dual mode should emit bridge payload"
         );
+        let payload: serde_json::Value =
+            serde_json::from_str(written.as_str()).expect("provider payload json");
+        let bridge_capabilities = payload
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .expect("bridge capabilities");
+        assert!(bridge_capabilities
+            .iter()
+            .any(|value| value.as_str() == Some("audit.shadow")));
+        let v2_capabilities = payload
+            .get("v2")
+            .and_then(|v2| v2.get("capabilities"))
+            .and_then(serde_json::Value::as_array)
+            .expect("v2 capabilities");
+        assert!(v2_capabilities
+            .iter()
+            .any(|value| value.as_str() == Some("audit.shadow")));
 
         let _ = fs::remove_dir_all(dir);
     }
