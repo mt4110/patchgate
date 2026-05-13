@@ -90,7 +90,7 @@
 `provider` / `full` の場合は `integrations.ci.generic_schema = "v2" | "dual"` が、
 完全に構成された bridge 実行では必要です
 （こちらもプレビュー実行では CLI オーバーライドで代替可能です）。
-`full` の場合は webhook / notification adapter も shadow metadata を付与します。
+`full` の場合は webhook / generic notification adapter も shadow metadata を付与します。
 
 ## Validation categories
 

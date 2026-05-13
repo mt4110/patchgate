@@ -1,0 +1,18 @@
+policy_version = 2
+
+[observability]
+audit_v2_jsonl_path = "examples/poc/compatibility-lab/audit-v2.jsonl"
+audit_v2_schema_version = 2
+
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/16_v2_migration_guide_alpha.md"

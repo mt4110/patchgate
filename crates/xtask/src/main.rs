@@ -72,6 +72,8 @@ struct OpsOptions {
     trend_output: Option<PathBuf>,
     replay_summary_input: Option<PathBuf>,
     provider_inputs: Vec<PathBuf>,
+    webhook_envelope_inputs: Vec<PathBuf>,
+    notification_envelope_inputs: Vec<PathBuf>,
     bundle_catalog_input: Option<PathBuf>,
     registry_input: Option<PathBuf>,
     exceptions_input: Option<PathBuf>,
@@ -440,6 +442,14 @@ struct ProviderArtifactSummary {
 }
 
 #[derive(Debug, Clone)]
+struct DeliveryBridgeArtifactSummary {
+    kind: String,
+    path: String,
+    valid: bool,
+    bridge_mode: String,
+}
+
+#[derive(Debug, Clone)]
 struct ReleasePolicySummary {
     lts_active: bool,
     lts_branch: String,
@@ -536,7 +546,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -679,6 +689,8 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut trend_output = None;
     let mut replay_summary_input = None;
     let mut provider_inputs = Vec::new();
+    let mut webhook_envelope_inputs = Vec::new();
+    let mut notification_envelope_inputs = Vec::new();
     let mut bundle_catalog_input = None;
     let mut registry_input = None;
     let mut exceptions_input = None;
@@ -741,6 +753,18 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .next()
                     .ok_or_else(|| anyhow!("missing value for --provider-input"))?;
                 provider_inputs.push(PathBuf::from(value));
+            }
+            "--webhook-envelope-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --webhook-envelope-input"))?;
+                webhook_envelope_inputs.push(PathBuf::from(value));
+            }
+            "--notification-envelope-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --notification-envelope-input"))?;
+                notification_envelope_inputs.push(PathBuf::from(value));
             }
             "--bundle-catalog-input" => {
                 let value = iter
@@ -877,6 +901,8 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         trend_output,
         replay_summary_input,
         provider_inputs,
+        webhook_envelope_inputs,
+        notification_envelope_inputs,
         bundle_catalog_input,
         registry_input,
         exceptions_input,
@@ -2072,6 +2098,50 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
         .ok_or_else(|| anyhow!("--audit-v2-input is required for shadow-review"))?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
     let shadow = build_shadow_alignment(&audits_v1, &audits_v2);
+    let drift = build_combined_audit_drift_summary(&audits_v1, &audits_v2);
+    let audit_contract_clean = audit_stream_contracts_are_clean(&audits_v1, &audits_v2);
+    let audit_drift_clean = audit_drift_is_clean(&drift) && audit_contract_clean;
+    let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
+    let shadow_repos = shadow_candidate_repos(&audits_v1, &audits_v2);
+    let provider_bridge_ready = if provider_summaries.is_empty() {
+        None
+    } else {
+        Some(provider_bridge_ready_for_repos(
+            &provider_summaries,
+            &shadow_repos,
+        ))
+    };
+    let webhook_bridge_summaries = summarize_delivery_bridge_inputs(
+        &options.webhook_envelope_inputs,
+        "webhook",
+        "patchgate.webhook.v2-shadow",
+        "scan.completed",
+    )?;
+    let notification_bridge_summaries = summarize_delivery_bridge_inputs(
+        &options.notification_envelope_inputs,
+        "notification",
+        "patchgate.notification.v2-shadow",
+        "scan.completed.notification",
+    )?;
+    let webhook_bridge_checked = !webhook_bridge_summaries.is_empty();
+    let notification_bridge_checked = !notification_bridge_summaries.is_empty();
+    let mut delivery_bridge_summaries = webhook_bridge_summaries;
+    delivery_bridge_summaries.extend(notification_bridge_summaries);
+    let delivery_bridge_ready = if !webhook_bridge_checked && !notification_bridge_checked {
+        None
+    } else {
+        Some(
+            webhook_bridge_checked
+                && notification_bridge_checked
+                && delivery_bridge_summaries
+                    .iter()
+                    .all(|summary| summary.valid),
+        )
+    };
+    let shadow_traffic_ready = shadow.aligned
+        && audit_drift_clean
+        && provider_bridge_ready.unwrap_or(true)
+        && delivery_bridge_ready.unwrap_or(true);
     let v2_schema_versions = audits_v2
         .iter()
         .map(|row| row.schema_version)
@@ -2120,7 +2190,24 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!("- audit_v2_events: {}\n", shadow.v2_events));
     md.push_str(&format!("- audit_v1_failures: {}\n", shadow.v1_failures));
     md.push_str(&format!("- audit_v2_failures: {}\n", shadow.v2_failures));
-    md.push_str(&format!("- event_delta: {}\n\n", shadow.event_delta));
+    md.push_str(&format!("- event_delta: {}\n", shadow.event_delta));
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!(
+        "- audit_contract_clean: {}\n",
+        audit_contract_clean
+    ));
+    md.push_str(&format!(
+        "- provider_bridge_ready: {}\n",
+        optional_bool_label(provider_bridge_ready)
+    ));
+    md.push_str(&format!(
+        "- delivery_bridge_ready: {}\n",
+        optional_bool_label(delivery_bridge_ready)
+    ));
+    md.push_str(&format!(
+        "- shadow_traffic_ready: {}\n\n",
+        shadow_traffic_ready
+    ));
 
     md.push_str("## V2 Coverage\n");
     md.push_str(&format!("- repo_set_match: {}\n", shadow.repo_set_match));
@@ -2153,10 +2240,57 @@ fn run_shadow_review(options: &OpsOptions) -> Result<()> {
     ));
     md.push_str(&format!("- aligned: {}\n\n", shadow.aligned));
 
+    md.push_str("## Provider Bridge Artifacts\n");
+    if provider_summaries.is_empty() {
+        md.push_str("- provider_inputs: none\n");
+        md.push_str("- attach `--provider-input` when reviewing provider/audit dual-contract readiness together.\n\n");
+    } else {
+        md.push_str(&format!(
+            "- provider_inputs: {}\n",
+            provider_summaries.len()
+        ));
+        for summary in &provider_summaries {
+            md.push_str(&format!(
+                "- repo={} schema_mode={}\n",
+                summary.repo, summary.schema_mode
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Delivery Bridge Artifacts\n");
+    if delivery_bridge_summaries.is_empty() {
+        md.push_str("- delivery_inputs: none\n");
+        md.push_str("- attach `--webhook-envelope-input` and `--notification-envelope-input` to review delivery bridge metadata with shadow traffic.\n\n");
+    } else {
+        md.push_str(&format!(
+            "- delivery_inputs: {}\n",
+            delivery_bridge_summaries.len()
+        ));
+        md.push_str(&format!("- webhook_checked: {}\n", webhook_bridge_checked));
+        md.push_str(&format!(
+            "- notification_checked: {}\n",
+            notification_bridge_checked
+        ));
+        for summary in &delivery_bridge_summaries {
+            md.push_str(&format!(
+                "- kind={} valid={} bridge_mode={} path={}\n",
+                summary.kind, summary.valid, summary.bridge_mode, summary.path
+            ));
+        }
+        md.push('\n');
+    }
+
     md.push_str("## Review Notes\n");
     md.push_str("- Compare event counts before promoting shadow traffic to wider rollout.\n");
     md.push_str("- Investigate any failure drift where v1 and v2 failure totals differ.\n");
     md.push_str("- Keep dual-write enabled until event counts and failure codes stay aligned.\n");
+    if provider_bridge_ready == Some(false) {
+        md.push_str("- Attach a dual/v2 provider artifact for at least one repo covered by the audit shadow.\n");
+    }
+    if delivery_bridge_ready == Some(false) {
+        md.push_str("- Attach valid webhook and notification bridge envelopes before widening full shadow traffic.\n");
+    }
 
     write_output(&options.output, md.as_str())?;
     println!("shadow review written: {}", options.output.display());
@@ -2335,6 +2469,25 @@ fn build_shadow_alignment(
         unique_scopes,
         diagnostics_emitted,
         aligned,
+    }
+}
+
+fn shadow_candidate_repos(
+    audits_v1: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> BTreeSet<String> {
+    audits_v1
+        .iter()
+        .map(|row| row.repo.clone())
+        .chain(audits_v2.iter().map(|row| row.repo.clone()))
+        .collect()
+}
+
+fn optional_bool_label(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "not_checked",
     }
 }
 
@@ -3099,6 +3252,65 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
         });
     }
     Ok(out)
+}
+
+fn summarize_delivery_bridge_inputs(
+    paths: &[PathBuf],
+    kind: &str,
+    expected_bridge_format: &str,
+    expected_shadow_of: &str,
+) -> Result<Vec<DeliveryBridgeArtifactSummary>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let value = load_json_file::<serde_json::Value>(path)?;
+        let bridge_mode = value
+            .get("bridge")
+            .and_then(|bridge| bridge.get("bridge_mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let valid =
+            delivery_bridge_artifact_is_valid(&value, expected_bridge_format, expected_shadow_of);
+        out.push(DeliveryBridgeArtifactSummary {
+            kind: kind.to_string(),
+            path: path.display().to_string(),
+            valid,
+            bridge_mode: bridge_mode.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn delivery_bridge_artifact_is_valid(
+    value: &serde_json::Value,
+    expected_bridge_format: &str,
+    expected_shadow_of: &str,
+) -> bool {
+    value
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|repo| !repo.trim().is_empty())
+        && value.get("event").and_then(serde_json::Value::as_str) == Some(expected_shadow_of)
+        && value.get("bridge").is_some_and(|bridge| {
+            bridge
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && bridge
+                    .get("bridge_format")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_bridge_format)
+                && bridge.get("shadow_of").and_then(serde_json::Value::as_str)
+                    == Some(expected_shadow_of)
+                && bridge
+                    .get("bridge_mode")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("full")
+        })
+        && if expected_shadow_of == "scan.completed" {
+            value.get("report").is_some()
+        } else {
+            value.get("summary").is_some()
+        }
 }
 
 fn candidate_repos(metrics: &[MetricLogRecord], audits: &[AuditLogRecord]) -> BTreeSet<String> {
@@ -3867,10 +4079,11 @@ mod tests {
         canonical_repo_path, checklist_box, fleet_repo_posture_label, load_json_file,
         load_jsonl_records, load_release_policy_summary, parse_ops_options, percentile_u128,
         provider_bridge_ready_for_repos, run_ga_readiness, security_review_is_approved,
-        summarize_provider_inputs, validate_siem_handoff_input, validate_workload_identity,
-        workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
-        AuditOperationV2, BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord,
-        MetricLogRecord, OpsOptions, OpsSubcommand, ProviderArtifactSummary, TEMP_SEQ,
+        summarize_delivery_bridge_inputs, summarize_provider_inputs, validate_siem_handoff_input,
+        validate_workload_identity, workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord,
+        AuditLogV2Record, AuditOperationV2, BenchSample, CompatibilityPosture,
+        DeadLetterReplaySummaryRecord, MetricLogRecord, OpsOptions, OpsSubcommand,
+        ProviderArtifactSummary, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -4234,6 +4447,8 @@ mod tests {
             trend_output: None,
             replay_summary_input: None,
             provider_inputs: Vec::new(),
+            webhook_envelope_inputs: Vec::new(),
+            notification_envelope_inputs: Vec::new(),
             bundle_catalog_input: None,
             registry_input: None,
             exceptions_input: None,
@@ -4295,6 +4510,8 @@ mod tests {
             trend_output: None,
             replay_summary_input: None,
             provider_inputs: Vec::new(),
+            webhook_envelope_inputs: Vec::new(),
+            notification_envelope_inputs: Vec::new(),
             bundle_catalog_input: None,
             registry_input: None,
             exceptions_input: None,
@@ -5128,6 +5345,51 @@ mod tests {
         let summaries = summarize_provider_inputs(std::slice::from_ref(&path))
             .expect("summarize provider inputs");
         assert_eq!(summaries[0].schema_mode, "unknown");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn summarize_delivery_bridge_inputs_validates_shadow_metadata() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-webhook-bridge-{seq}.json"));
+        fs::write(
+            &path,
+            r#"{"event":"scan.completed","repo":"example/repo","report":{},"bridge":{"schema_version":1,"bridge_format":"patchgate.webhook.v2-shadow","shadow_of":"scan.completed","bridge_mode":"full"}}"#,
+        )
+        .expect("write webhook bridge payload");
+
+        let summaries = summarize_delivery_bridge_inputs(
+            std::slice::from_ref(&path),
+            "webhook",
+            "patchgate.webhook.v2-shadow",
+            "scan.completed",
+        )
+        .expect("summarize delivery inputs");
+        assert!(summaries[0].valid);
+        assert_eq!(summaries[0].bridge_mode, "full");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn summarize_delivery_bridge_inputs_rejects_non_full_bridge_mode() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("xtask-webhook-bridge-invalid-{seq}.json"));
+        fs::write(
+            &path,
+            r#"{"event":"scan.completed","repo":"example/repo","report":{},"bridge":{"schema_version":1,"bridge_format":"patchgate.webhook.v2-shadow","shadow_of":"scan.completed","bridge_mode":"provider"}}"#,
+        )
+        .expect("write webhook bridge payload");
+
+        let summaries = summarize_delivery_bridge_inputs(
+            std::slice::from_ref(&path),
+            "webhook",
+            "patchgate.webhook.v2-shadow",
+            "scan.completed",
+        )
+        .expect("summarize delivery inputs");
+        assert!(!summaries[0].valid);
 
         let _ = fs::remove_file(path);
     }

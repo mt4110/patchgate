@@ -1,0 +1,1 @@
+{"schema_version":2,"api_version":"patchgate.plugin.v2-shadow","shadow_of":"patchgate.plugin.v1","plugin_id":"sample","repo_root":".","mode":"warn","scope":"worktree","changed_files":[],"metadata":{"bridge_mode":"shadow"}}

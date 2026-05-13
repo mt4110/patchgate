@@ -26,10 +26,25 @@ fn main() {
         .get("plugin_id")
         .and_then(|value| value.as_str())
         .unwrap_or("sample");
+    let api_version = payload
+        .get("api_version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
     let mut diagnostics = vec![
         format!("plugin_id={plugin_id}"),
+        format!("api_version={api_version}"),
         format!("changed_files={changed_files}"),
     ];
+    if let Some(shadow_of) = payload.get("shadow_of").and_then(|value| value.as_str()) {
+        diagnostics.push(format!("shadow_of={shadow_of}"));
+    }
+    if let Some(bridge_mode) = payload
+        .get("metadata")
+        .and_then(|metadata| metadata.get("bridge_mode"))
+        .and_then(|value| value.as_str())
+    {
+        diagnostics.push(format!("bridge_mode={bridge_mode}"));
+    }
     diagnostics.extend(extra_diagnostics);
     let out = json!({
         "findings": [],

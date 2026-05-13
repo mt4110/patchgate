@@ -1,0 +1,1 @@
+{"event":"scan.completed.notification","repo":"example/repo","summary":{"score":100,"threshold":70,"should_fail":false,"mode":"warn","scope":"worktree","review_priority":"P3","findings":0},"bridge":{"schema_version":1,"bridge_format":"patchgate.notification.v2-shadow","shadow_of":"scan.completed.notification","bridge_mode":"full"}}

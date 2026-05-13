@@ -29,10 +29,15 @@ audit_v2_schema_version = 2
 
 - `patchgate policy verify-v2 --format text`
 - `patchgate policy diff-contract --format text`
-- `cargo run -p xtask -- ops shadow-review ...`
+- `patchgate policy verify-v2 --provider-input artifacts/provider-dual.json --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --plugin-shadow-input sdk/templates/python-plugin/sample-input.v2.json --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json --format text`
+- `cargo run -p xtask -- ops shadow-review --provider-input artifacts/provider-dual.json --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json ...`
 
 ## 4. Promotion criteria
 
+- provider dual artifact が downstream で読める
+- audit v2 artifact がSIEM handoffへ変換できる
+- plugin template の `sample-input.v2.json` が `patchgate.plugin.v2-shadow` として検証できる
+- webhook / notification bridge metadata が shadow traffic review に含まれる
 - dual-run の event count が安定
 - `compatibility-report.md` が `start-v2-seed`
 - audit drift が 0

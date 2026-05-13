@@ -25,8 +25,14 @@ def main() -> int:
     findings = []
     diagnostics = [
         f"plugin_id={payload.get('plugin_id', 'unknown')}",
+        f"api_version={payload.get('api_version', 'unknown')}",
         f"changed_files={len(payload.get('changed_files', []))}",
     ]
+    if isinstance(payload.get("shadow_of"), str):
+        diagnostics.append(f"shadow_of={payload['shadow_of']}")
+    metadata = payload.get("metadata", {})
+    if isinstance(metadata, dict) and isinstance(metadata.get("bridge_mode"), str):
+        diagnostics.append(f"bridge_mode={metadata['bridge_mode']}")
 
     for file in payload.get("changed_files", []):
         path = file.get("path", "")
