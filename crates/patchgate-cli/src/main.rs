@@ -5191,12 +5191,13 @@ fn execute_scan(
             }
         }
     } else if cache_enabled {
-        let policy_hash = effective_policy_hash(&cfg, &authority).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to hash effective config"),
-            )
-        })?;
+        let policy_hash =
+            effective_policy_hash(&cfg, &authority, &authority_failures).map_err(|err| {
+                ScanError::new(
+                    ScanErrorKind::Runtime,
+                    err.context("failed to hash effective config"),
+                )
+            })?;
         let mut cache_conn = match open_cache_connection(repo_root, &cfg.cache.db_path) {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -7546,9 +7547,28 @@ fn config_hash(cfg: &Config) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serialized)))
 }
 
-fn effective_policy_hash(cfg: &Config, authority: &PolicyAuthority) -> Result<String> {
-    let material = format!("{}|authority={}", config_hash(cfg)?, authority.digest);
-    Ok(format!("{:x}", Sha256::digest(material.as_bytes())))
+fn effective_policy_hash(
+    cfg: &Config,
+    authority: &PolicyAuthority,
+    failures: &[PolicyAuthorityFailure],
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct PolicyHashMaterial<'a> {
+        config_hash: String,
+        authority: &'a PolicyAuthority,
+        enforce_failure_codes: Vec<&'a str>,
+    }
+
+    let material = PolicyHashMaterial {
+        config_hash: config_hash(cfg)?,
+        authority,
+        enforce_failure_codes: failures
+            .iter()
+            .map(|failure| failure.code.as_str())
+            .collect(),
+    };
+    let serialized = serde_json::to_vec(&material)?;
+    Ok(format!("{:x}", Sha256::digest(serialized)))
 }
 
 fn attach_policy_authority(
@@ -8124,7 +8144,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser as _;
-    use patchgate_config::Config;
+    use patchgate_config::{Config, PolicyAuthority, PolicyAuthorityFailure};
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
     use patchgate_github::PublishAuth;
     use serde_json::Value;
@@ -8136,8 +8156,8 @@ mod tests {
         build_history_trend, bundle_catalog_artifact_summary, changed_file_limit_fail_open_report,
         ci_template_catalog, delivery_bridge_headers, delivery_bridge_metadata,
         detect_head_sha_from_env, detect_pr_number_from_env, detect_sandbox_capabilities,
-        exception_expired, exception_governance_artifact_summary, gate_exit_code,
-        is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
+        effective_policy_hash, exception_expired, exception_governance_artifact_summary,
+        gate_exit_code, is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
         notification_payload, parse_mode, parse_policy_preset, parse_scope,
         policy_authority_relative_path, pr_head_sha_from_event_payload,
         pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
@@ -9129,6 +9149,36 @@ mod tests {
             build_cache_key("diff-a", "policy-a", "enforce", "staged")
         );
         assert_ne!(base, build_cache_key("diff-a", "policy-a", "warn", "repo"));
+    }
+
+    #[test]
+    fn effective_policy_hash_includes_authority_state() {
+        let cfg = Config::default();
+        let mut trusted_authority = PolicyAuthority {
+            trusted: true,
+            digest: "sha256:same-policy".to_string(),
+            ..PolicyAuthority::default()
+        };
+        trusted_authority.diagnostics.clear();
+        let mut untrusted_authority = trusted_authority.clone();
+        untrusted_authority.trusted = false;
+
+        let trusted_hash =
+            effective_policy_hash(&cfg, &trusted_authority, &[]).expect("trusted hash");
+        let untrusted_hash =
+            effective_policy_hash(&cfg, &untrusted_authority, &[]).expect("untrusted hash");
+        assert_ne!(trusted_hash, untrusted_hash);
+
+        let failure_hash = effective_policy_hash(
+            &cfg,
+            &trusted_authority,
+            &[PolicyAuthorityFailure {
+                code: "untrusted_policy_in_enforce".to_string(),
+                message: "blocked".to_string(),
+            }],
+        )
+        .expect("failure hash");
+        assert_ne!(trusted_hash, failure_hash);
     }
 
     #[test]
