@@ -583,6 +583,45 @@ policy_version = 2
 }
 
 #[test]
+fn enforce_scan_errors_when_trusted_ref_lacks_policy_file() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+fail_threshold = 80
+"#,
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "enforce",
+            "--format",
+            "json",
+            "--base-ref",
+            "HEAD",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "missing trusted policy file should be a config error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trusted policy ref `HEAD` exists but `policy.toml` is missing"));
+
+    Ok(())
+}
+
+#[test]
 fn enforce_scan_rejects_policy_changing_cli_override() -> TestResult<()> {
     let repo = TestRepo::create()?;
     repo.write_file(

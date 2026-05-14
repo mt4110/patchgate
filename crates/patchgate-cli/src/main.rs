@@ -2284,9 +2284,9 @@ fn resolve_policy_authority_from_common_with_preset(
     parse_mode(args.mode.as_str(), OptionSource::Cli).map_err(|err| anyhow!("{}", err.render()))?;
 
     let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
-    let policy_rel = policy_authority_relative_path(repo_root, policy_path.as_deref());
+    let policy_rel = policy_authority_relative_path(repo_root, policy_path.as_deref())?;
     let local_text = if let Some(head_ref) = args.head_ref.as_deref() {
-        read_git_file_at_ref(repo_root, head_ref, policy_rel.as_str())?
+        read_git_file_at_ref(repo_root, head_ref, policy_rel.as_str(), false)?
     } else {
         read_optional_policy_file(policy_path.as_deref())?
     };
@@ -2297,13 +2297,12 @@ fn resolve_policy_authority_from_common_with_preset(
     });
 
     let base_branch = match args.base_ref.as_deref() {
-        Some(base_ref) => {
-            read_git_file_at_ref(repo_root, base_ref, policy_rel.as_str())?.map(|text| {
+        Some(base_ref) => read_git_file_at_ref(repo_root, base_ref, policy_rel.as_str(), true)?
+            .map(|text| {
                 PolicyAuthoritySourceInput::new("base_branch", text)
                     .with_ref(Some(base_ref.to_string()))
                     .with_path(Some(policy_rel.clone()))
-            })
-        }
+            }),
         None => None,
     };
     let trusted_authority_config = base_branch
@@ -2331,13 +2330,12 @@ fn resolve_policy_authority_from_common_with_preset(
         .clone()
         .or_else(|| non_empty_string(authority_config.protected_policy_ref.as_str()));
     let protected_ref_source = match protected_ref.as_deref() {
-        Some(ref_name) => {
-            read_git_file_at_ref(repo_root, ref_name, policy_rel.as_str())?.map(|text| {
+        Some(ref_name) => read_git_file_at_ref(repo_root, ref_name, policy_rel.as_str(), true)?
+            .map(|text| {
                 PolicyAuthoritySourceInput::new("protected_ref", text)
                     .with_ref(Some(ref_name.to_string()))
                     .with_path(Some(policy_rel.clone()))
-            })
-        }
+            }),
         None => None,
     };
 
@@ -6161,16 +6159,23 @@ fn resolve_policy_path(
     resolve_config_path(repo_root, config_override)
 }
 
-fn policy_authority_relative_path(repo_root: &Path, policy_path: Option<&Path>) -> String {
+fn policy_authority_relative_path(repo_root: &Path, policy_path: Option<&Path>) -> Result<String> {
     match policy_path {
-        Some(path) if path.is_absolute() => path
-            .strip_prefix(repo_root)
-            .ok()
-            .and_then(Path::to_str)
-            .unwrap_or("policy.toml")
-            .replace('\\', "/"),
-        Some(path) => path.to_string_lossy().replace('\\', "/"),
-        None => "policy.toml".to_string(),
+        Some(path) if path.is_absolute() => {
+            let relative = path.strip_prefix(repo_root).with_context(|| {
+                format!(
+                    "policy path {} must be inside repository root {} for trusted ref resolution",
+                    path.display(),
+                    repo_root.display()
+                )
+            })?;
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", path.display()))?;
+            Ok(relative.replace('\\', "/"))
+        }
+        Some(path) => Ok(path.to_string_lossy().replace('\\', "/")),
+        None => Ok("policy.toml".to_string()),
     }
 }
 
@@ -6187,6 +6192,7 @@ fn read_git_file_at_ref(
     repo_root: &Path,
     ref_name: &str,
     rel_path: &str,
+    missing_policy_is_error: bool,
 ) -> Result<Option<String>> {
     if ref_name.trim().is_empty() || rel_path.trim().is_empty() {
         return Ok(None);
@@ -6205,6 +6211,11 @@ fn read_git_file_at_ref(
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if git_ref_exists(repo_root, ref_name)? {
+        if missing_policy_is_error {
+            return Err(anyhow!(
+                "trusted policy ref `{ref_name}` exists but `{rel_path}` is missing: {stderr}"
+            ));
+        }
         return Ok(None);
     }
     Err(anyhow!(
@@ -8128,13 +8139,14 @@ mod tests {
         exception_expired, exception_governance_artifact_summary, gate_exit_code,
         is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
         notification_payload, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
-        registry_provenance_artifact_summary, render_contract_diff_report_json,
-        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        policy_authority_relative_path, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, registry_provenance_artifact_summary,
+        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
+        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -9246,6 +9258,15 @@ mod tests {
         let resolved =
             resolve_policy_path(&repo_root, Some(&global), Some(&subcmd)).expect("resolved path");
         assert_eq!(resolved, repo_root.join("subcmd.toml"));
+    }
+
+    #[test]
+    fn policy_authority_relative_path_rejects_external_absolute_policy_path() {
+        let repo_root = PathBuf::from("/tmp/patchgate-repo");
+        let external = PathBuf::from("/tmp/external-policy.toml");
+        let err = policy_authority_relative_path(&repo_root, Some(&external))
+            .expect_err("external absolute policy path must be rejected");
+        assert!(err.to_string().contains("must be inside repository root"));
     }
 
     #[test]
