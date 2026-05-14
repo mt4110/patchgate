@@ -771,11 +771,11 @@ fn print_help() {
             "  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n",
             "  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n",
             "  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--contract-freeze-input PATH] [--migration-drill-input PATH] [--rollback-packet-input PATH] [--fleet-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH] [--sunset-notice-path PATH]\n",
-            "  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--rc-readiness-input PATH] [--go-no-go-path PATH] [--fleet-review-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]\n",
-            "  cargo run -p xtask -- ops migration-completion --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--fleet-review-input PATH] [--rc-readiness-input PATH] [--migration-drill-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH]\n",
-            "  cargo run -p xtask -- ops dual-run-decommission --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--rollback-packet-input PATH] [--migration-drill-input PATH] [--rc-readiness-input PATH] [--sunset-notice-path PATH] [--support-model-path PATH]\n",
-            "  cargo run -p xtask -- ops post-ga-telemetry --metrics-input PATH --audit-input PATH --audit-v2-input PATH --ga-packet-input PATH --support-model-path PATH --output PATH [--replay-summary-input PATH] [--fleet-review-input PATH]\n",
-            "  cargo run -p xtask -- ops retrospective-cleanup --output PATH [--migration-completion-input PATH] [--dual-run-decommission-input PATH] [--post-ga-telemetry-input PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]",
+            "  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --policy-input PATH --rc-readiness-input PATH --go-no-go-path PATH --fleet-review-input PATH --migration-guide-path PATH --candidate-checklist-path PATH --ops-handbook-path PATH --support-model-path PATH --sunset-notice-path PATH --phase201-backcast-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops migration-completion --metrics-input PATH --audit-input PATH --audit-v2-input PATH --provider-input PATH ... --fleet-review-input PATH --rc-readiness-input PATH --migration-drill-input PATH --migration-guide-path PATH --candidate-checklist-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops dual-run-decommission --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --provider-input PATH ... --rollback-packet-input PATH --migration-drill-input PATH --rc-readiness-input PATH --sunset-notice-path PATH --support-model-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops post-ga-telemetry --metrics-input PATH --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --fleet-review-input PATH --ga-packet-input PATH --support-model-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops retrospective-cleanup --migration-completion-input PATH --dual-run-decommission-input PATH --post-ga-telemetry-input PATH --ops-handbook-path PATH --support-model-path PATH --sunset-notice-path PATH --phase201-backcast-path PATH --output PATH",
         )
     );
 }
@@ -4445,21 +4445,71 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
 fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let audit_v2_input = options
-        .audit_v2_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--audit-v2-input is required for ga-packet"))?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "ga-packet",
+    )?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
-    let replay_summary = options
-        .replay_summary_input
-        .as_deref()
-        .map(load_json_file::<DeadLetterReplaySummaryRecord>)
-        .transpose()?;
-    let policy_input = options
-        .policy_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--policy-input is required for ga-packet"))?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "ga-packet",
+    )?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
+    let policy_input = required_path(
+        options.policy_input.as_deref(),
+        "--policy-input",
+        "ga-packet",
+    )?;
     let release_policy = load_release_policy_summary(policy_input)?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "ga-packet",
+    )?;
+    let go_no_go_path = required_path(
+        options.go_no_go_path.as_deref(),
+        "--go-no-go-path",
+        "ga-packet",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "ga-packet",
+    )?;
+    let migration_guide_path = required_path(
+        options.migration_guide_path.as_deref(),
+        "--migration-guide-path",
+        "ga-packet",
+    )?;
+    let candidate_checklist_path = required_path(
+        options.candidate_checklist_path.as_deref(),
+        "--candidate-checklist-path",
+        "ga-packet",
+    )?;
+    let ops_handbook_path = required_path(
+        options.ops_handbook_path.as_deref(),
+        "--ops-handbook-path",
+        "ga-packet",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "ga-packet",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "ga-packet",
+    )?;
+    let phase201_backcast_path = required_path(
+        options.phase201_backcast_path.as_deref(),
+        "--phase201-backcast-path",
+        "ga-packet",
+    )?;
     let assessment = build_compatibility_assessment(
         &metrics,
         &audits,
@@ -4474,18 +4524,15 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     let replay_clean = replay_summary
         .as_ref()
         .is_some_and(|summary| summary.failed_records == 0 && summary.retained_records == 0);
-    let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
-    let candidate_checklist_ready =
-        candidate_checklist_ready(options.candidate_checklist_path.as_deref())?;
-    let ops_handbook_ready = ops_handbook_ready(options.ops_handbook_path.as_deref())?;
-    let support_model_ready = support_model_ready(options.support_model_path.as_deref())?;
-    let sunset_notice_ready = sunset_notice_ready(options.sunset_notice_path.as_deref())?;
-    let phase201_backcast_ready =
-        phase201_backcast_ready(options.phase201_backcast_path.as_deref())?;
-    let rc_readiness_ready = rc_readiness_packet_ready(options.rc_readiness_input.as_deref())?;
-    let go_no_go_ready = go_no_go_review_ready(options.go_no_go_path.as_deref())?;
-    let fleet_governance_ready =
-        fleet_review_cost_signoff_ready(options.fleet_review_input.as_deref())?;
+    let migration_guide_present = path_exists(Some(migration_guide_path));
+    let candidate_checklist_ready = candidate_checklist_ready(Some(candidate_checklist_path))?;
+    let ops_handbook_ready = ops_handbook_ready(Some(ops_handbook_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let phase201_backcast_ready = phase201_backcast_ready(Some(phase201_backcast_path))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let go_no_go_ready = go_no_go_review_ready(Some(go_no_go_path))?;
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
     let lts_ready = release_policy.lts_active
         && release_policy.lts_branch == "lts/v2"
         && release_policy.security_sla_hours <= 72;
@@ -4689,10 +4736,41 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
 fn run_migration_completion(options: &OpsOptions) -> Result<()> {
     let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let audit_v2_input = options
-        .audit_v2_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--audit-v2-input is required for migration-completion"))?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "migration-completion",
+    )?;
+    require_non_empty_paths(
+        &options.provider_inputs,
+        "--provider-input",
+        "migration-completion",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "migration-completion",
+    )?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "migration-completion",
+    )?;
+    let migration_drill_input = required_path(
+        options.migration_drill_input.as_deref(),
+        "--migration-drill-input",
+        "migration-completion",
+    )?;
+    let migration_guide_path = required_path(
+        options.migration_guide_path.as_deref(),
+        "--migration-guide-path",
+        "migration-completion",
+    )?;
+    let candidate_checklist_path = required_path(
+        options.candidate_checklist_path.as_deref(),
+        "--candidate-checklist-path",
+        "migration-completion",
+    )?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
     let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
     let shadow = build_shadow_alignment(&audits, &audits_v2);
@@ -4703,13 +4781,11 @@ fn run_migration_completion(options: &OpsOptions) -> Result<()> {
     let mut repos = candidate_repos(&metrics, &audits);
     repos.extend(audits_v2.iter().map(|row| row.repo.clone()));
     let provider_bridge_ready = provider_bridge_ready_for_repos(&provider_summaries, &repos);
-    let fleet_governance_ready =
-        fleet_review_cost_signoff_ready(options.fleet_review_input.as_deref())?;
-    let rc_readiness_ready = rc_readiness_packet_ready(options.rc_readiness_input.as_deref())?;
-    let migration_drill_ready = migration_drill_ready(options.migration_drill_input.as_deref())?;
-    let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
-    let candidate_checklist_ready =
-        candidate_checklist_ready(options.candidate_checklist_path.as_deref())?;
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let migration_drill_ready = migration_drill_ready(Some(migration_drill_input))?;
+    let migration_guide_present = path_exists(Some(migration_guide_path));
+    let candidate_checklist_ready = candidate_checklist_ready(Some(candidate_checklist_path))?;
     let migration_complete = !repos.is_empty()
         && provider_bridge_ready
         && audit_export.ready
@@ -4802,16 +4878,50 @@ fn run_migration_completion(options: &OpsOptions) -> Result<()> {
 
 fn run_dual_run_decommission(options: &OpsOptions) -> Result<()> {
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let audit_v2_input = options
-        .audit_v2_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--audit-v2-input is required for dual-run-decommission"))?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "dual-run-decommission",
+    )?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "dual-run-decommission",
+    )?;
+    require_non_empty_paths(
+        &options.provider_inputs,
+        "--provider-input",
+        "dual-run-decommission",
+    )?;
+    let rollback_packet_input = required_path(
+        options.rollback_packet_input.as_deref(),
+        "--rollback-packet-input",
+        "dual-run-decommission",
+    )?;
+    let migration_drill_input = required_path(
+        options.migration_drill_input.as_deref(),
+        "--migration-drill-input",
+        "dual-run-decommission",
+    )?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "dual-run-decommission",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "dual-run-decommission",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "dual-run-decommission",
+    )?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
-    let replay_summary = options
-        .replay_summary_input
-        .as_deref()
-        .map(load_json_file::<DeadLetterReplaySummaryRecord>)
-        .transpose()?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
     let shadow = build_shadow_alignment(&audits, &audits_v2);
     let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
     let audit_drift_clean =
@@ -4824,12 +4934,11 @@ fn run_dual_run_decommission(options: &OpsOptions) -> Result<()> {
     });
     let repos = shadow_candidate_repos(&audits, &audits_v2);
     let provider_v1_restore_ready = provider_v1_restore_verified(&options.provider_inputs, &repos)?;
-    let rollback_packet_ready =
-        rollback_packet_input_ready(options.rollback_packet_input.as_deref())?;
-    let migration_drill_ready = migration_drill_ready(options.migration_drill_input.as_deref())?;
-    let rc_readiness_ready = rc_readiness_packet_ready(options.rc_readiness_input.as_deref())?;
-    let sunset_notice_ready = sunset_notice_ready(options.sunset_notice_path.as_deref())?;
-    let support_model_ready = support_model_ready(options.support_model_path.as_deref())?;
+    let rollback_packet_ready = rollback_packet_input_ready(Some(rollback_packet_input))?;
+    let migration_drill_ready = migration_drill_ready(Some(migration_drill_input))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
     let decommission_ready = !repos.is_empty()
         && replay_clean
         && shadow.aligned
@@ -4902,16 +5011,25 @@ fn run_dual_run_decommission(options: &OpsOptions) -> Result<()> {
 fn run_post_ga_telemetry(options: &OpsOptions) -> Result<()> {
     let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let audit_v2_input = options
-        .audit_v2_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--audit-v2-input is required for post-ga-telemetry"))?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "post-ga-telemetry",
+    )?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "post-ga-telemetry",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "post-ga-telemetry",
+    )?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
-    let replay_summary = options
-        .replay_summary_input
-        .as_deref()
-        .map(load_json_file::<DeadLetterReplaySummaryRecord>)
-        .transpose()?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
     let assessment = build_compatibility_assessment(
         &metrics,
         &audits,
@@ -4930,8 +5048,7 @@ fn run_post_ga_telemetry(options: &OpsOptions) -> Result<()> {
             && summary.failed_records == 0
             && summary.retained_records == 0
     });
-    let fleet_governance_ready =
-        fleet_review_cost_signoff_ready(options.fleet_review_input.as_deref())?;
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
     let ga_packet_input = options
         .ga_packet_input
         .as_deref()
@@ -5029,17 +5146,50 @@ fn run_post_ga_telemetry(options: &OpsOptions) -> Result<()> {
 }
 
 fn run_retrospective_cleanup(options: &OpsOptions) -> Result<()> {
+    let migration_completion_input = required_path(
+        options.migration_completion_input.as_deref(),
+        "--migration-completion-input",
+        "retrospective-cleanup",
+    )?;
+    let dual_run_decommission_input = required_path(
+        options.dual_run_decommission_input.as_deref(),
+        "--dual-run-decommission-input",
+        "retrospective-cleanup",
+    )?;
+    let post_ga_telemetry_input = required_path(
+        options.post_ga_telemetry_input.as_deref(),
+        "--post-ga-telemetry-input",
+        "retrospective-cleanup",
+    )?;
+    let ops_handbook_path = required_path(
+        options.ops_handbook_path.as_deref(),
+        "--ops-handbook-path",
+        "retrospective-cleanup",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "retrospective-cleanup",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "retrospective-cleanup",
+    )?;
+    let phase201_backcast_path = required_path(
+        options.phase201_backcast_path.as_deref(),
+        "--phase201-backcast-path",
+        "retrospective-cleanup",
+    )?;
     let migration_completion_ready =
-        migration_completion_board_ready(options.migration_completion_input.as_deref())?;
+        migration_completion_board_ready(Some(migration_completion_input))?;
     let dual_run_decommission_ready =
-        dual_run_decommission_plan_ready(options.dual_run_decommission_input.as_deref())?;
-    let post_ga_telemetry_ready =
-        post_ga_telemetry_review_ready(options.post_ga_telemetry_input.as_deref())?;
-    let ops_handbook_ready = ops_handbook_ready(options.ops_handbook_path.as_deref())?;
-    let support_model_ready = support_model_ready(options.support_model_path.as_deref())?;
-    let sunset_notice_ready = sunset_notice_ready(options.sunset_notice_path.as_deref())?;
-    let phase201_backcast_ready =
-        phase201_backcast_ready(options.phase201_backcast_path.as_deref())?;
+        dual_run_decommission_plan_ready(Some(dual_run_decommission_input))?;
+    let post_ga_telemetry_ready = post_ga_telemetry_review_ready(Some(post_ga_telemetry_input))?;
+    let ops_handbook_ready = ops_handbook_ready(Some(ops_handbook_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let phase201_backcast_ready = phase201_backcast_ready(Some(phase201_backcast_path))?;
     let cleanup_queue_ready = migration_completion_ready
         && dual_run_decommission_ready
         && post_ga_telemetry_ready
@@ -5377,6 +5527,17 @@ fn provider_bridge_ready_for_repos(
 
 fn path_exists(path: Option<&Path>) -> bool {
     path.is_some_and(Path::exists)
+}
+
+fn required_path<'a>(path: Option<&'a Path>, flag: &str, command: &str) -> Result<&'a Path> {
+    path.ok_or_else(|| anyhow!("{flag} is required for {command}"))
+}
+
+fn require_non_empty_paths(paths: &[PathBuf], flag: &str, command: &str) -> Result<()> {
+    if paths.is_empty() {
+        bail!("{flag} is required for {command}");
+    }
+    Ok(())
 }
 
 fn security_review_is_approved(path: Option<&Path>) -> Result<bool> {
