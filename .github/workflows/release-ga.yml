@@ -189,8 +189,9 @@ jobs:
             echo
             echo "## Review Criteria"
             echo "- verify no unknown failure codes are introduced"
-            echo "- confirm dual-write drift is understood"
-            echo "- confirm rollback packet restores v1 authority"
+            echo "- confirm audit v1/v2 event identity and failure counts match"
+            echo "- confirm rollback packet restores provider and audit authority to v1"
+            echo "- confirm cost and provenance signals have no open blockers"
             echo
             echo "## Decision"
             echo "- manual workflow input: rc_security_decision=continue"
@@ -225,6 +226,7 @@ jobs:
             echo "## Required Evidence"
             echo "- RC readiness: artifacts/v2-rc-readiness.md"
             echo "- rollback packet: artifacts/rollback-packet.json"
+            echo "- LTS policy: artifacts/policy.v2.toml"
             echo "- v1 sunset notice: docs/21_v1_sunset_notice.md"
             echo "- support path: docs/22_v2_support_model.md"
             echo

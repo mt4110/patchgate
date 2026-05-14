@@ -48,6 +48,8 @@ cargo run -p patchgate-cli -- policy verify-v2 \
 RC hardening fixture path:
 
 ```bash
+mkdir -p target/compatibility-lab
+
 cargo run -p patchgate-cli -- policy diff-contract \
   --path examples/poc/compatibility-lab/policy.v2.toml \
   --format json \
@@ -67,6 +69,16 @@ cargo run -p xtask -- ops fleet-review \
   --exceptions-input examples/poc/fleet-lab/exceptions.json \
   --cost-ceiling-minutes 30 \
   --output target/compatibility-lab/fleet-review.md
+
+cargo run -p xtask -- ops audit-drift-report \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --output target/compatibility-lab/audit-drift-report.md
+
+cargo run -p xtask -- ops shadow-review \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --output target/compatibility-lab/shadow-review.md
 
 cargo run -p xtask -- ops rollback-packet \
   --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \

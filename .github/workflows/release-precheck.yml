@@ -271,9 +271,9 @@ jobs:
             echo
             echo "## Review Criteria"
             echo "- verify no unknown failure codes are introduced"
-            echo "- confirm dual-write drift is understood"
-            echo "- confirm candidate docs are synced"
-            echo "- confirm rollback packet restores v1 authority"
+            echo "- confirm audit v1/v2 event identity and failure counts match"
+            echo "- confirm rollback packet restores provider and audit authority to v1"
+            echo "- confirm cost and provenance signals have no open blockers"
             echo
             echo "## Decision"
             echo "- CI fixture: upstream generated evidence commands completed in this job"

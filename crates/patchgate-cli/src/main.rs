@@ -3536,12 +3536,38 @@ fn build_contract_diff_report(
     ));
 
     let mut next_actions = Vec::new();
+    if cfg.policy_version != POLICY_VERSION_CURRENT {
+        next_actions.push(format!(
+            "Migrate policy_version to {POLICY_VERSION_CURRENT} before freezing the v2 contract."
+        ));
+    }
+    if !cfg.compatibility.v1.rc_frozen {
+        next_actions
+            .push("Set compatibility.v1.rc_frozen=true before RC contract freeze.".to_string());
+    }
+    if cfg.compatibility.v1.allow_legacy_config_names {
+        next_actions.push(
+            "Set compatibility.v1.allow_legacy_config_names=false to enforce the freeze boundary."
+                .to_string(),
+        );
+    }
     if !cfg.compatibility.v2.shadow_mode {
         next_actions
             .push("Enable compatibility.v2.shadow_mode before attempting dual-run.".to_string());
     }
+    if cfg.compatibility.v2.bridge_mode == "off" {
+        next_actions.push(
+            "Set compatibility.v2.bridge_mode to provider, audit, or full for RC evidence."
+                .to_string(),
+        );
+    }
     if cfg.integrations.ci.generic_schema == "v1" {
         next_actions.push("Switch integrations.ci.generic_schema to `v2` or `dual` for provider bridge validation.".to_string());
+    }
+    if cfg.observability.audit_v2_schema_version != 2 {
+        next_actions.push(
+            "Set observability.audit_v2_schema_version=2 for the v2 audit export gate.".to_string(),
+        );
     }
     if cfg.observability.audit_v2_jsonl_path.trim().is_empty() {
         next_actions

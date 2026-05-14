@@ -309,7 +309,7 @@ cargo run -p xtask -- ops rc-readiness \
   --output artifacts/v2-rc-readiness.md
 ```
 
-`artifacts/security-review-template.md` は、レビュー完了後に `- [x] Continue` を付け、`Mitigation required` は未チェックのままにしてください。
+`artifacts/security-review-template.md` は、unknown failure code / audit v1-v2 event identity / rollback authority / cost and provenance の criteria を埋めたうえで、レビュー完了後に `- [x] Continue` を付け、`Mitigation required` は未チェックのままにしてください。
 `artifacts/diff-contract.json` は `patchgate policy diff-contract --format json --enforce` で生成し、`artifacts/fleet-review.md` は repo / segment cost が green の状態で添付します。
 
 ### GA packet を生成

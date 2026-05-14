@@ -514,6 +514,15 @@ struct ShadowAlignment {
     aligned: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AuditEventIdentity {
+    repo: String,
+    mode: String,
+    scope: String,
+    result: String,
+    failure_code: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ProviderArtifactSummary {
     repo: String,
@@ -2341,7 +2350,8 @@ fn run_rollback_packet(options: &OpsOptions) -> Result<()> {
     let provider_v1_verified =
         provider_v1_restore_verified(&options.provider_inputs, &rollback_repos)?;
     let audit_v2_retained = !audits_v2.is_empty();
-    let dual_run_reversible = !audits.is_empty() && audit_v2_retained && shadow.aligned;
+    let audit_event_parity = audit_events_have_strict_parity(&audits, &audits_v2);
+    let dual_run_reversible = audit_event_parity && shadow.aligned;
     let dry_run_completed = dual_run_reversible && provider_v1_verified;
     let packet = RollbackPacket {
         schema_version: 1,
@@ -2388,6 +2398,7 @@ fn run_migration_drill(options: &OpsOptions) -> Result<()> {
         rollback_packet_input_ready(options.rollback_packet_input.as_deref())?;
     let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
     let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let audit_event_parity = audit_events_have_strict_parity(&audits, &audits_v2);
     let candidate_repos = candidate_repos(&metrics, &audits);
     let metric_repos = metrics
         .iter()
@@ -2403,9 +2414,10 @@ fn run_migration_drill(options: &OpsOptions) -> Result<()> {
         .collect::<BTreeSet<_>>();
     let provider_ready_repos = provider_summaries
         .iter()
-        .filter(|summary| matches!(summary.schema_mode.as_str(), "dual" | "v2"))
+        .filter(|summary| summary.schema_mode == "dual")
         .map(|summary| summary.repo.as_str())
         .collect::<BTreeSet<_>>();
+    let provider_restore_ready_repos = provider_v1_restore_ready_repos(&options.provider_inputs)?;
 
     let mut blockers = Vec::new();
     if candidate_repos.is_empty() {
@@ -2413,6 +2425,9 @@ fn run_migration_drill(options: &OpsOptions) -> Result<()> {
     }
     if !shadow.aligned {
         blockers.push("audit v1/v2 shadow alignment failed".to_string());
+    }
+    if !audit_event_parity {
+        blockers.push("audit v1/v2 event identity parity failed".to_string());
     }
     if !rollback_packet_ready {
         blockers.push("rollback packet is missing or incomplete".to_string());
@@ -2424,7 +2439,9 @@ fn run_migration_drill(options: &OpsOptions) -> Result<()> {
                 && audit_repos.contains(repo.as_str())
                 && audit_v2_repos.contains(repo.as_str())
                 && provider_ready_repos.contains(repo.as_str())
+                && provider_restore_ready_repos.contains(repo.as_str())
                 && shadow.aligned
+                && audit_event_parity
                 && rollback_packet_ready
         })
         .count();
@@ -2435,8 +2452,12 @@ fn run_migration_drill(options: &OpsOptions) -> Result<()> {
         if !audit_repos.contains(repo.as_str()) {
             blockers.push(format!("repo={repo} missing audit v1 evidence"));
         }
-        if !provider_ready_repos.contains(repo.as_str()) {
-            blockers.push(format!("repo={repo} missing dual/v2 provider artifact"));
+        if !provider_ready_repos.contains(repo.as_str())
+            || !provider_restore_ready_repos.contains(repo.as_str())
+        {
+            blockers.push(format!(
+                "repo={repo} missing dual provider artifact with v1 restore evidence"
+            ));
         }
         if !audit_v2_repos.contains(repo.as_str()) {
             blockers.push(format!("repo={repo} missing audit v2 evidence"));
@@ -4614,6 +4635,49 @@ fn provider_identity(value: &serde_json::Value, schema_mode: &str) -> String {
     }
 }
 
+fn audit_event_identity_counts_v1(
+    audits: &[AuditLogRecord],
+) -> BTreeMap<AuditEventIdentity, usize> {
+    let mut counts = BTreeMap::new();
+    for row in audits {
+        let identity = AuditEventIdentity {
+            repo: row.repo.clone(),
+            mode: row.mode.clone(),
+            scope: row.scope.clone(),
+            result: row.result.clone(),
+            failure_code: row.failure_code.clone(),
+        };
+        *counts.entry(identity).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn audit_event_identity_counts_v2(
+    audits: &[AuditLogV2Record],
+) -> BTreeMap<AuditEventIdentity, usize> {
+    let mut counts = BTreeMap::new();
+    for row in audits {
+        let identity = AuditEventIdentity {
+            repo: row.repo.clone(),
+            mode: row.operation.mode.clone(),
+            scope: row.operation.scope.clone(),
+            result: row.operation.result.clone(),
+            failure_code: row.failure.code.clone(),
+        };
+        *counts.entry(identity).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn audit_events_have_strict_parity(
+    audits_v1: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> bool {
+    !audits_v1.is_empty()
+        && !audits_v2.is_empty()
+        && audit_event_identity_counts_v1(audits_v1) == audit_event_identity_counts_v2(audits_v2)
+}
+
 fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSummary>> {
     let mut out = Vec::new();
     for path in paths {
@@ -4656,7 +4720,17 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
     Ok(out)
 }
 
-fn provider_v1_restore_verified(paths: &[PathBuf], repos: &BTreeSet<String>) -> Result<bool> {
+fn provider_v1_payload_matches(value: &serde_json::Value, repo: &str) -> bool {
+    value
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value_repo| value_repo == repo)
+        && value.get("provider").and_then(serde_json::Value::as_str) == Some("generic")
+        && value.get("summary").is_some()
+        && value.get("report").is_some()
+}
+
+fn provider_v1_restore_ready_repos(paths: &[PathBuf]) -> Result<BTreeSet<String>> {
     let mut ready_repos = BTreeSet::new();
     for path in paths {
         let value = load_json_file::<serde_json::Value>(path)?;
@@ -4664,19 +4738,25 @@ fn provider_v1_restore_verified(paths: &[PathBuf], repos: &BTreeSet<String>) -> 
             .get("repo")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
+        let repo_is_valid = repo != "unknown" && !repo.trim().is_empty();
         let dual_bridge_with_v1 = value
             .get("bridge_format")
             .and_then(serde_json::Value::as_str)
             == Some("patchgate.provider.generic.bridge.v1")
-            && value.get("v1").is_some();
-        let direct_v1 = value.get("provider").and_then(serde_json::Value::as_str)
-            == Some("generic")
-            && value.get("summary").is_some()
-            && value.get("report").is_some();
-        if dual_bridge_with_v1 || direct_v1 {
+            && value.get("v2").is_some()
+            && value
+                .get("v1")
+                .is_some_and(|v1| provider_v1_payload_matches(v1, repo));
+        let direct_v1 = provider_v1_payload_matches(&value, repo);
+        if repo_is_valid && (dual_bridge_with_v1 || direct_v1) {
             ready_repos.insert(repo.to_string());
         }
     }
+    Ok(ready_repos)
+}
+
+fn provider_v1_restore_verified(paths: &[PathBuf], repos: &BTreeSet<String>) -> Result<bool> {
+    let ready_repos = provider_v1_restore_ready_repos(paths)?;
     Ok(!repos.is_empty() && repos.iter().all(|repo| ready_repos.contains(repo)))
 }
 
@@ -4784,6 +4864,12 @@ fn security_review_packet_ready(path: Option<&Path>) -> Result<bool> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let approved = security_review_is_approved(Some(path))?;
     let mitigation_unchecked = raw.contains("- [ ] Mitigation required");
+    let required_criteria = [
+        "unknown failure codes",
+        "audit v1/v2 event identity",
+        "rollback packet restores",
+        "cost and provenance",
+    ];
     Ok(approved
         && mitigation_unchecked
         && raw.contains("# RC Security Review Packet")
@@ -4793,7 +4879,10 @@ fn security_review_packet_ready(path: Option<&Path>) -> Result<bool> {
         && raw.contains("audit-drift")
         && raw.contains("shadow-review")
         && raw.contains("fleet-review")
-        && raw.contains("rollback"))
+        && raw.contains("rollback")
+        && required_criteria
+            .iter()
+            .all(|criterion| raw.contains(criterion)))
 }
 
 fn contract_freeze_input_ready(path: Option<&Path>) -> Result<bool> {
@@ -4913,9 +5002,10 @@ fn deprecation_countdown_markers_ready(path: Option<&Path>) -> Result<bool> {
         return Ok(false);
     }
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(raw.contains("+30")
-        && raw.contains("+60")
-        && raw.contains("+90")
+    Ok(raw.contains("## Countdown markers")
+        && raw.contains("- +30:")
+        && raw.contains("- +60:")
+        && raw.contains("- +90:")
         && raw.contains("v2-ga-packet")
         && raw.contains("dual-run"))
 }
@@ -4937,6 +5027,7 @@ fn candidate_checklist_ready(path: Option<&Path>) -> Result<bool> {
         "rollback packet",
         "RC security review",
         "benchmark / cost sign-off",
+        "candidate checklist",
         "GA go / no-go",
     ];
     Ok(required.iter().all(|marker| raw.contains(marker)))
@@ -4990,8 +5081,10 @@ fn go_no_go_review_ready(path: Option<&Path>) -> Result<bool> {
         && no_go_unchecked
         && raw.contains("# V2 GA Go / No-Go Review")
         && raw.contains("## Decision")
+        && raw.contains("## Required Evidence")
         && raw.contains("RC readiness")
         && raw.contains("rollback")
+        && raw.contains("LTS policy")
         && raw.contains("v1 sunset")
         && raw.contains("support"))
 }
@@ -5061,8 +5154,11 @@ fn validate_audit_export_v2(
     if !shadow.scope_set_match {
         diagnostics.push("audit v1/v2 scope sets differ".to_string());
     }
-    if shadow.event_delta.abs() > 1 {
+    if shadow.event_delta != 0 {
         diagnostics.push(format!("audit v1/v2 event_delta={}", shadow.event_delta));
+    }
+    if !audit_events_have_strict_parity(audits, audits_v2) {
+        diagnostics.push("audit v1/v2 event identities differ".to_string());
     }
     AuditExportV2Validation {
         ready: diagnostics.is_empty(),
@@ -7191,7 +7287,7 @@ mod tests {
         .expect("write audit v2");
         fs::write(
             &provider,
-            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"provider":"generic","summary":{},"report":{}},"v2":{}}
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"provider":"generic","repo":"repo-a","summary":{},"report":{}},"v2":{}}
 "#,
         )
         .expect("write provider");
@@ -7216,7 +7312,7 @@ mod tests {
         let blocked_output = base.join("rollback-packet-blocked.json");
         fs::write(
             &mismatched_provider,
-            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-b","v1":{"provider":"generic","summary":{},"report":{}},"v2":{}}
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-b","v1":{"provider":"generic","repo":"repo-b","summary":{},"report":{}},"v2":{}}
 "#,
         )
         .expect("write mismatched provider");
@@ -7237,6 +7333,34 @@ mod tests {
         ])
         .expect("parse blocked rollback options");
         let err = run_rollback_packet(&blocked_options).expect_err("repo mismatch must block");
+        assert!(err.to_string().contains("rollback packet failed"));
+
+        let malformed_provider = base.join("provider-malformed.json");
+        let malformed_output = base.join("rollback-packet-malformed.json");
+        fs::write(
+            &malformed_provider,
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"repo":"repo-a"},"v2":{}}
+"#,
+        )
+        .expect("write malformed provider");
+        let malformed_options = parse_ops_options(vec![
+            "rollback-packet".into(),
+            "--audit-input".into(),
+            options.audit_input.clone().into_os_string(),
+            "--audit-v2-input".into(),
+            options
+                .audit_v2_input
+                .clone()
+                .expect("audit v2 input")
+                .into_os_string(),
+            "--provider-input".into(),
+            malformed_provider.into_os_string(),
+            "--output".into(),
+            malformed_output.into_os_string(),
+        ])
+        .expect("parse malformed rollback options");
+        let err =
+            run_rollback_packet(&malformed_options).expect_err("malformed v1 restore must block");
         assert!(err.to_string().contains("rollback packet failed"));
 
         let _ = fs::remove_dir_all(base);
@@ -7274,7 +7398,7 @@ mod tests {
         .expect("write audit v2");
         fs::write(
             &provider,
-            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{},"v2":{}}
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"provider":"generic","repo":"repo-a","summary":{},"report":{}},"v2":{}}
 "#,
         )
         .expect("write provider");
@@ -7864,26 +7988,26 @@ security_sla_hours = "72"
         let security = base.join("security-review.md");
         fs::write(
             &security,
-            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- clean\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
         )
         .expect("write security");
         assert!(security_review_packet_ready(Some(&security)).expect("security ready"));
         fs::write(
             &security,
-            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- clean\n\n## Decision\n- [x] Continue\n",
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n",
         )
         .expect("write thin security");
         assert!(!security_review_packet_ready(Some(&security)).expect("security should parse"));
         fs::write(
             &security,
-            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- clean\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
         )
         .expect("restore security");
 
         let sunset = base.join("sunset.md");
         fs::write(
             &sunset,
-            "# V1 Sunset Notice\n\n+30 verify-v2\n+60 v1-only warning\n+90 dual-run decommission\n\nv2-ga-packet\n",
+            "# V1 Sunset Notice\n\n## Countdown markers\n- +30: verify-v2\n- +60: v1-only warning\n- +90: dual-run decommission with `v2-ga-packet.md`\n",
         )
         .expect("write sunset");
         assert!(deprecation_countdown_markers_ready(Some(&sunset)).expect("sunset ready"));
@@ -7900,6 +8024,7 @@ security_sla_hours = "72"
                 "rollback packet",
                 "RC security review",
                 "benchmark / cost sign-off",
+                "candidate checklist",
                 "GA go / no-go",
             ]
             .join("\n"),
@@ -7926,13 +8051,13 @@ security_sla_hours = "72"
         let go = base.join("go-no-go.md");
         fs::write(
             &go,
-            "# V2 GA Go / No-Go Review\n\nRC readiness green\nrollback ready\nv1 sunset notice\nsupport path\n\n## Decision\n- [x] Go\n- [ ] No-go\n",
+            "# V2 GA Go / No-Go Review\n\n## Required Evidence\n- RC readiness: artifacts/v2-rc-readiness.md\n- rollback packet: artifacts/rollback-packet.json\n- LTS policy: artifacts/policy.v2.toml\n- v1 sunset notice: docs/21_v1_sunset_notice.md\n- support path: docs/22_v2_support_model.md\n\n## Decision\n- [x] Go\n- [ ] No-go\n",
         )
         .expect("write go no-go");
         assert!(go_no_go_review_ready(Some(&go)).expect("go no-go ready"));
         fs::write(
             &go,
-            "# V2 GA Go / No-Go Review\n\nRC readiness green\nrollback ready\nv1 sunset notice\nsupport path\n\n## Decision\n- [x] Go\n",
+            "# V2 GA Go / No-Go Review\n\n## Required Evidence\n- RC readiness: artifacts/v2-rc-readiness.md\n- rollback packet: artifacts/rollback-packet.json\n- v1 sunset notice: docs/21_v1_sunset_notice.md\n- support path: docs/22_v2_support_model.md\n\n## Decision\n- [x] Go\n- [ ] No-go\n",
         )
         .expect("write thin go no-go");
         assert!(!go_no_go_review_ready(Some(&go)).expect("thin go no-go should parse"));
@@ -7994,6 +8119,21 @@ security_sla_hours = "72"
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("schema_version=3")));
+
+        let mut extra_v2 = invalid_v2;
+        extra_v2[0].schema_version = 2;
+        extra_v2[0].gate.score = Some(90);
+        extra_v2.push(extra_v2[0].clone());
+        let validation = validate_audit_export_v2(&audits, &extra_v2);
+        assert!(!validation.ready);
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("event_delta=1")));
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("event identities differ")));
     }
 
     #[test]
