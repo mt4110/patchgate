@@ -10,6 +10,10 @@
 - `fleet-review.md`
 - `v2-rc-readiness.md`
 - `v2-ga-packet.md`
+- `diff-contract.json`
+- `migration-drill.json`
+- `rollback-packet.json`
+- `v2-ga-go-no-go.md`
 
 ## Escalation path
 
@@ -20,7 +24,8 @@
 5. provider / plugin / delivery bridge artifact check fails
 6. provider rollout checklist triggers rollback
 7. fleet review exceeds cost ceiling, fails provider negotiation, exposes unverified provenance, or has expired exceptions
-8. GA packet fails LTS/support/sunset checks
+8. RC readiness lacks contract freeze, migration drill, rollback packet, security review, benchmark/cost sign-off, or v1 deprecation countdown evidence
+9. GA packet fails RC readiness, go/no-go, LTS/support/sunset checks
 
 ## Steady-state loop
 
@@ -31,7 +36,11 @@
 5. review shadow output
 6. verify provider, audit, plugin shadow, webhook, and notification bridge artifacts
 7. review fleet packet, including segment cost, retention tier, exception governance, and Phase181+ RC prep blockers
-8. decide hold / widen / rollback
+8. generate rollback packet from current audit v1 / audit v2 / provider restore evidence
+9. generate migration drill from current metrics / audit v1 / audit v2 / provider / rollback evidence
+10. attach contract freeze, migration drill, rollback packet, security review, benchmark/cost sign-off, and countdown markers to RC readiness
+11. for release workflow, set `rc_security_decision=continue` and `ga_decision=go` only after the packet evidence is reviewed
+12. decide hold / widen / rollback
 
 ## GA command
 
@@ -42,6 +51,8 @@ cargo run -p xtask -- ops ga-packet \
   --audit-v2-input artifacts/scan-audit-v2.jsonl \
   --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
   --policy-input artifacts/policy.v2.toml \
+  --rc-readiness-input artifacts/v2-rc-readiness.md \
+  --go-no-go-path artifacts/v2-ga-go-no-go.md \
   --migration-guide-path docs/16_v2_migration_guide_alpha.md \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
   --ops-handbook-path docs/19_v2_ops_handbook.md \

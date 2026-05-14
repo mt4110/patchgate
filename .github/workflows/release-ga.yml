@@ -6,6 +6,22 @@ on:
       version:
         description: "Release version (e.g. v1.0.0)"
         required: true
+      rc_security_decision:
+        description: "RC security review decision"
+        required: true
+        default: hold
+        type: choice
+        options:
+          - hold
+          - continue
+      ga_decision:
+        description: "GA release decision"
+        required: true
+        default: no-go
+        type: choice
+        options:
+          - no-go
+          - go
 
 permissions:
   id-token: write
@@ -20,6 +36,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - uses: sigstore/cosign-installer@v3.8.1
 
       - name: Prepare v2 policy evidence
@@ -37,7 +55,8 @@ jobs:
             --format json > artifacts/verify-v2.json
           cargo run -p patchgate-cli -- policy diff-contract \
             --path artifacts/policy.v2.toml \
-            --format json > artifacts/diff-contract.json
+            --format json \
+            --enforce > artifacts/diff-contract.json
 
       - name: Generate telemetry and provider artifacts
         run: |
@@ -78,20 +97,6 @@ jobs:
             --output config/benchmarks/ci-worktree-baseline.jsonl \
             --require-baseline \
             --report-output artifacts/bench-compare.json
-          {
-            echo "# RC Security Review Packet"
-            echo
-            echo "## Inputs"
-            echo "- history summary: artifacts/history-summary.json"
-            echo "- history trend: artifacts/history-trend.json"
-            echo "- verify-v2: artifacts/verify-v2.json"
-            echo
-            echo "## Decision"
-            echo "- CI fixture: pre-approved to exercise rc-readiness gating"
-            echo "- [x] Continue"
-            echo "- [ ] Mitigation required"
-          } > artifacts/security-review-template.md
-
       - name: Generate replay evidence
         run: |
           python3 - <<'PY' &
@@ -154,6 +159,45 @@ jobs:
             --provider-input artifacts/provider-dual.json \
             --cost-ceiling-minutes 30 \
             --output artifacts/fleet-review.md
+          cargo run -p xtask -- ops rollback-packet \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --output artifacts/rollback-packet.json
+          cargo run -p xtask -- ops migration-drill \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --rollback-packet-input artifacts/rollback-packet.json \
+            --output artifacts/migration-drill.json
+          if [ "${{ inputs.rc_security_decision }}" != "continue" ]; then
+            echo "RC security review decision must be continue to build release packets."
+            exit 1
+          fi
+          {
+            echo "# RC Security Review Packet"
+            echo
+            echo "## Inputs"
+            echo "- history summary: artifacts/history-summary.json"
+            echo "- history trend: artifacts/history-trend.json"
+            echo "- verify-v2: artifacts/verify-v2.json"
+            echo "- audit-drift: artifacts/audit-drift-report.md"
+            echo "- shadow-review: artifacts/shadow-review.md"
+            echo "- fleet-review: artifacts/fleet-review.md"
+            echo "- rollback packet: artifacts/rollback-packet.json"
+            echo
+            echo "## Review Criteria"
+            echo "- verify no unknown failure codes are introduced"
+            echo "- confirm audit v1/v2 event identity and failure counts match"
+            echo "- confirm rollback packet restores provider and audit authority to v1"
+            echo "- confirm cost and provenance signals have no open blockers"
+            echo
+            echo "## Decision"
+            echo "- manual workflow input: rc_security_decision=continue"
+            echo "- [x] Continue"
+            echo "- [ ] Mitigation required"
+          } > artifacts/security-review-template.md
           cargo run -p xtask -- ops rc-readiness \
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
@@ -162,17 +206,43 @@ jobs:
             --provider-input artifacts/provider-dual.json \
             --benchmark-input artifacts/bench-compare.json \
             --security-review-input artifacts/security-review-template.md \
+            --contract-freeze-input artifacts/diff-contract.json \
+            --migration-drill-input artifacts/migration-drill.json \
+            --rollback-packet-input artifacts/rollback-packet.json \
+            --fleet-review-input artifacts/fleet-review.md \
             --migration-guide-path docs/16_v2_migration_guide_alpha.md \
             --provider-rollout-path docs/15_provider_rollout_checklist.md \
             --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
             --freeze-boundary-path artifacts/v1.1-freeze-boundary.md \
+            --sunset-notice-path docs/21_v1_sunset_notice.md \
             --output artifacts/v2-rc-readiness.md
+          if [ "${{ inputs.ga_decision }}" != "go" ]; then
+            echo "GA release decision must be go after RC readiness is green."
+            exit 1
+          fi
+          {
+            echo "# V2 GA Go / No-Go Review"
+            echo
+            echo "## Required Evidence"
+            echo "- RC readiness: artifacts/v2-rc-readiness.md"
+            echo "- rollback packet: artifacts/rollback-packet.json"
+            echo "- LTS policy: artifacts/policy.v2.toml"
+            echo "- v1 sunset notice: docs/21_v1_sunset_notice.md"
+            echo "- support path: docs/22_v2_support_model.md"
+            echo
+            echo "## Decision"
+            echo "- manual workflow input: ga_decision=go"
+            echo "- [x] Go"
+            echo "- [ ] No-go"
+          } > artifacts/v2-ga-go-no-go.md
           cargo run -p xtask -- ops ga-packet \
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
             --audit-v2-input artifacts/scan-audit-v2.jsonl \
             --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
             --policy-input artifacts/policy.v2.toml \
+            --rc-readiness-input artifacts/v2-rc-readiness.md \
+            --go-no-go-path artifacts/v2-ga-go-no-go.md \
             --migration-guide-path docs/16_v2_migration_guide_alpha.md \
             --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
             --ops-handbook-path docs/19_v2_ops_handbook.md \

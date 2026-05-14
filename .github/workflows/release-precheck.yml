@@ -72,7 +72,8 @@ jobs:
             --format json > artifacts/verify-v2.json
           nix develop --command cargo run -p patchgate-cli -- policy diff-contract \
             --path artifacts/policy.v2.toml \
-            --format json > artifacts/diff-contract.json
+            --format json \
+            --enforce > artifacts/diff-contract.json
           for preset in strict balanced relaxed; do
             nix develop --command cargo run -p patchgate-cli -- policy lint \
               --path "config/presets/${preset}.toml" \
@@ -170,28 +171,6 @@ jobs:
             --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json \
             --format json > artifacts/verify-v2-artifacts.json
 
-      - name: Build RC security review template
-        run: |
-          mkdir -p artifacts
-          {
-            echo "# RC Security Review Packet"
-            echo
-            echo "## Inputs"
-            echo "- history summary: artifacts/history-summary.json"
-            echo "- history trend: artifacts/history-trend.json"
-            echo "- audit drift: artifacts/audit-drift-report.md"
-            echo
-            echo "## Review Criteria"
-            echo "- verify no unknown failure codes are introduced"
-            echo "- confirm dual-write drift is understood"
-            echo "- confirm candidate docs are synced"
-            echo
-            echo "## Decision"
-            echo "- CI fixture: pre-approved to exercise rc-readiness gating"
-            echo "- [x] Continue"
-            echo "- [ ] Mitigation required"
-          } > artifacts/security-review-template.md
-
       - name: Dead-letter replay dry-run smoke test
         run: |
           cat > artifacts/dead-letter.jsonl <<'EOF'
@@ -267,6 +246,40 @@ jobs:
             --provider-input artifacts/provider-dual.json \
             --cost-ceiling-minutes 30 \
             --output artifacts/fleet-review.md
+          nix develop --command cargo run -p xtask -- ops rollback-packet \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --output artifacts/rollback-packet.json
+          nix develop --command cargo run -p xtask -- ops migration-drill \
+            --metrics-input artifacts/scan-metrics.jsonl \
+            --audit-input artifacts/scan-audit.jsonl \
+            --audit-v2-input artifacts/scan-audit-v2.jsonl \
+            --provider-input artifacts/provider-dual.json \
+            --rollback-packet-input artifacts/rollback-packet.json \
+            --output artifacts/migration-drill.json
+          {
+            echo "# RC Security Review Packet"
+            echo
+            echo "## Inputs"
+            echo "- history summary: artifacts/history-summary.json"
+            echo "- history trend: artifacts/history-trend.json"
+            echo "- audit-drift: artifacts/audit-drift-report.md"
+            echo "- shadow-review: artifacts/shadow-review.md"
+            echo "- fleet-review: artifacts/fleet-review.md"
+            echo "- rollback packet: artifacts/rollback-packet.json"
+            echo
+            echo "## Review Criteria"
+            echo "- verify no unknown failure codes are introduced"
+            echo "- confirm audit v1/v2 event identity and failure counts match"
+            echo "- confirm rollback packet restores provider and audit authority to v1"
+            echo "- confirm cost and provenance signals have no open blockers"
+            echo
+            echo "## Decision"
+            echo "- CI fixture: upstream generated evidence commands completed in this job"
+            echo "- [x] Continue"
+            echo "- [ ] Mitigation required"
+          } > artifacts/security-review-template.md
           nix develop --command cargo run -p xtask -- ops rc-readiness \
             --metrics-input artifacts/scan-metrics.jsonl \
             --audit-input artifacts/scan-audit.jsonl \
@@ -275,10 +288,15 @@ jobs:
             --provider-input artifacts/provider-dual.json \
             --benchmark-input artifacts/bench-compare.json \
             --security-review-input artifacts/security-review-template.md \
+            --contract-freeze-input artifacts/diff-contract.json \
+            --migration-drill-input artifacts/migration-drill.json \
+            --rollback-packet-input artifacts/rollback-packet.json \
+            --fleet-review-input artifacts/fleet-review.md \
             --migration-guide-path docs/16_v2_migration_guide_alpha.md \
             --provider-rollout-path docs/15_provider_rollout_checklist.md \
             --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
             --freeze-boundary-path artifacts/v1.1-freeze-boundary.md \
+            --sunset-notice-path docs/21_v1_sunset_notice.md \
             --output artifacts/v2-rc-readiness.md
 
       - name: Verify SBOM and provenance metadata contract

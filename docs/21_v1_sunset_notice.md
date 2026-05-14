@@ -15,6 +15,12 @@
 3. +60日: v1-only provider の warning 強化
 4. +90日: dual-run decommission review
 
+## Countdown markers
+
+- +30: migration reminder and `diff-contract --enforce` evidence refresh
+- +60: v1-only provider warning escalation
+- +90: dual-run rollback/decommission review with `v2-ga-packet.md`
+
 ## Required artifacts
 
 - `v2-ga-packet.md`

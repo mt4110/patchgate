@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-14T00:00:00Z",
+  "owner": "platform-governance",
+  "triggers": [
+    "provider artifact drift",
+    "audit v2 event or failure drift",
+    "fleet cost ceiling breach"
+  ],
+  "restore": {
+    "bridge_mode": "off",
+    "generic_schema": "v1",
+    "v1_audit_authoritative": true
+  },
+  "verification": {
+    "dry_run_completed": true,
+    "dual_run_reversible": true,
+    "provider_v1_verified": true,
+    "audit_v2_retained": true
+  },
+  "retained_evidence": ["audit-v1", "audit-v2"]
+}

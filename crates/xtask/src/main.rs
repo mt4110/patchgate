@@ -40,6 +40,8 @@ enum OpsSubcommand {
     FreezeScoreboard,
     FreezeBoundary,
     ReplayNormalize,
+    RollbackPacket,
+    MigrationDrill,
     ShadowReview,
     FleetReview,
     RcReadiness,
@@ -79,6 +81,11 @@ struct OpsOptions {
     exceptions_input: Option<PathBuf>,
     benchmark_input: Option<PathBuf>,
     security_review_input: Option<PathBuf>,
+    contract_freeze_input: Option<PathBuf>,
+    migration_drill_input: Option<PathBuf>,
+    rollback_packet_input: Option<PathBuf>,
+    fleet_review_input: Option<PathBuf>,
+    rc_readiness_input: Option<PathBuf>,
     policy_input: Option<PathBuf>,
     migration_guide_path: Option<PathBuf>,
     provider_rollout_path: Option<PathBuf>,
@@ -88,6 +95,7 @@ struct OpsOptions {
     support_model_path: Option<PathBuf>,
     sunset_notice_path: Option<PathBuf>,
     phase201_backcast_path: Option<PathBuf>,
+    go_no_go_path: Option<PathBuf>,
     cost_ceiling_minutes: Option<u64>,
     availability_target_pct: u8,
     p95_target_ms: u32,
@@ -506,6 +514,15 @@ struct ShadowAlignment {
     aligned: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AuditEventIdentity {
+    repo: String,
+    mode: String,
+    scope: String,
+    result: String,
+    failure_code: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ProviderArtifactSummary {
     repo: String,
@@ -580,6 +597,59 @@ struct ReleasePolicySummary {
     lts_active: bool,
     lts_branch: String,
     security_sla_hours: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MigrationDrillReport {
+    schema_version: u8,
+    generated_at: String,
+    drill_id: String,
+    repos_total: usize,
+    repos_attempted: usize,
+    repos_succeeded: usize,
+    repos_failed: usize,
+    provider_artifacts_checked: usize,
+    audit_events_replayed: usize,
+    rollback_rehearsed: bool,
+    dry_run: bool,
+    #[serde(default)]
+    owners: Vec<String>,
+    #[serde(default)]
+    blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RollbackPacket {
+    schema_version: u8,
+    generated_at: String,
+    owner: String,
+    #[serde(default)]
+    triggers: Vec<String>,
+    restore: RollbackRestorePlan,
+    verification: RollbackVerification,
+    #[serde(default)]
+    retained_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RollbackRestorePlan {
+    bridge_mode: String,
+    generic_schema: String,
+    v1_audit_authoritative: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RollbackVerification {
+    dry_run_completed: bool,
+    dual_run_reversible: bool,
+    provider_v1_verified: bool,
+    audit_v2_retained: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AuditExportV2Validation {
+    ready: bool,
+    diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -672,7 +742,7 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops rollback-packet --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...]\n  cargo run -p xtask -- ops migration-drill --metrics-input PATH --audit-input PATH --audit-v2-input PATH --rollback-packet-input PATH --output PATH [--provider-input PATH ...]\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--contract-freeze-input PATH] [--migration-drill-input PATH] [--rollback-packet-input PATH] [--fleet-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH] [--sunset-notice-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--rc-readiness-input PATH] [--go-no-go-path PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
     );
 }
 
@@ -788,7 +858,7 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `freeze-boundary`, `replay-normalize`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `freeze-boundary`, `replay-normalize`, `rollback-packet`, `migration-drill`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
@@ -802,6 +872,8 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         "freeze-scoreboard" => OpsSubcommand::FreezeScoreboard,
         "freeze-boundary" => OpsSubcommand::FreezeBoundary,
         "replay-normalize" => OpsSubcommand::ReplayNormalize,
+        "rollback-packet" => OpsSubcommand::RollbackPacket,
+        "migration-drill" => OpsSubcommand::MigrationDrill,
         "shadow-review" => OpsSubcommand::ShadowReview,
         "fleet-review" => OpsSubcommand::FleetReview,
         "rc-readiness" => OpsSubcommand::RcReadiness,
@@ -822,6 +894,11 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut exceptions_input = None;
     let mut benchmark_input = None;
     let mut security_review_input = None;
+    let mut contract_freeze_input = None;
+    let mut migration_drill_input = None;
+    let mut rollback_packet_input = None;
+    let mut fleet_review_input = None;
+    let mut rc_readiness_input = None;
     let mut policy_input = None;
     let mut migration_guide_path = None;
     let mut provider_rollout_path = None;
@@ -831,6 +908,7 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut support_model_path = None;
     let mut sunset_notice_path = None;
     let mut phase201_backcast_path = None;
+    let mut go_no_go_path = None;
     let mut cost_ceiling_minutes = None;
     let mut availability_target_pct = DEFAULT_SLO_AVAILABILITY_TARGET_PCT;
     let mut p95_target_ms = DEFAULT_SLO_P95_TARGET_MS;
@@ -922,6 +1000,36 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .ok_or_else(|| anyhow!("missing value for --security-review-input"))?;
                 security_review_input = Some(PathBuf::from(value));
             }
+            "--contract-freeze-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --contract-freeze-input"))?;
+                contract_freeze_input = Some(PathBuf::from(value));
+            }
+            "--migration-drill-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --migration-drill-input"))?;
+                migration_drill_input = Some(PathBuf::from(value));
+            }
+            "--rollback-packet-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --rollback-packet-input"))?;
+                rollback_packet_input = Some(PathBuf::from(value));
+            }
+            "--fleet-review-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --fleet-review-input"))?;
+                fleet_review_input = Some(PathBuf::from(value));
+            }
+            "--rc-readiness-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --rc-readiness-input"))?;
+                rc_readiness_input = Some(PathBuf::from(value));
+            }
             "--policy-input" => {
                 let value = iter
                     .next()
@@ -975,6 +1083,12 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .next()
                     .ok_or_else(|| anyhow!("missing value for --phase201-backcast-path"))?;
                 phase201_backcast_path = Some(PathBuf::from(value));
+            }
+            "--go-no-go-path" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --go-no-go-path"))?;
+                go_no_go_path = Some(PathBuf::from(value));
             }
             "--cost-ceiling-minutes" => {
                 let value = iter
@@ -1034,6 +1148,11 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         exceptions_input,
         benchmark_input,
         security_review_input,
+        contract_freeze_input,
+        migration_drill_input,
+        rollback_packet_input,
+        fleet_review_input,
+        rc_readiness_input,
         policy_input,
         migration_guide_path,
         provider_rollout_path,
@@ -1043,6 +1162,7 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         support_model_path,
         sunset_notice_path,
         phase201_backcast_path,
+        go_no_go_path,
         cost_ceiling_minutes,
         availability_target_pct,
         p95_target_ms,
@@ -1063,6 +1183,8 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
         OpsSubcommand::FreezeScoreboard => run_freeze_scoreboard(options),
         OpsSubcommand::FreezeBoundary => run_freeze_boundary(options),
         OpsSubcommand::ReplayNormalize => run_replay_normalize(options),
+        OpsSubcommand::RollbackPacket => run_rollback_packet(options),
+        OpsSubcommand::MigrationDrill => run_migration_drill(options),
         OpsSubcommand::ShadowReview => run_shadow_review(options),
         OpsSubcommand::FleetReview => run_fleet_review(options),
         OpsSubcommand::RcReadiness => run_rc_readiness(options),
@@ -2213,6 +2335,158 @@ fn run_replay_normalize(options: &OpsOptions) -> Result<()> {
         "replay evidence packet written: {}",
         options.output.display()
     );
+    Ok(())
+}
+
+fn run_rollback_packet(options: &OpsOptions) -> Result<()> {
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let audit_v2_input = options
+        .audit_v2_input
+        .as_deref()
+        .ok_or_else(|| anyhow!("--audit-v2-input is required for rollback-packet"))?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let rollback_repos = shadow_candidate_repos(&audits, &audits_v2);
+    let provider_v1_verified =
+        provider_v1_restore_verified(&options.provider_inputs, &rollback_repos)?;
+    let audit_v2_retained = !audits_v2.is_empty();
+    let audit_event_parity = audit_events_have_strict_parity(&audits, &audits_v2);
+    let dual_run_reversible = audit_event_parity && shadow.aligned;
+    let dry_run_completed = dual_run_reversible && provider_v1_verified;
+    let packet = RollbackPacket {
+        schema_version: 1,
+        generated_at: current_utc_timestamp_label()?,
+        owner: "platform-governance".to_string(),
+        triggers: vec![
+            "provider artifact drift".to_string(),
+            "audit v2 event or failure drift".to_string(),
+            "fleet cost ceiling breach".to_string(),
+        ],
+        restore: RollbackRestorePlan {
+            bridge_mode: "off".to_string(),
+            generic_schema: "v1".to_string(),
+            v1_audit_authoritative: true,
+        },
+        verification: RollbackVerification {
+            dry_run_completed,
+            dual_run_reversible,
+            provider_v1_verified,
+            audit_v2_retained,
+        },
+        retained_evidence: vec!["audit-v1".to_string(), "audit-v2".to_string()],
+    };
+    write_output(
+        &options.output,
+        serde_json::to_string_pretty(&packet)?.as_str(),
+    )?;
+    println!("rollback packet written: {}", options.output.display());
+    if !rollback_packet_input_ready(Some(&options.output))? {
+        bail!("rollback packet failed");
+    }
+    Ok(())
+}
+
+fn run_migration_drill(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let audit_v2_input = options
+        .audit_v2_input
+        .as_deref()
+        .ok_or_else(|| anyhow!("--audit-v2-input is required for migration-drill"))?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    let rollback_packet_ready =
+        rollback_packet_input_ready(options.rollback_packet_input.as_deref())?;
+    let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
+    let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let audit_event_parity = audit_events_have_strict_parity(&audits, &audits_v2);
+    let candidate_repos = candidate_repos(&metrics, &audits);
+    let metric_repos = metrics
+        .iter()
+        .map(|row| row.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let audit_repos = audits
+        .iter()
+        .map(|row| row.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let audit_v2_repos = audits_v2
+        .iter()
+        .map(|row| row.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let provider_ready_repos = provider_summaries
+        .iter()
+        .filter(|summary| summary.schema_mode == "dual")
+        .map(|summary| summary.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let provider_restore_ready_repos = provider_v1_restore_ready_repos(&options.provider_inputs)?;
+
+    let mut blockers = Vec::new();
+    if candidate_repos.is_empty() {
+        blockers.push("no candidate repos found in metrics or audit inputs".to_string());
+    }
+    if !shadow.aligned {
+        blockers.push("audit v1/v2 shadow alignment failed".to_string());
+    }
+    if !audit_event_parity {
+        blockers.push("audit v1/v2 event identity parity failed".to_string());
+    }
+    if !rollback_packet_ready {
+        blockers.push("rollback packet is missing or incomplete".to_string());
+    }
+    let repos_succeeded = candidate_repos
+        .iter()
+        .filter(|repo| {
+            metric_repos.contains(repo.as_str())
+                && audit_repos.contains(repo.as_str())
+                && audit_v2_repos.contains(repo.as_str())
+                && provider_ready_repos.contains(repo.as_str())
+                && provider_restore_ready_repos.contains(repo.as_str())
+                && shadow.aligned
+                && audit_event_parity
+                && rollback_packet_ready
+        })
+        .count();
+    for repo in &candidate_repos {
+        if !metric_repos.contains(repo.as_str()) {
+            blockers.push(format!("repo={repo} missing metrics evidence"));
+        }
+        if !audit_repos.contains(repo.as_str()) {
+            blockers.push(format!("repo={repo} missing audit v1 evidence"));
+        }
+        if !provider_ready_repos.contains(repo.as_str())
+            || !provider_restore_ready_repos.contains(repo.as_str())
+        {
+            blockers.push(format!(
+                "repo={repo} missing dual provider artifact with v1 restore evidence"
+            ));
+        }
+        if !audit_v2_repos.contains(repo.as_str()) {
+            blockers.push(format!("repo={repo} missing audit v2 evidence"));
+        }
+    }
+    let repos_total = candidate_repos.len();
+    let report = MigrationDrillReport {
+        schema_version: 1,
+        generated_at: current_utc_timestamp_label()?,
+        drill_id: "phase181-large-scale-migration-drill".to_string(),
+        repos_total,
+        repos_attempted: repos_total,
+        repos_succeeded,
+        repos_failed: repos_total.saturating_sub(repos_succeeded),
+        provider_artifacts_checked: provider_summaries.len(),
+        audit_events_replayed: audits_v2.len(),
+        rollback_rehearsed: rollback_packet_ready,
+        dry_run: false,
+        owners: vec!["platform-governance".to_string()],
+        blockers,
+    };
+    write_output(
+        &options.output,
+        serde_json::to_string_pretty(&report)?.as_str(),
+    )?;
+    println!("migration drill written: {}", options.output.display());
+    if report.repos_failed > 0 || !report.blockers.is_empty() {
+        bail!("migration drill failed");
+    }
     Ok(())
 }
 
@@ -3781,6 +4055,7 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     let scoreboard = build_freeze_scoreboard(&metrics, &audits, &assessment);
     let shadow = build_shadow_alignment(&audits, &audits_v2);
     let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
+    let audit_export_v2_validation = validate_audit_export_v2(&audits, &audits_v2);
     let benchmark_signoff = options
         .benchmark_input
         .as_deref()
@@ -3791,32 +4066,55 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
     let security_review_present = path_exists(options.security_review_input.as_deref());
     let security_review_approved =
         security_review_is_approved(options.security_review_input.as_deref())?;
+    let security_review_packet_ready =
+        security_review_packet_ready(options.security_review_input.as_deref())?;
+    let contract_freeze_ready =
+        contract_freeze_input_ready(options.contract_freeze_input.as_deref())?;
+    let migration_drill_artifact_ready =
+        migration_drill_ready(options.migration_drill_input.as_deref())?;
+    let rollback_packet_input_ready =
+        rollback_packet_input_ready(options.rollback_packet_input.as_deref())?;
+    let fleet_cost_signoff =
+        fleet_review_cost_signoff_ready(options.fleet_review_input.as_deref())?;
+    let benchmark_cost_signoff = benchmark_signoff && fleet_cost_signoff;
     let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
     let provider_rollout_present = path_exists(options.provider_rollout_path.as_deref());
     let candidate_checklist_present = path_exists(options.candidate_checklist_path.as_deref());
+    let candidate_checklist_ready =
+        candidate_checklist_ready(options.candidate_checklist_path.as_deref())?;
     let freeze_boundary_present = path_exists(options.freeze_boundary_path.as_deref());
+    let deprecation_countdown_ready =
+        deprecation_countdown_markers_ready(options.sunset_notice_path.as_deref())?;
     let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
     let candidate_repos = candidate_repos(&metrics, &audits);
     let provider_bridge_ready =
         provider_bridge_ready_for_repos(&provider_summaries, &candidate_repos);
     let audit_drift_clean =
         audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
-    let migration_drill_clean = replay_summary
-        .as_ref()
-        .is_some_and(|summary| summary.failed_records == 0 && summary.retained_records == 0);
-    let rollback_packet_ready =
-        migration_drill_clean && shadow.aligned && candidate_checklist_present;
+    let migration_drill_clean = replay_summary.as_ref().is_some_and(|summary| {
+        !summary.dry_run
+            && summary.rewrite_input
+            && summary.failed_records == 0
+            && summary.retained_records == 0
+    }) && migration_drill_artifact_ready;
+    let rollback_packet_ready = migration_drill_clean
+        && shadow.aligned
+        && candidate_checklist_ready
+        && rollback_packet_input_ready;
     let deprecation_window_days = 90u16;
     let rc_ready = scoreboard.v2_seed_ready
+        && contract_freeze_ready
         && audit_drift_clean
+        && audit_export_v2_validation.ready
         && shadow.aligned
         && provider_bridge_ready
-        && benchmark_signoff
-        && security_review_approved
+        && benchmark_cost_signoff
+        && security_review_packet_ready
         && migration_guide_present
         && provider_rollout_present
-        && candidate_checklist_present
+        && candidate_checklist_ready
         && freeze_boundary_present
+        && deprecation_countdown_ready
         && rollback_packet_ready;
 
     let mut next_actions = assessment.next_actions.clone();
@@ -3835,17 +4133,69 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
             "Attach a non-regressing benchmark compare artifact for RC sign-off.".to_string(),
         );
     }
+    if !fleet_cost_signoff {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach a fleet-review artifact with governance, repo cost, and segment cost green."
+                .to_string(),
+        );
+    }
     if !security_review_present {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
             "Attach the RC security review packet before promoting the candidate.".to_string(),
         );
-    } else if !security_review_approved {
+    } else if !security_review_packet_ready {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
-            "Mark the RC security review packet with `- [x] Continue` and keep `Mitigation required` unchecked after reviewer sign-off.".to_string(),
+            "Complete the RC security review packet with inputs, criteria, checked Continue, and unchecked Mitigation required.".to_string(),
+        );
+    }
+    if !contract_freeze_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach an enforced diff-contract JSON artifact with v1 frozen and v2 bridge enabled."
+                .to_string(),
+        );
+    }
+    if !audit_export_v2_validation.ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Regenerate audit v2 export until schema, format, event identity, gate fields, and v1/v2 sets validate.".to_string(),
+        );
+    }
+    if !migration_drill_artifact_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach a non-dry-run large-scale migration drill artifact with zero failed repos and rollback rehearsal.".to_string(),
+        );
+    }
+    if !rollback_packet_input_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach a rollback packet that restores bridge_mode=off, generic_schema=v1, and retains audit v1/v2 evidence.".to_string(),
+        );
+    }
+    if !deprecation_countdown_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach the v1 sunset notice with +30/+60/+90 deprecation countdown markers."
+                .to_string(),
+        );
+    }
+    if !candidate_checklist_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Update the v2 candidate checklist with PR181-PR190 RC hardening markers.".to_string(),
         );
     }
     if !migration_guide_present
@@ -3868,13 +4218,26 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         "- deprecation_window_days: {}\n",
         deprecation_window_days
     ));
+    md.push_str(&format!(
+        "- contract_freeze_ready: {}\n",
+        contract_freeze_ready
+    ));
     md.push_str(&format!("- shadow_aligned: {}\n", shadow.aligned));
     md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!(
+        "- audit_export_v2_valid: {}\n",
+        audit_export_v2_validation.ready
+    ));
     md.push_str(&format!(
         "- provider_bridge_ready: {}\n",
         provider_bridge_ready
     ));
     md.push_str(&format!("- benchmark_signoff: {}\n", benchmark_signoff));
+    md.push_str(&format!("- fleet_cost_signoff: {}\n", fleet_cost_signoff));
+    md.push_str(&format!(
+        "- benchmark_cost_signoff: {}\n",
+        benchmark_cost_signoff
+    ));
     md.push_str(&format!(
         "- security_review_present: {}\n",
         security_review_present
@@ -3884,12 +4247,32 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         security_review_approved
     ));
     md.push_str(&format!(
+        "- security_review_packet_ready: {}\n",
+        security_review_packet_ready
+    ));
+    md.push_str(&format!(
+        "- migration_drill_artifact_ready: {}\n",
+        migration_drill_artifact_ready
+    ));
+    md.push_str(&format!(
         "- migration_drill_clean: {}\n",
         migration_drill_clean
     ));
     md.push_str(&format!(
+        "- rollback_packet_input_ready: {}\n",
+        rollback_packet_input_ready
+    ));
+    md.push_str(&format!(
         "- rollback_packet_ready: {}\n",
         rollback_packet_ready
+    ));
+    md.push_str(&format!(
+        "- deprecation_countdown_ready: {}\n",
+        deprecation_countdown_ready
+    ));
+    md.push_str(&format!(
+        "- candidate_checklist_ready: {}\n",
+        candidate_checklist_ready
     ));
     md.push_str(&format!(
         "- freeze_boundary_present: {}\n\n",
@@ -3902,8 +4285,16 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         checklist_box(scoreboard.v2_seed_ready)
     ));
     md.push_str(&format!(
+        "- {} v2 RC contract freeze is enforced\n",
+        checklist_box(contract_freeze_ready)
+    ));
+    md.push_str(&format!(
         "- {} audit drift is clean\n",
         checklist_box(audit_drift_clean)
+    ));
+    md.push_str(&format!(
+        "- {} audit export v2 validates\n",
+        checklist_box(audit_export_v2_validation.ready)
     ));
     md.push_str(&format!(
         "- {} shadow alignment holds\n",
@@ -3918,8 +4309,16 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         checklist_box(benchmark_signoff)
     ));
     md.push_str(&format!(
-        "- {} security review packet is approved\n",
-        checklist_box(security_review_approved)
+        "- {} cost sign-off is attached\n",
+        checklist_box(fleet_cost_signoff)
+    ));
+    md.push_str(&format!(
+        "- {} security review packet is complete and approved\n",
+        checklist_box(security_review_packet_ready)
+    ));
+    md.push_str(&format!(
+        "- {} large-scale migration drill is clean\n",
+        checklist_box(migration_drill_clean)
     ));
     md.push_str(&format!(
         "- {} migration guide path resolves\n",
@@ -3930,17 +4329,27 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
         checklist_box(provider_rollout_present)
     ));
     md.push_str(&format!(
-        "- {} candidate checklist path resolves\n",
-        checklist_box(candidate_checklist_present)
+        "- {} candidate checklist has RC hardening markers\n",
+        checklist_box(candidate_checklist_ready)
     ));
     md.push_str(&format!(
         "- {} freeze boundary path resolves\n",
         checklist_box(freeze_boundary_present)
     ));
     md.push_str(&format!(
-        "- {} rollback packet is derivable from replay + shadow evidence\n",
+        "- {} v1 deprecation countdown markers resolve\n",
+        checklist_box(deprecation_countdown_ready)
+    ));
+    md.push_str(&format!(
+        "- {} rollback packet is attached and derivable from replay + shadow evidence\n",
         checklist_box(rollback_packet_ready)
     ));
+    if !audit_export_v2_validation.diagnostics.is_empty() {
+        md.push_str("\n## Audit Export V2 Diagnostics\n");
+        for diagnostic in &audit_export_v2_validation.diagnostics {
+            md.push_str(&format!("- {diagnostic}\n"));
+        }
+    }
 
     md.push_str("\n## Next Actions\n");
     if next_actions.is_empty() {
@@ -3997,6 +4406,8 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     let support_model_present = path_exists(options.support_model_path.as_deref());
     let sunset_notice_present = path_exists(options.sunset_notice_path.as_deref());
     let phase201_backcast_present = path_exists(options.phase201_backcast_path.as_deref());
+    let rc_readiness_ready = rc_readiness_packet_ready(options.rc_readiness_input.as_deref())?;
+    let go_no_go_ready = go_no_go_review_ready(options.go_no_go_path.as_deref())?;
     let lts_ready = release_policy.lts_active
         && !release_policy.lts_branch.trim().is_empty()
         && release_policy.security_sla_hours <= 72;
@@ -4014,6 +4425,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         && audit_drift_clean
         && lts_ready
         && docs_ready;
+    let ga_ready = ga_ready && rc_readiness_ready && go_no_go_ready;
 
     let mut next_actions = assessment.next_actions.clone();
     let mut seen_actions = next_actions.iter().cloned().collect::<BTreeSet<_>>();
@@ -4054,6 +4466,20 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
             "Clear unknown audit failure codes/results before promoting the GA packet.".to_string(),
         );
     }
+    if !rc_readiness_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach a green v2 RC readiness packet before the GA review.".to_string(),
+        );
+    }
+    if !go_no_go_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach a go/no-go review with Go checked, No-go unchecked, and rollback/support/sunset evidence referenced.".to_string(),
+        );
+    }
 
     let mut md = String::new();
     md.push_str("# V2 GA Packet\n\n");
@@ -4071,6 +4497,8 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         dual_run_decommission_ready
     ));
     md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!("- rc_readiness_ready: {}\n", rc_readiness_ready));
+    md.push_str(&format!("- go_no_go_ready: {}\n", go_no_go_ready));
     md.push_str(&format!("- docs_ready: {}\n\n", docs_ready));
 
     md.push_str("## Checklist\n");
@@ -4085,6 +4513,14 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     md.push_str(&format!(
         "- {} audit drift is clean\n",
         checklist_box(audit_drift_clean)
+    ));
+    md.push_str(&format!(
+        "- {} RC readiness packet is green\n",
+        checklist_box(rc_readiness_ready)
+    ));
+    md.push_str(&format!(
+        "- {} GA go/no-go review is Go\n",
+        checklist_box(go_no_go_ready)
     ));
     md.push_str(&format!(
         "- {} LTS policy is active and within SLA\n",
@@ -4199,6 +4635,49 @@ fn provider_identity(value: &serde_json::Value, schema_mode: &str) -> String {
     }
 }
 
+fn audit_event_identity_counts_v1(
+    audits: &[AuditLogRecord],
+) -> BTreeMap<AuditEventIdentity, usize> {
+    let mut counts = BTreeMap::new();
+    for row in audits {
+        let identity = AuditEventIdentity {
+            repo: row.repo.clone(),
+            mode: row.mode.clone(),
+            scope: row.scope.clone(),
+            result: row.result.clone(),
+            failure_code: row.failure_code.clone(),
+        };
+        *counts.entry(identity).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn audit_event_identity_counts_v2(
+    audits: &[AuditLogV2Record],
+) -> BTreeMap<AuditEventIdentity, usize> {
+    let mut counts = BTreeMap::new();
+    for row in audits {
+        let identity = AuditEventIdentity {
+            repo: row.repo.clone(),
+            mode: row.operation.mode.clone(),
+            scope: row.operation.scope.clone(),
+            result: row.operation.result.clone(),
+            failure_code: row.failure.code.clone(),
+        };
+        *counts.entry(identity).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn audit_events_have_strict_parity(
+    audits_v1: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> bool {
+    !audits_v1.is_empty()
+        && !audits_v2.is_empty()
+        && audit_event_identity_counts_v1(audits_v1) == audit_event_identity_counts_v2(audits_v2)
+}
+
 fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSummary>> {
     let mut out = Vec::new();
     for path in paths {
@@ -4239,6 +4718,46 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
         });
     }
     Ok(out)
+}
+
+fn provider_v1_payload_matches(value: &serde_json::Value, repo: &str) -> bool {
+    value
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value_repo| value_repo == repo)
+        && value.get("provider").and_then(serde_json::Value::as_str) == Some("generic")
+        && value.get("summary").is_some()
+        && value.get("report").is_some()
+}
+
+fn provider_v1_restore_ready_repos(paths: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let mut ready_repos = BTreeSet::new();
+    for path in paths {
+        let value = load_json_file::<serde_json::Value>(path)?;
+        let repo = value
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let repo_is_valid = repo != "unknown" && !repo.trim().is_empty();
+        let dual_bridge_with_v1 = value
+            .get("bridge_format")
+            .and_then(serde_json::Value::as_str)
+            == Some("patchgate.provider.generic.bridge.v1")
+            && value.get("v2").is_some()
+            && value
+                .get("v1")
+                .is_some_and(|v1| provider_v1_payload_matches(v1, repo));
+        let direct_v1 = provider_v1_payload_matches(&value, repo);
+        if repo_is_valid && (dual_bridge_with_v1 || direct_v1) {
+            ready_repos.insert(repo.to_string());
+        }
+    }
+    Ok(ready_repos)
+}
+
+fn provider_v1_restore_verified(paths: &[PathBuf], repos: &BTreeSet<String>) -> Result<bool> {
+    let ready_repos = provider_v1_restore_ready_repos(paths)?;
+    Ok(!repos.is_empty() && repos.iter().all(|repo| ready_repos.contains(repo)))
 }
 
 fn summarize_delivery_bridge_inputs(
@@ -4312,11 +4831,12 @@ fn provider_bridge_ready_for_repos(
     provider_summaries: &[ProviderArtifactSummary],
     repos: &BTreeSet<String>,
 ) -> bool {
-    !repos.is_empty()
-        && provider_summaries.iter().any(|summary| {
-            repos.contains(summary.repo.as_str())
-                && matches!(summary.schema_mode.as_str(), "dual" | "v2")
-        })
+    let ready_repos = provider_summaries
+        .iter()
+        .filter(|summary| matches!(summary.schema_mode.as_str(), "dual" | "v2"))
+        .map(|summary| summary.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    !repos.is_empty() && repos.iter().all(|repo| ready_repos.contains(repo.as_str()))
 }
 
 fn path_exists(path: Option<&Path>) -> bool {
@@ -4332,6 +4852,318 @@ fn security_review_is_approved(path: Option<&Path>) -> Result<bool> {
     let mitigation_checked =
         raw.contains("- [x] Mitigation required") || raw.contains("- [X] Mitigation required");
     Ok(continue_checked && !mitigation_checked)
+}
+
+fn security_review_packet_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let approved = security_review_is_approved(Some(path))?;
+    let mitigation_unchecked = raw.contains("- [ ] Mitigation required");
+    let required_criteria = [
+        "unknown failure codes",
+        "audit v1/v2 event identity",
+        "rollback packet restores",
+        "cost and provenance",
+    ];
+    Ok(approved
+        && mitigation_unchecked
+        && raw.contains("# RC Security Review Packet")
+        && raw.contains("## Inputs")
+        && raw.contains("## Review Criteria")
+        && raw.contains("## Decision")
+        && raw.contains("audit-drift")
+        && raw.contains("shadow-review")
+        && raw.contains("fleet-review")
+        && raw.contains("rollback")
+        && required_criteria
+            .iter()
+            .all(|criterion| raw.contains(criterion)))
+}
+
+fn contract_freeze_input_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let value = serde_json::from_str::<serde_json::Value>(raw.as_str())
+        .with_context(|| format!("decode {}", path.display()))?;
+    let v1_enabled = value
+        .get("v1_contract")
+        .and_then(|contract| contract.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let v2_enabled = value
+        .get("v2_contract")
+        .and_then(|contract| contract.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let breaking_gate_ready = value
+        .get("breaking_change_gate_ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let details = value
+        .get("v1_contract")
+        .and_then(|contract| contract.get("details"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .chain(
+            value
+                .get("v2_contract")
+                .and_then(|contract| contract.get("details"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+        )
+        .collect::<Vec<_>>();
+    let v1_frozen = details.contains(&"compatibility.v1.rc_frozen=true");
+    let strict_v1 = details.contains(&"compatibility.v1.allow_legacy_config_names=false");
+    let shadow_mode = details.contains(&"compatibility.v2.shadow_mode=true");
+    let bridge_enabled = details.iter().any(|detail| {
+        detail.starts_with("compatibility.v2.bridge_mode=") && !detail.ends_with("=off")
+    });
+    let guide_present = details.contains(&"migration_guide_exists=true");
+    let audit_v2_present = details.iter().any(|detail| {
+        detail.starts_with("observability.audit_v2_jsonl_path=") && !detail.ends_with("=<disabled>")
+    });
+    v1_enabled
+        .then_some(())
+        .ok_or_else(|| anyhow!("contract freeze input has v1_contract.enabled=false"))?;
+    Ok(v2_enabled
+        && breaking_gate_ready
+        && v1_frozen
+        && strict_v1
+        && shadow_mode
+        && bridge_enabled
+        && guide_present
+        && audit_v2_present)
+}
+
+fn migration_drill_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let report = load_json_file::<MigrationDrillReport>(path)?;
+    Ok(report.schema_version > 0
+        && ymd_key(&report.generated_at).is_some()
+        && !report.drill_id.trim().is_empty()
+        && report.repos_total > 0
+        && report.repos_attempted == report.repos_total
+        && report.repos_succeeded == report.repos_total
+        && report.repos_failed == 0
+        && report.provider_artifacts_checked >= report.repos_total
+        && report.audit_events_replayed > 0
+        && report.rollback_rehearsed
+        && !report.dry_run
+        && report.owners.iter().any(|owner| !owner.trim().is_empty())
+        && report.blockers.is_empty())
+}
+
+fn rollback_packet_input_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let packet = load_json_file::<RollbackPacket>(path)?;
+    let retained = packet
+        .retained_evidence
+        .iter()
+        .map(|item| item.as_str())
+        .collect::<BTreeSet<_>>();
+    Ok(packet.schema_version > 0
+        && ymd_key(&packet.generated_at).is_some()
+        && !packet.owner.trim().is_empty()
+        && packet
+            .triggers
+            .iter()
+            .any(|trigger| !trigger.trim().is_empty())
+        && packet.restore.bridge_mode == "off"
+        && packet.restore.generic_schema == "v1"
+        && packet.restore.v1_audit_authoritative
+        && packet.verification.dry_run_completed
+        && packet.verification.dual_run_reversible
+        && packet.verification.provider_v1_verified
+        && packet.verification.audit_v2_retained
+        && retained.contains("audit-v1")
+        && retained.contains("audit-v2"))
+}
+
+fn deprecation_countdown_markers_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(raw.contains("## Countdown markers")
+        && raw.contains("- +30:")
+        && raw.contains("- +60:")
+        && raw.contains("- +90:")
+        && raw.contains("v2-ga-packet")
+        && raw.contains("dual-run"))
+}
+
+fn candidate_checklist_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let required = [
+        "v2 RC contract freeze",
+        "breaking-change enforcement",
+        "v1 deprecation countdown",
+        "large-scale migration drill",
+        "audit export v2 validation",
+        "rollback packet",
+        "RC security review",
+        "benchmark / cost sign-off",
+        "candidate checklist",
+        "GA go / no-go",
+    ];
+    Ok(required.iter().all(|marker| raw.contains(marker)))
+}
+
+fn fleet_review_cost_signoff_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(raw.contains("- governance_ready: true")
+        && raw.contains("- repo_cost_ok: true")
+        && raw.contains("- segment_cost_ok: true")
+        && !raw.contains("next_packet=fleet-review-remediation"))
+}
+
+fn rc_readiness_packet_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(raw.contains("- rc_ready: true")
+        && raw.contains("- contract_freeze_ready: true")
+        && raw.contains("- audit_export_v2_valid: true")
+        && raw.contains("- security_review_packet_ready: true")
+        && raw.contains("- migration_drill_clean: true")
+        && raw.contains("- rollback_packet_ready: true")
+        && raw.contains("- benchmark_cost_signoff: true")
+        && raw.contains("- deprecation_countdown_ready: true"))
+}
+
+fn go_no_go_review_ready(path: Option<&Path>) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let go_checked = raw.contains("- [x] Go") || raw.contains("- [X] Go");
+    let no_go_checked = raw.contains("- [x] No-go") || raw.contains("- [X] No-go");
+    let no_go_unchecked = raw.contains("- [ ] No-go");
+    Ok(go_checked
+        && !no_go_checked
+        && no_go_unchecked
+        && raw.contains("# V2 GA Go / No-Go Review")
+        && raw.contains("## Decision")
+        && raw.contains("## Required Evidence")
+        && raw.contains("RC readiness")
+        && raw.contains("rollback")
+        && raw.contains("LTS policy")
+        && raw.contains("v1 sunset")
+        && raw.contains("support"))
+}
+
+fn validate_audit_export_v2(
+    audits: &[AuditLogRecord],
+    audits_v2: &[AuditLogV2Record],
+) -> AuditExportV2Validation {
+    let shadow = build_shadow_alignment(audits, audits_v2);
+    let mut diagnostics = Vec::new();
+    if audits_v2.is_empty() {
+        diagnostics.push("audit v2 stream is empty".to_string());
+    }
+    for row in audits_v2 {
+        if row.schema_version != 2 {
+            diagnostics.push(format!(
+                "repo={} emitted_at={} schema_version={}",
+                row.repo, row.emitted_at, row.schema_version
+            ));
+        }
+        if row.audit_format != "patchgate.audit.v2" {
+            diagnostics.push(format!(
+                "repo={} emitted_at={} audit_format={}",
+                row.repo, row.emitted_at, row.audit_format
+            ));
+        }
+        if row.emitted_at == 0
+            || row.actor.trim().is_empty()
+            || row.repo.trim().is_empty()
+            || row.operation.target.trim().is_empty()
+            || row.operation.mode.trim().is_empty()
+            || row.operation.scope.trim().is_empty()
+            || !matches!(
+                row.operation.result.as_str(),
+                "pass" | "gate_fail" | "error"
+            )
+        {
+            diagnostics.push(format!(
+                "repo={} emitted_at={} has incomplete operation identity",
+                row.repo, row.emitted_at
+            ));
+        }
+        if row.gate.score.is_none()
+            || row.gate.threshold.is_none()
+            || row.gate.changed_files.is_none()
+        {
+            diagnostics.push(format!(
+                "repo={} emitted_at={} missing gate score, threshold, or changed_files",
+                row.repo, row.emitted_at
+            ));
+        }
+        if let Some(code) = row.failure.code.as_ref() {
+            if !is_known_failure_code(code) {
+                diagnostics.push(format!(
+                    "repo={} emitted_at={} unknown failure_code={}",
+                    row.repo, row.emitted_at, code
+                ));
+            }
+        }
+    }
+    if !shadow.repo_set_match {
+        diagnostics.push("audit v1/v2 repo sets differ".to_string());
+    }
+    if !shadow.mode_set_match {
+        diagnostics.push("audit v1/v2 mode sets differ".to_string());
+    }
+    if !shadow.scope_set_match {
+        diagnostics.push("audit v1/v2 scope sets differ".to_string());
+    }
+    if shadow.event_delta != 0 {
+        diagnostics.push(format!("audit v1/v2 event_delta={}", shadow.event_delta));
+    }
+    if !audit_events_have_strict_parity(audits, audits_v2) {
+        diagnostics.push("audit v1/v2 event identities differ".to_string());
+    }
+    AuditExportV2Validation {
+        ready: diagnostics.is_empty(),
+        diagnostics,
+    }
 }
 
 fn load_release_policy_summary(path: &Path) -> Result<ReleasePolicySummary> {
@@ -4710,6 +5542,36 @@ fn load_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&raw).with_context(|| format!("decode {}", path.display()))
 }
 
+fn current_utc_timestamp_label() -> Result<String> {
+    let unix_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    let (year, month, day) = unix_days_to_ymd((unix_ts / 86_400) as i64);
+    let second_of_day = unix_ts % 86_400;
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
+fn unix_days_to_ymd(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
+}
+
 fn write_output(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -5063,20 +5925,24 @@ mod tests {
         build_audit_drift_summary, build_combined_audit_drift_summary,
         build_compatibility_assessment, build_freeze_boundary_markdown, build_freeze_scoreboard,
         build_shadow_alignment, build_siem_handoff_records, build_verify_v1_calibration,
-        bundle_catalog_governance_ready, candidate_repos, canonical_repo_path, checklist_box,
-        cost_within_ceiling, exception_governance_statuses, exception_is_expired,
-        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
+        bundle_catalog_governance_ready, candidate_checklist_ready, candidate_repos,
+        canonical_repo_path, checklist_box, contract_freeze_input_ready, cost_within_ceiling,
+        deprecation_countdown_markers_ready, exception_governance_statuses, exception_is_expired,
+        fleet_repo_posture_label, fleet_review_cost_signoff_ready, go_no_go_review_ready,
+        load_json_file, load_jsonl_records, load_release_policy_summary, migration_drill_ready,
         parse_ops_options, percentile_u128, provider_bridge_ready_for_repos, provider_capabilities,
-        provider_negotiation_statuses, registry_provenance_ready, repo_cost_ceiling_minutes,
-        retention_tier_is_valid, run_ga_readiness, security_review_is_approved,
-        segment_cost_statuses, summarize_delivery_bridge_inputs, summarize_provider_inputs,
+        provider_negotiation_statuses, rc_readiness_packet_ready, registry_provenance_ready,
+        repo_cost_ceiling_minutes, retention_tier_is_valid, rollback_packet_input_ready,
+        run_ga_readiness, run_migration_drill, run_rollback_packet, security_review_is_approved,
+        security_review_packet_ready, segment_cost_statuses, summarize_delivery_bridge_inputs,
+        summarize_provider_inputs, unix_days_to_ymd, validate_audit_export_v2,
         validate_siem_handoff_input, validate_workload_identity, workspace_root, AuditFailureV2,
         AuditGateV2, AuditLogRecord, AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy,
         BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog,
         FleetBundleEntry, FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry,
-        GovernanceExceptionsPacket, MetricLogRecord, OpsOptions, OpsSubcommand,
-        PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary, RolloutWavePolicy,
-        TEMP_SEQ,
+        GovernanceExceptionsPacket, MetricLogRecord, MigrationDrillReport, OpsOptions,
+        OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary,
+        RolloutWavePolicy, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -5406,12 +6272,63 @@ mod tests {
             "rc-readiness".into(),
             "--freeze-boundary-path".into(),
             "artifacts/v1.1-freeze-boundary.md".into(),
+            "--contract-freeze-input".into(),
+            "artifacts/diff-contract.json".into(),
+            "--migration-drill-input".into(),
+            "artifacts/migration-drill.json".into(),
+            "--rollback-packet-input".into(),
+            "artifacts/rollback-packet.json".into(),
+            "--fleet-review-input".into(),
+            "artifacts/fleet-review.md".into(),
+            "--sunset-notice-path".into(),
+            "docs/21_v1_sunset_notice.md".into(),
         ])
         .expect("parse rc readiness options");
 
         assert_eq!(
             options.freeze_boundary_path.as_deref(),
             Some(Path::new("artifacts/v1.1-freeze-boundary.md"))
+        );
+        assert_eq!(
+            options.contract_freeze_input.as_deref(),
+            Some(Path::new("artifacts/diff-contract.json"))
+        );
+        assert_eq!(
+            options.migration_drill_input.as_deref(),
+            Some(Path::new("artifacts/migration-drill.json"))
+        );
+        assert_eq!(
+            options.rollback_packet_input.as_deref(),
+            Some(Path::new("artifacts/rollback-packet.json"))
+        );
+        assert_eq!(
+            options.fleet_review_input.as_deref(),
+            Some(Path::new("artifacts/fleet-review.md"))
+        );
+        assert_eq!(
+            options.sunset_notice_path.as_deref(),
+            Some(Path::new("docs/21_v1_sunset_notice.md"))
+        );
+    }
+
+    #[test]
+    fn ga_packet_accepts_rc_and_go_no_go_paths() {
+        let options = parse_ops_options(vec![
+            "ga-packet".into(),
+            "--rc-readiness-input".into(),
+            "artifacts/v2-rc-readiness.md".into(),
+            "--go-no-go-path".into(),
+            "docs/25_v2_ga_go_no_go.md".into(),
+        ])
+        .expect("parse ga packet options");
+
+        assert_eq!(
+            options.rc_readiness_input.as_deref(),
+            Some(Path::new("artifacts/v2-rc-readiness.md"))
+        );
+        assert_eq!(
+            options.go_no_go_path.as_deref(),
+            Some(Path::new("docs/25_v2_ga_go_no_go.md"))
         );
     }
 
@@ -5447,6 +6364,11 @@ mod tests {
             exceptions_input: None,
             benchmark_input: None,
             security_review_input: None,
+            contract_freeze_input: None,
+            migration_drill_input: None,
+            rollback_packet_input: None,
+            fleet_review_input: None,
+            rc_readiness_input: None,
             policy_input: None,
             migration_guide_path: None,
             provider_rollout_path: None,
@@ -5456,6 +6378,7 @@ mod tests {
             support_model_path: None,
             sunset_notice_path: None,
             phase201_backcast_path: None,
+            go_no_go_path: None,
             cost_ceiling_minutes: None,
             availability_target_pct: 99,
             p95_target_ms: 1_500,
@@ -5510,6 +6433,11 @@ mod tests {
             exceptions_input: None,
             benchmark_input: None,
             security_review_input: None,
+            contract_freeze_input: None,
+            migration_drill_input: None,
+            rollback_packet_input: None,
+            fleet_review_input: None,
+            rc_readiness_input: None,
             policy_input: None,
             migration_guide_path: None,
             provider_rollout_path: None,
@@ -5519,6 +6447,7 @@ mod tests {
             support_model_path: None,
             sunset_notice_path: None,
             phase201_backcast_path: None,
+            go_no_go_path: None,
             cost_ceiling_minutes: None,
             availability_target_pct: 99,
             p95_target_ms: 1_500,
@@ -6312,6 +7241,212 @@ mod tests {
     }
 
     #[test]
+    fn provider_bridge_ready_requires_every_candidate_repo() {
+        let repos = ["repo-a".to_string(), "repo-b".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut summaries = vec![ProviderArtifactSummary {
+            repo: "repo-a".to_string(),
+            provider: "generic".to_string(),
+            schema_mode: "dual".to_string(),
+            capabilities: std::collections::BTreeSet::new(),
+        }];
+
+        assert!(!provider_bridge_ready_for_repos(&summaries, &repos));
+
+        summaries.push(ProviderArtifactSummary {
+            repo: "repo-b".to_string(),
+            provider: "generic".to_string(),
+            schema_mode: "v2".to_string(),
+            capabilities: std::collections::BTreeSet::new(),
+        });
+        assert!(provider_bridge_ready_for_repos(&summaries, &repos));
+    }
+
+    #[test]
+    fn rollback_packet_generates_from_dual_run_evidence() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-rollback-packet-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let audit = base.join("audit.jsonl");
+        let audit_v2 = base.join("audit-v2.jsonl");
+        let provider = base.join("provider-dual.json");
+        let output = base.join("rollback-packet.json");
+        fs::write(
+            &audit,
+            r#"{"schema_version":1,"audit_format":"patchgate.audit.v1","unix_ts":1,"actor":"bot","repo":"repo-a","mode":"warn","scope":"staged","result":"pass","failure_code":null}
+"#,
+        )
+        .expect("write audit");
+        fs::write(
+            &audit_v2,
+            r#"{"schema_version":2,"audit_format":"patchgate.audit.v2","emitted_at":1,"actor":"bot","repo":"repo-a","operation":{"target":"scan","mode":"warn","scope":"staged","result":"pass"},"gate":{"score":95,"threshold":70,"changed_files":1},"failure":{"code":null,"category":null},"diagnostics":[]}
+"#,
+        )
+        .expect("write audit v2");
+        fs::write(
+            &provider,
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"provider":"generic","repo":"repo-a","summary":{},"report":{}},"v2":{}}
+"#,
+        )
+        .expect("write provider");
+
+        let options = parse_ops_options(vec![
+            "rollback-packet".into(),
+            "--audit-input".into(),
+            audit.into_os_string(),
+            "--audit-v2-input".into(),
+            audit_v2.into_os_string(),
+            "--provider-input".into(),
+            provider.into_os_string(),
+            "--output".into(),
+            output.clone().into_os_string(),
+        ])
+        .expect("parse rollback packet options");
+
+        run_rollback_packet(&options).expect("rollback packet should pass");
+        assert!(rollback_packet_input_ready(Some(&output)).expect("rollback packet ready"));
+
+        let mismatched_provider = base.join("provider-mismatch.json");
+        let blocked_output = base.join("rollback-packet-blocked.json");
+        fs::write(
+            &mismatched_provider,
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-b","v1":{"provider":"generic","repo":"repo-b","summary":{},"report":{}},"v2":{}}
+"#,
+        )
+        .expect("write mismatched provider");
+        let blocked_options = parse_ops_options(vec![
+            "rollback-packet".into(),
+            "--audit-input".into(),
+            options.audit_input.clone().into_os_string(),
+            "--audit-v2-input".into(),
+            options
+                .audit_v2_input
+                .clone()
+                .expect("audit v2 input")
+                .into_os_string(),
+            "--provider-input".into(),
+            mismatched_provider.into_os_string(),
+            "--output".into(),
+            blocked_output.into_os_string(),
+        ])
+        .expect("parse blocked rollback options");
+        let err = run_rollback_packet(&blocked_options).expect_err("repo mismatch must block");
+        assert!(err.to_string().contains("rollback packet failed"));
+
+        let malformed_provider = base.join("provider-malformed.json");
+        let malformed_output = base.join("rollback-packet-malformed.json");
+        fs::write(
+            &malformed_provider,
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"repo":"repo-a"},"v2":{}}
+"#,
+        )
+        .expect("write malformed provider");
+        let malformed_options = parse_ops_options(vec![
+            "rollback-packet".into(),
+            "--audit-input".into(),
+            options.audit_input.clone().into_os_string(),
+            "--audit-v2-input".into(),
+            options
+                .audit_v2_input
+                .clone()
+                .expect("audit v2 input")
+                .into_os_string(),
+            "--provider-input".into(),
+            malformed_provider.into_os_string(),
+            "--output".into(),
+            malformed_output.into_os_string(),
+        ])
+        .expect("parse malformed rollback options");
+        let err =
+            run_rollback_packet(&malformed_options).expect_err("malformed v1 restore must block");
+        assert!(err.to_string().contains("rollback packet failed"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn migration_drill_generates_report_from_current_evidence() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-migration-drill-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let metrics = base.join("metrics.jsonl");
+        let audit = base.join("audit.jsonl");
+        let audit_v2 = base.join("audit-v2.jsonl");
+        let provider = base.join("provider-dual.json");
+        let rollback = base.join("rollback-packet.json");
+        let output = base.join("migration-drill.json");
+        fs::write(
+            &metrics,
+            r#"{"unix_ts":1,"repo":"repo-a","mode":"warn","scope":"staged","duration_ms":10,"score":95,"should_fail":false,"failure_code":null}
+"#,
+        )
+        .expect("write metrics");
+        fs::write(
+            &audit,
+            r#"{"schema_version":1,"audit_format":"patchgate.audit.v1","unix_ts":1,"actor":"bot","repo":"repo-a","mode":"warn","scope":"staged","result":"pass","failure_code":null}
+"#,
+        )
+        .expect("write audit");
+        fs::write(
+            &audit_v2,
+            r#"{"schema_version":2,"audit_format":"patchgate.audit.v2","emitted_at":1,"actor":"bot","repo":"repo-a","operation":{"target":"scan","mode":"warn","scope":"staged","result":"pass"},"gate":{"score":95,"threshold":70,"changed_files":1},"failure":{"code":null,"category":null},"diagnostics":[]}
+"#,
+        )
+        .expect("write audit v2");
+        fs::write(
+            &provider,
+            r#"{"bridge_format":"patchgate.provider.generic.bridge.v1","repo":"repo-a","v1":{"provider":"generic","repo":"repo-a","summary":{},"report":{}},"v2":{}}
+"#,
+        )
+        .expect("write provider");
+        fs::write(
+            &rollback,
+            r#"{"schema_version":1,"generated_at":"2026-05-14T00:00:00Z","owner":"platform","triggers":["provider drift"],"restore":{"bridge_mode":"off","generic_schema":"v1","v1_audit_authoritative":true},"verification":{"dry_run_completed":true,"dual_run_reversible":true,"provider_v1_verified":true,"audit_v2_retained":true},"retained_evidence":["audit-v1","audit-v2"]}"#,
+        )
+        .expect("write rollback");
+
+        let options = parse_ops_options(vec![
+            "migration-drill".into(),
+            "--metrics-input".into(),
+            metrics.into_os_string(),
+            "--audit-input".into(),
+            audit.into_os_string(),
+            "--audit-v2-input".into(),
+            audit_v2.into_os_string(),
+            "--provider-input".into(),
+            provider.into_os_string(),
+            "--rollback-packet-input".into(),
+            rollback.into_os_string(),
+            "--output".into(),
+            output.clone().into_os_string(),
+        ])
+        .expect("parse migration drill options");
+
+        run_migration_drill(&options).expect("migration drill should pass");
+        let report = load_json_file::<MigrationDrillReport>(&output).expect("load drill report");
+        assert_eq!(report.repos_total, 1);
+        assert_eq!(report.repos_succeeded, 1);
+        assert_eq!(report.provider_artifacts_checked, 1);
+        assert_eq!(report.audit_events_replayed, 1);
+        assert!(report.rollback_rehearsed);
+        assert!(!report.dry_run);
+        assert!(report.blockers.is_empty());
+        assert!(super::ymd_key(&report.generated_at).is_some());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unix_days_to_ymd_covers_epoch_boundary() {
+        assert_eq!(unix_days_to_ymd(0), (1970, 1, 1));
+        assert_eq!(unix_days_to_ymd(1), (1970, 1, 2));
+        assert_eq!(unix_days_to_ymd(-1), (1969, 12, 31));
+    }
+
+    #[test]
     fn summarize_provider_inputs_detects_dual_payload() {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("xtask-provider-{seq}.json"));
@@ -6818,6 +7953,187 @@ security_sla_hours = "72"
 
         let _ = fs::remove_file(pending);
         let _ = fs::remove_file(approved);
+    }
+
+    #[test]
+    fn rc_hardening_artifact_validators_reject_thin_inputs() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-rc-hardening-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let contract = base.join("diff-contract.json");
+        fs::write(
+            &contract,
+            r#"{"policy_path":"policy.toml","breaking_change_gate_ready":true,"v1_contract":{"enabled":true,"details":["policy_version=2","compatibility.v1.rc_frozen=true","compatibility.v1.allow_legacy_config_names=false"]},"v2_contract":{"enabled":true,"details":["compatibility.v2.shadow_mode=true","compatibility.v2.bridge_mode=full","observability.audit_v2_jsonl_path=artifacts/scan-audit-v2.jsonl","migration_guide_exists=true"]},"migration_delta":["provider payload schema: v1 -> dual","audit export: v1 -> v2"]}"#,
+        )
+        .expect("write contract freeze");
+        assert!(contract_freeze_input_ready(Some(&contract)).expect("contract ready"));
+
+        let drill = base.join("migration-drill.json");
+        fs::write(
+            &drill,
+            r#"{"schema_version":1,"generated_at":"2026-05-14T00:00:00Z","drill_id":"phase181-drill","repos_total":2,"repos_attempted":2,"repos_succeeded":2,"repos_failed":0,"provider_artifacts_checked":2,"audit_events_replayed":4,"rollback_rehearsed":true,"dry_run":false,"owners":["platform"],"blockers":[]}"#,
+        )
+        .expect("write drill");
+        assert!(migration_drill_ready(Some(&drill)).expect("drill ready"));
+
+        let rollback = base.join("rollback-packet.json");
+        fs::write(
+            &rollback,
+            r#"{"schema_version":1,"generated_at":"2026-05-14T00:00:00Z","owner":"platform","triggers":["provider drift"],"restore":{"bridge_mode":"off","generic_schema":"v1","v1_audit_authoritative":true},"verification":{"dry_run_completed":true,"dual_run_reversible":true,"provider_v1_verified":true,"audit_v2_retained":true},"retained_evidence":["audit-v1","audit-v2"]}"#,
+        )
+        .expect("write rollback");
+        assert!(rollback_packet_input_ready(Some(&rollback)).expect("rollback ready"));
+
+        let security = base.join("security-review.md");
+        fs::write(
+            &security,
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
+        )
+        .expect("write security");
+        assert!(security_review_packet_ready(Some(&security)).expect("security ready"));
+        fs::write(
+            &security,
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n",
+        )
+        .expect("write thin security");
+        assert!(!security_review_packet_ready(Some(&security)).expect("security should parse"));
+        fs::write(
+            &security,
+            "# RC Security Review Packet\n\n## Inputs\n- audit-drift\n- shadow-review\n- fleet-review\n- rollback packet\n\n## Review Criteria\n- unknown failure codes are absent\n- audit v1/v2 event identity and failure counts match\n- rollback packet restores provider and audit authority to v1\n- cost and provenance signals have no open blockers\n\n## Decision\n- [x] Continue\n- [ ] Mitigation required\n",
+        )
+        .expect("restore security");
+
+        let sunset = base.join("sunset.md");
+        fs::write(
+            &sunset,
+            "# V1 Sunset Notice\n\n## Countdown markers\n- +30: verify-v2\n- +60: v1-only warning\n- +90: dual-run decommission with `v2-ga-packet.md`\n",
+        )
+        .expect("write sunset");
+        assert!(deprecation_countdown_markers_ready(Some(&sunset)).expect("sunset ready"));
+
+        let checklist = base.join("candidate.md");
+        fs::write(
+            &checklist,
+            [
+                "v2 RC contract freeze",
+                "breaking-change enforcement",
+                "v1 deprecation countdown",
+                "large-scale migration drill",
+                "audit export v2 validation",
+                "rollback packet",
+                "RC security review",
+                "benchmark / cost sign-off",
+                "candidate checklist",
+                "GA go / no-go",
+            ]
+            .join("\n"),
+        )
+        .expect("write checklist");
+        assert!(candidate_checklist_ready(Some(&checklist)).expect("checklist ready"));
+
+        let fleet = base.join("fleet-review.md");
+        fs::write(
+            &fleet,
+            "# Fleet\n- governance_ready: true\n- repo_cost_ok: true\n- segment_cost_ok: true\n",
+        )
+        .expect("write fleet");
+        assert!(fleet_review_cost_signoff_ready(Some(&fleet)).expect("fleet ready"));
+
+        let rc = base.join("v2-rc-readiness.md");
+        fs::write(
+            &rc,
+            "# V2 RC Readiness Packet\n- rc_ready: true\n- contract_freeze_ready: true\n- audit_export_v2_valid: true\n- security_review_packet_ready: true\n- migration_drill_clean: true\n- rollback_packet_ready: true\n- benchmark_cost_signoff: true\n- deprecation_countdown_ready: true\n",
+        )
+        .expect("write rc packet");
+        assert!(rc_readiness_packet_ready(Some(&rc)).expect("rc ready"));
+
+        let go = base.join("go-no-go.md");
+        fs::write(
+            &go,
+            "# V2 GA Go / No-Go Review\n\n## Required Evidence\n- RC readiness: artifacts/v2-rc-readiness.md\n- rollback packet: artifacts/rollback-packet.json\n- LTS policy: artifacts/policy.v2.toml\n- v1 sunset notice: docs/21_v1_sunset_notice.md\n- support path: docs/22_v2_support_model.md\n\n## Decision\n- [x] Go\n- [ ] No-go\n",
+        )
+        .expect("write go no-go");
+        assert!(go_no_go_review_ready(Some(&go)).expect("go no-go ready"));
+        fs::write(
+            &go,
+            "# V2 GA Go / No-Go Review\n\n## Required Evidence\n- RC readiness: artifacts/v2-rc-readiness.md\n- rollback packet: artifacts/rollback-packet.json\n- v1 sunset notice: docs/21_v1_sunset_notice.md\n- support path: docs/22_v2_support_model.md\n\n## Decision\n- [x] Go\n- [ ] No-go\n",
+        )
+        .expect("write thin go no-go");
+        assert!(!go_no_go_review_ready(Some(&go)).expect("thin go no-go should parse"));
+
+        fs::write(
+            &drill,
+            r#"{"schema_version":1,"generated_at":"2026-05-14T00:00:00Z","drill_id":"phase181-drill","repos_total":2,"repos_attempted":2,"repos_succeeded":1,"repos_failed":1,"provider_artifacts_checked":2,"audit_events_replayed":4,"rollback_rehearsed":false,"dry_run":false,"owners":["platform"],"blockers":["repo failed"]}"#,
+        )
+        .expect("write failed drill");
+        assert!(!migration_drill_ready(Some(&drill)).expect("drill should parse"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn audit_export_v2_validation_requires_strict_v2_contract() {
+        let audits = vec![AuditLogRecord {
+            schema_version: 1,
+            audit_format: "patchgate.audit.v1".to_string(),
+            unix_ts: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            mode: "warn".to_string(),
+            scope: "staged".to_string(),
+            result: "pass".to_string(),
+            failure_code: None,
+        }];
+        let valid_v2 = vec![AuditLogV2Record {
+            schema_version: 2,
+            audit_format: "patchgate.audit.v2".to_string(),
+            emitted_at: 1,
+            actor: "bot".to_string(),
+            repo: "repo".to_string(),
+            operation: AuditOperationV2 {
+                target: "scan".to_string(),
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                result: "pass".to_string(),
+            },
+            gate: AuditGateV2 {
+                score: Some(90),
+                threshold: Some(70),
+                changed_files: Some(1),
+            },
+            failure: AuditFailureV2 {
+                code: None,
+                category: None,
+            },
+            diagnostics: vec![],
+        }];
+        assert!(validate_audit_export_v2(&audits, &valid_v2).ready);
+
+        let mut invalid_v2 = valid_v2;
+        invalid_v2[0].schema_version = 3;
+        invalid_v2[0].gate.score = None;
+        let validation = validate_audit_export_v2(&audits, &invalid_v2);
+        assert!(!validation.ready);
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("schema_version=3")));
+
+        let mut extra_v2 = invalid_v2;
+        extra_v2[0].schema_version = 2;
+        extra_v2[0].gate.score = Some(90);
+        extra_v2.push(extra_v2[0].clone());
+        let validation = validate_audit_export_v2(&audits, &extra_v2);
+        assert!(!validation.ready);
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("event_delta=1")));
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("event identities differ")));
     }
 
     #[test]

@@ -260,6 +260,32 @@ cargo run -p xtask -- ops fleet-review \
 この packet は repo posture だけでなく、provider capability negotiation、registry provenance、
 retention tier、rollout wave、exception governance、segment cost、Phase181+ RC prep blocker まで同じ出力で確認します。
 
+### Rollback packet を生成
+
+```bash
+cargo run -p xtask -- ops rollback-packet \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --provider-input artifacts/provider-dual.json \
+  --output artifacts/rollback-packet.json
+```
+
+`rollback-packet.json` は、audit v1/v2 の shadow alignment と provider v1 restore evidence を確認して、`bridge_mode = "off"` / `generic_schema = "v1"` の復帰先を固定します。
+
+### Migration drill を生成
+
+```bash
+cargo run -p xtask -- ops migration-drill \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --provider-input artifacts/provider-dual.json \
+  --rollback-packet-input artifacts/rollback-packet.json \
+  --output artifacts/migration-drill.json
+```
+
+`migration-drill.json` は、metrics / audit v1 / audit v2 / provider dual artifact / rollback packet を同じ repo set で照合し、failed repo または blocker がある場合は失敗します。
+
 ### RC readiness packet を生成
 
 ```bash
@@ -271,13 +297,20 @@ cargo run -p xtask -- ops rc-readiness \
   --provider-input artifacts/provider-dual.json \
   --benchmark-input artifacts/bench-compare.json \
   --security-review-input artifacts/security-review-template.md \
+  --contract-freeze-input artifacts/diff-contract.json \
+  --migration-drill-input artifacts/migration-drill.json \
+  --rollback-packet-input artifacts/rollback-packet.json \
+  --fleet-review-input artifacts/fleet-review.md \
   --migration-guide-path docs/16_v2_migration_guide_alpha.md \
   --provider-rollout-path docs/15_provider_rollout_checklist.md \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --freeze-boundary-path artifacts/v1.1-freeze-boundary.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
   --output artifacts/v2-rc-readiness.md
 ```
 
-`artifacts/security-review-template.md` は、レビュー完了後に `- [x] Continue` を付け、`Mitigation required` は未チェックのままにしてください。
+`artifacts/security-review-template.md` は、unknown failure code / audit v1-v2 event identity / rollback authority / cost and provenance の criteria を埋めたうえで、レビュー完了後に `- [x] Continue` を付け、`Mitigation required` は未チェックのままにしてください。
+`artifacts/diff-contract.json` は `patchgate policy diff-contract --format json --enforce` で生成し、`artifacts/fleet-review.md` は repo / segment cost が green の状態で添付します。
 
 ### GA packet を生成
 
@@ -288,6 +321,8 @@ cargo run -p xtask -- ops ga-packet \
   --audit-v2-input artifacts/scan-audit-v2.jsonl \
   --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
   --policy-input artifacts/policy.v2.toml \
+  --rc-readiness-input artifacts/v2-rc-readiness.md \
+  --go-no-go-path artifacts/v2-ga-go-no-go.md \
   --migration-guide-path docs/16_v2_migration_guide_alpha.md \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
   --ops-handbook-path docs/19_v2_ops_handbook.md \

@@ -534,6 +534,10 @@ struct PolicyDiffContractArgs {
     /// Output format: text|json
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Fail when the v1/v2 contract boundary is not ready for RC freeze
+    #[arg(long)]
+    enforce: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2105,6 +2109,7 @@ impl V2ArtifactContext {
 #[derive(Debug, Serialize)]
 struct ContractDiffReport {
     policy_path: String,
+    breaking_change_gate_ready: bool,
     v1_contract: ContractSurfaceSummary,
     v2_contract: ContractSurfaceSummary,
     migration_delta: Vec<String>,
@@ -2427,6 +2432,9 @@ fn run_policy_diff_contract(
         } else {
             PolicyExitCode::IoFailed
         };
+    }
+    if args.enforce && !report.breaking_change_gate_ready {
+        return PolicyExitCode::MigrationRequired;
     }
     PolicyExitCode::Ok
 }
@@ -3528,12 +3536,38 @@ fn build_contract_diff_report(
     ));
 
     let mut next_actions = Vec::new();
+    if cfg.policy_version != POLICY_VERSION_CURRENT {
+        next_actions.push(format!(
+            "Migrate policy_version to {POLICY_VERSION_CURRENT} before freezing the v2 contract."
+        ));
+    }
+    if !cfg.compatibility.v1.rc_frozen {
+        next_actions
+            .push("Set compatibility.v1.rc_frozen=true before RC contract freeze.".to_string());
+    }
+    if cfg.compatibility.v1.allow_legacy_config_names {
+        next_actions.push(
+            "Set compatibility.v1.allow_legacy_config_names=false to enforce the freeze boundary."
+                .to_string(),
+        );
+    }
     if !cfg.compatibility.v2.shadow_mode {
         next_actions
             .push("Enable compatibility.v2.shadow_mode before attempting dual-run.".to_string());
     }
+    if cfg.compatibility.v2.bridge_mode == "off" {
+        next_actions.push(
+            "Set compatibility.v2.bridge_mode to provider, audit, or full for RC evidence."
+                .to_string(),
+        );
+    }
     if cfg.integrations.ci.generic_schema == "v1" {
         next_actions.push("Switch integrations.ci.generic_schema to `v2` or `dual` for provider bridge validation.".to_string());
+    }
+    if cfg.observability.audit_v2_schema_version != 2 {
+        next_actions.push(
+            "Set observability.audit_v2_schema_version=2 for the v2 audit export gate.".to_string(),
+        );
     }
     if cfg.observability.audit_v2_jsonl_path.trim().is_empty() {
         next_actions
@@ -3545,14 +3579,29 @@ fn build_contract_diff_report(
                 .to_string(),
         );
     }
+    let breaking_change_gate_ready = cfg.policy_version == POLICY_VERSION_CURRENT
+        && cfg.compatibility.v1.rc_frozen
+        && !cfg.compatibility.v1.allow_legacy_config_names
+        && cfg.compatibility.v2.shadow_mode
+        && v2_contract.enabled
+        && migration_guide_exists
+        && cfg.compatibility.v2.bridge_mode != "off"
+        && cfg.observability.audit_v2_schema_version == 2
+        && !cfg.observability.audit_v2_jsonl_path.trim().is_empty()
+        && (cfg.integrations.ci.provider != "generic"
+            || cfg.integrations.ci.generic_schema != "v1");
+
     if next_actions.is_empty() {
-        next_actions.push(
-            "Contract bridge inputs are present; continue with shadow traffic review.".to_string(),
-        );
+        next_actions.push(if breaking_change_gate_ready {
+            "Breaking-change boundary is ready for RC freeze.".to_string()
+        } else {
+            "Contract bridge inputs are present; continue with shadow traffic review.".to_string()
+        });
     }
 
     ContractDiffReport {
         policy_path: policy_path.display().to_string(),
+        breaking_change_gate_ready,
         v1_contract,
         v2_contract,
         migration_delta,
@@ -3591,6 +3640,10 @@ fn render_contract_diff_report_text(report: &ContractDiffReport) -> String {
     let mut out = String::new();
     out.push_str("patchgate policy diff-contract\n");
     out.push_str(&format!("- policy_path: {}\n", report.policy_path));
+    out.push_str(&format!(
+        "- breaking_change_gate_ready: {}\n",
+        report.breaking_change_gate_ready
+    ));
     out.push_str(&format!(
         "- v1_contract_enabled: {}\n",
         report.v1_contract.enabled
@@ -9086,10 +9139,13 @@ bridge_mode = "off"
         let json = render_contract_diff_report_json(&report).expect("render json");
 
         assert!(!report.v2_contract.enabled);
+        assert!(!report.breaking_change_gate_ready);
         assert!(text.contains("patchgate policy diff-contract"));
+        assert!(text.contains("- breaking_change_gate_ready: false"));
         assert!(text.contains("- v2_contract_enabled: false"));
         assert!(text.contains("Enable compatibility.v2.shadow_mode before attempting dual-run."));
         assert!(json.contains("\"policy_path\""));
+        assert!(json.contains("\"breaking_change_gate_ready\""));
         assert!(json.contains("\"v2_contract\""));
         assert!(json.contains("\"next_actions\""));
 
@@ -9100,9 +9156,65 @@ bridge_mode = "off"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                enforce: false,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_diff_contract_enforce_requires_shadow_mode() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-diff-contract-shadow-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[compatibility.v2]
+shadow_mode = false
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let loaded =
+            load_policy_config(Some(policy_path.as_path()), None).expect("load policy config");
+        let report = build_contract_diff_report(&repo_root, policy_path.as_path(), &loaded.config);
+        assert!(report.v2_contract.enabled);
+        assert!(!report.breaking_change_gate_ready);
+        assert!(report
+            .next_actions
+            .iter()
+            .any(|action| action.contains("shadow_mode")));
+
+        let code = run_policy_diff_contract(
+            &repo_root,
+            None,
+            PolicyDiffContractArgs {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "json".to_string(),
+                enforce: true,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
 
         let _ = fs::remove_dir_all(repo_root);
     }
@@ -9143,9 +9255,10 @@ migration_guide_path = "docs/v2-migration-alpha.md"
         let text = render_contract_diff_report_text(&report);
 
         assert!(report.v2_contract.enabled);
+        assert!(report.breaking_change_gate_ready);
+        assert!(text.contains("- breaking_change_gate_ready: true"));
         assert!(text.contains("- v2_contract_enabled: true"));
-        assert!(text
-            .contains("Contract bridge inputs are present; continue with shadow traffic review."));
+        assert!(text.contains("Breaking-change boundary is ready for RC freeze."));
 
         let code = run_policy_diff_contract(
             &repo_root,
@@ -9154,6 +9267,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "json".to_string(),
+                enforce: true,
             },
         );
         assert_eq!(code, PolicyExitCode::Ok);
