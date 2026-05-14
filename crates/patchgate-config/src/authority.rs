@@ -548,6 +548,13 @@ fn resolve_pr_overlay(base: &Config, overlay: &Config, mode: &str) -> OverlayRes
         &mut accepted_keys,
         &mut rejected_keys,
     );
+    compare_output_mode(
+        base,
+        overlay,
+        &mut candidate,
+        &mut accepted_keys,
+        &mut rejected_keys,
+    );
     compare_bool_enable_only(
         "test_gap.enabled",
         base.test_gap.enabled,
@@ -810,6 +817,24 @@ fn compare_bool_enable_only(
         accepted.push(key.to_string());
     } else {
         rejected.push(key.to_string());
+    }
+}
+
+fn compare_output_mode(
+    base: &Config,
+    overlay: &Config,
+    candidate: &mut Config,
+    accepted: &mut Vec<String>,
+    rejected: &mut Vec<String>,
+) {
+    if overlay.output.mode == base.output.mode {
+        return;
+    }
+    if base.output.mode == "warn" && overlay.output.mode == "enforce" {
+        candidate.output.mode = overlay.output.mode.clone();
+        accepted.push("output.mode".to_string());
+    } else {
+        rejected.push("output.mode".to_string());
     }
 }
 
@@ -1259,6 +1284,46 @@ critical_patterns = [".github/workflows/**", "infra/**", "terraform/**", "k8s/**
             .accepted_keys
             .contains(&"dangerous_change.patterns".to_string()));
         assert_eq!(resolution.config.output.fail_threshold, 85);
+    }
+
+    #[test]
+    fn enforce_accepts_overlay_that_tightens_output_mode() {
+        let resolution = resolve_policy_authority(PolicyAuthorityResolverInput {
+            mode: "enforce".to_string(),
+            preset: None,
+            base_branch: Some(source(
+                "base_branch",
+                r#"
+policy_version = 2
+[output]
+mode = "warn"
+fail_threshold = 80
+"#,
+            )),
+            protected_ref: None,
+            local_file: Some(source(
+                "local_file",
+                r#"
+policy_version = 2
+[output]
+mode = "enforce"
+fail_threshold = 80
+"#,
+            )),
+            org_bundle: None,
+            enforce_trusted_policy_required: true,
+            allow_untrusted_local_enforce: false,
+        })
+        .expect("resolve authority");
+
+        assert!(resolution.enforce_failures.is_empty());
+        assert!(resolution
+            .authority
+            .pr_overlay
+            .accepted_keys
+            .contains(&"output.mode".to_string()));
+        assert!(resolution.authority.pr_overlay.rejected_keys.is_empty());
+        assert_eq!(resolution.config.output.mode, "enforce");
     }
 
     #[test]
