@@ -94,6 +94,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Verify Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustup which cargo
+          cargo --version
+          rustc --version
       - name: test
         run: cargo test --workspace
       - name: scan profile (windows diagnostics)
@@ -117,6 +125,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Verify Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustup which cargo
+          cargo --version
+          rustc --version
       - uses: actions/setup-node@v4
         if: matrix.lang == 'node'
         with:

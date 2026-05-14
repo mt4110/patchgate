@@ -25,6 +25,8 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Prepare artifact directory
         run: mkdir -p artifacts
