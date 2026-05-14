@@ -260,8 +260,7 @@ pub fn resolve_policy_authority(
         let mut trusted = merge_trusted_policy_values(&trusted_values, input.preset)?;
         if let Some(local) = local_loaded.as_ref() {
             if local.config != trusted.config {
-                let overlay_resolution =
-                    resolve_pr_overlay(&trusted.config, &local.config, input.mode.as_str());
+                let overlay_resolution = resolve_pr_overlay(&trusted.config, &local.config);
                 overlay = overlay_resolution.authority;
                 trusted.config = overlay_resolution.config;
                 if input.mode == "enforce" && !overlay.rejected_keys.is_empty() {
@@ -535,7 +534,7 @@ struct OverlayResolution {
     authority: PolicyOverlayAuthority,
 }
 
-fn resolve_pr_overlay(base: &Config, overlay: &Config, mode: &str) -> OverlayResolution {
+fn resolve_pr_overlay(base: &Config, overlay: &Config) -> OverlayResolution {
     let mut candidate = base.clone();
     let mut accepted_keys = Vec::new();
     let mut rejected_keys = Vec::new();
@@ -746,7 +745,7 @@ fn resolve_pr_overlay(base: &Config, overlay: &Config, mode: &str) -> OverlayRes
         rejected_keys.push("policy_authority".to_string());
     }
 
-    if mode == "enforce" && candidate != *overlay {
+    if candidate != *overlay {
         append_unallowlisted_diff_keys(&candidate, overlay, &mut rejected_keys);
     }
 
@@ -1376,6 +1375,35 @@ fail_threshold = 88
 
         assert!(!resolution.authority.trusted);
         assert!(resolution.enforce_failures.is_empty());
+    }
+
+    #[test]
+    fn warn_overlay_reports_unallowlisted_policy_diff_keys() {
+        let resolution = resolve_policy_authority(PolicyAuthorityResolverInput {
+            mode: "warn".to_string(),
+            preset: None,
+            base_branch: Some(source("base_branch", "policy_version = 2\n")),
+            protected_ref: None,
+            local_file: Some(source(
+                "local_file",
+                r#"
+policy_version = 2
+[cache]
+enabled = false
+"#,
+            )),
+            org_bundle: None,
+            enforce_trusted_policy_required: true,
+            allow_untrusted_local_enforce: false,
+        })
+        .expect("resolve authority");
+
+        assert!(resolution.enforce_failures.is_empty());
+        assert!(resolution
+            .authority
+            .pr_overlay
+            .rejected_keys
+            .contains(&"policy.unallowlisted.cache".to_string()));
     }
 
     #[test]
