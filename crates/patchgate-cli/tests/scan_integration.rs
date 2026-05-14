@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+const TRUST_BASE_POLICY: &str = include_str!("fixtures/fork_pr_trust/base-policy.toml");
+const TRUST_OVERLAY_LOWERS_THRESHOLD: &str =
+    include_str!("fixtures/fork_pr_trust/overlay-lowers-threshold.toml");
 
 struct TestRepo {
     root: PathBuf,
@@ -403,25 +406,11 @@ generic_schema = "v1"
 #[test]
 fn enforce_scan_rejects_fork_overlay_that_lowers_policy() -> TestResult<()> {
     let repo = TestRepo::create()?;
-    repo.write_file(
-        "policy.toml",
-        r#"
-policy_version = 2
-[output]
-fail_threshold = 80
-"#,
-    )?;
+    repo.write_file("policy.toml", TRUST_BASE_POLICY)?;
     repo.git(&["add", "policy.toml"])?;
     repo.git(&["commit", "-qm", "add trusted policy"])?;
 
-    repo.write_file(
-        "policy.toml",
-        r#"
-policy_version = 2
-[output]
-fail_threshold = 10
-"#,
-    )?;
+    repo.write_file("policy.toml", TRUST_OVERLAY_LOWERS_THRESHOLD)?;
 
     let output = run_patchgate(
         repo.root(),
@@ -433,6 +422,8 @@ fail_threshold = 10
             "enforce",
             "--format",
             "json",
+            "--base-ref",
+            "HEAD",
             "--no-cache",
         ],
     )?;
@@ -496,6 +487,8 @@ fail_threshold = 0
             "worktree",
             "--format",
             "json",
+            "--base-ref",
+            "HEAD",
             "--no-cache",
         ],
     )?;
@@ -518,7 +511,7 @@ fail_threshold = 0
         .ok_or("missing rejected_keys")?;
     assert!(rejected
         .iter()
-        .any(|value| value.as_str() == Some("policy.unallowlisted_changes")));
+        .any(|value| value.as_str() == Some("policy.unallowlisted.output")));
 
     Ok(())
 }
@@ -555,6 +548,8 @@ policy_version = 2
             "enforce",
             "--format",
             "json",
+            "--base-ref",
+            "HEAD",
             "--no-cache",
         ],
     )?;

@@ -6,10 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{
-    load_effective_from_text_typed, load_effective_from_typed, Config, ConfigError, LoadedConfig,
-    PolicyPreset,
-};
+use crate::{load_effective_from_typed, Config, ConfigError, LoadedConfig, PolicyPreset};
 
 const AUTHORITY_SCHEMA_VERSION: &str = "patchgate.policy_authority.v1";
 const BUNDLE_SCHEMA_VERSION: &str = "patchgate.policy.bundle.v1";
@@ -175,17 +172,17 @@ pub fn resolve_policy_authority(
     let mut trusted_values = Vec::new();
 
     if let Some(base) = input.base_branch.as_ref() {
-        load_source_config(base, input.preset)?;
+        let trusted_source = load_source_policy_value(base, input.preset)?;
         trusted_values.push(TrustedPolicyValue {
-            value: parse_source_policy_value(base)?,
+            value: trusted_source.value,
         });
         sources.push(source_record(base, true, false));
     }
 
     if let Some(protected) = input.protected_ref.as_ref() {
-        load_source_config(protected, input.preset)?;
+        let trusted_source = load_source_policy_value(protected, input.preset)?;
         trusted_values.push(TrustedPolicyValue {
-            value: parse_source_policy_value(protected)?,
+            value: trusted_source.value,
         });
         sources.push(source_record(protected, true, false));
     }
@@ -193,26 +190,29 @@ pub fn resolve_policy_authority(
     if let Some(bundle) = input.org_bundle.as_ref() {
         let digest = sha256_digest(bundle.text.as_bytes());
         match verify_policy_bundle_source(bundle) {
-            Ok(verified) => match load_policy_bundle_config(bundle.text.as_str(), input.preset) {
-                Ok(_) => {
-                    trusted_values.push(TrustedPolicyValue {
-                        value: parse_policy_bundle_value(bundle.text.as_str())?,
-                    });
-                    sources.push(PolicyAuthoritySource {
-                        kind: "org_bundle".to_string(),
-                        ref_name: None,
-                        path: bundle.path.clone(),
-                        digest,
-                        trusted: true,
-                        signature_verified: true,
-                    });
-                    diagnostics.push(format!(
-                        "org bundle signature verified with key fingerprint {}",
-                        verified.public_key_fingerprint
-                    ));
+            Ok(verified) => {
+                let policy_value = parse_policy_bundle_value(bundle.text.as_str())?;
+                match load_policy_bundle_value_config(policy_value.clone(), input.preset) {
+                    Ok(_) => {
+                        trusted_values.push(TrustedPolicyValue {
+                            value: policy_value,
+                        });
+                        sources.push(PolicyAuthoritySource {
+                            kind: "org_bundle".to_string(),
+                            ref_name: None,
+                            path: bundle.path.clone(),
+                            digest,
+                            trusted: true,
+                            signature_verified: true,
+                        });
+                        diagnostics.push(format!(
+                            "org bundle signature verified with key fingerprint {}",
+                            verified.public_key_fingerprint
+                        ));
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
-            },
+            }
             Err(message) => {
                 sources.push(PolicyAuthoritySource {
                     kind: "org_bundle".to_string(),
@@ -232,10 +232,10 @@ pub fn resolve_policy_authority(
 
     let mut overlay = PolicyOverlayAuthority::default();
     let local_loaded = match input.local_file.as_ref() {
-        Some(local) => match load_source_config(local, input.preset) {
-            Ok(loaded) => {
+        Some(local) => match load_source_policy_value(local, input.preset) {
+            Ok(loaded_source) => {
                 sources.push(source_record(local, false, false));
-                Some(loaded)
+                Some(loaded_source.loaded)
             }
             Err(err) if !trusted_values.is_empty() => {
                 sources.push(source_record(local, false, false));
@@ -366,8 +366,7 @@ pub fn verify_policy_bundle_signature(
     signature_text: &str,
     public_key_base64: &str,
 ) -> Result<PolicyBundleVerification, String> {
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(public_key_base64.trim())
+    let key_bytes = decode_base64_material(public_key_base64.trim())
         .map_err(|err| format!("failed to decode policy bundle public key (base64): {err}"))?;
     let key_array: [u8; 32] = key_bytes
         .as_slice()
@@ -375,8 +374,7 @@ pub fn verify_policy_bundle_signature(
         .map_err(|_| "policy bundle public key must be 32 bytes (ed25519)".to_string())?;
     let verifying_key = VerifyingKey::from_bytes(&key_array)
         .map_err(|err| format!("failed to parse policy bundle public key (ed25519): {err}"))?;
-    let signature_bytes = base64::engine::general_purpose::STANDARD
-        .decode(signature_text.trim())
+    let signature_bytes = decode_base64_material(signature_text.trim())
         .map_err(|err| format!("failed to decode policy bundle signature (base64): {err}"))?;
     let signature = Signature::try_from(signature_bytes.as_slice())
         .map_err(|err| format!("failed to parse policy bundle signature (ed25519): {err}"))?;
@@ -389,6 +387,14 @@ pub fn verify_policy_bundle_signature(
     })
 }
 
+fn decode_base64_material(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(input))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(input))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyBundleVerification {
     pub public_key_fingerprint: String,
@@ -399,10 +405,7 @@ pub fn load_policy_bundle_config(
     preset: Option<PolicyPreset>,
 ) -> Result<LoadedConfig, PolicyAuthorityError> {
     let policy_value = parse_policy_bundle_value(bundle_text)?;
-    let policy_text = toml::to_string(&policy_value)
-        .map_err(|source| PolicyAuthorityError::RenderResolvedPolicy { source })?;
-    load_effective_from_text_typed(policy_text.as_str(), preset)
-        .map_err(|source| PolicyAuthorityError::BundleConfig { source })
+    load_policy_bundle_value_config(policy_value, preset)
 }
 
 pub fn build_policy_authority_artifact(
@@ -411,16 +414,31 @@ pub fn build_policy_authority_artifact(
     resolution.artifact.clone()
 }
 
-fn load_source_config(
+struct LoadedPolicyValue {
+    loaded: LoadedConfig,
+    value: toml::Value,
+}
+
+fn load_source_policy_value(
     source: &PolicyAuthoritySourceInput,
     preset: Option<PolicyPreset>,
-) -> Result<LoadedConfig, PolicyAuthorityError> {
-    load_effective_from_text_typed(source.text.as_str(), preset).map_err(|err| {
+) -> Result<LoadedPolicyValue, PolicyAuthorityError> {
+    let value = parse_source_policy_value(source)?;
+    let loaded = load_effective_from_policy_value(value.clone(), preset).map_err(|err| {
         PolicyAuthorityError::SourceParse {
             kind: source.kind,
             source: err,
         }
-    })
+    })?;
+    Ok(LoadedPolicyValue { loaded, value })
+}
+
+fn load_policy_bundle_value_config(
+    policy_value: toml::Value,
+    preset: Option<PolicyPreset>,
+) -> Result<LoadedConfig, PolicyAuthorityError> {
+    load_effective_from_policy_value(policy_value, preset)
+        .map_err(|source| PolicyAuthorityError::BundleConfig { source })
 }
 
 struct TrustedPolicyValue {
@@ -461,13 +479,25 @@ fn merge_trusted_policy_values(
     for value in values {
         crate::deep_merge(&mut merged, value.value.clone());
     }
-    let policy_text = toml::to_string(&merged)
-        .map_err(|source| PolicyAuthorityError::RenderResolvedPolicy { source })?;
-    load_effective_from_text_typed(policy_text.as_str(), preset).map_err(|source| {
+    load_effective_from_policy_value(merged, preset).map_err(|source| {
         PolicyAuthorityError::SourceParse {
             kind: "trusted_policy_merge",
             source,
         }
+    })
+}
+
+fn load_effective_from_policy_value(
+    policy_value: toml::Value,
+    preset: Option<PolicyPreset>,
+) -> Result<LoadedConfig, ConfigError> {
+    let (config, version_source) = crate::load_effective_from_policy_value(policy_value, preset)?;
+    crate::validate_config(&config)?;
+    let compatibility_warnings = crate::compatibility_warnings(&config, version_source);
+    Ok(LoadedConfig {
+        config,
+        version_source,
+        compatibility_warnings,
     })
 }
 
@@ -710,7 +740,7 @@ fn resolve_pr_overlay(base: &Config, overlay: &Config, mode: &str) -> OverlayRes
     }
 
     if mode == "enforce" && candidate != *overlay {
-        rejected_keys.push("policy.unallowlisted_changes".to_string());
+        append_unallowlisted_diff_keys(&candidate, overlay, &mut rejected_keys);
     }
 
     sort_dedup(&mut accepted_keys);
@@ -923,24 +953,21 @@ fn compare_plugins(
     if overlay.plugins == base.plugins {
         return;
     }
+    let rejection_start = rejected.len();
     if base.plugins.enabled && !overlay.plugins.enabled {
         rejected.push("plugins.enabled".to_string());
-        return;
     }
     if base.plugins.signature.required && !overlay.plugins.signature.required {
         rejected.push("plugins.signature.required".to_string());
-        return;
     }
     if overlay.plugins.signature.public_key_env != base.plugins.signature.public_key_env
         || overlay.plugins.signature.trusted_key_envs != base.plugins.signature.trusted_key_envs
         || overlay.plugins.signature.revoked_key_sha256 != base.plugins.signature.revoked_key_sha256
     {
         rejected.push("plugins.signature.trusted_keys".to_string());
-        return;
     }
     if overlay.plugins.enabled && !overlay.plugins.signature.required {
         rejected.push("plugins.signature.required".to_string());
-        return;
     }
     if overlay.plugins.enabled
         && overlay.plugins.entries.iter().any(|plugin| {
@@ -948,13 +975,96 @@ fn compare_plugins(
         })
     {
         rejected.push("plugins.entries".to_string());
-        return;
     }
-    if is_plugin_entry_superset(&overlay.plugins.entries, &base.plugins.entries) {
+    if !is_plugin_entry_superset(&overlay.plugins.entries, &base.plugins.entries) {
+        rejected.push("plugins.entries".to_string());
+    }
+
+    if rejected.len() == rejection_start {
         candidate.plugins = overlay.plugins.clone();
         accepted.push("plugins".to_string());
-    } else {
-        rejected.push("plugins.entries".to_string());
+    }
+}
+
+fn append_unallowlisted_diff_keys(
+    candidate: &Config,
+    overlay: &Config,
+    rejected: &mut Vec<String>,
+) {
+    push_unallowlisted_diff(
+        "policy_version",
+        &candidate.policy_version,
+        &overlay.policy_version,
+        rejected,
+    );
+    push_unallowlisted_diff("output", &candidate.output, &overlay.output, rejected);
+    push_unallowlisted_diff("scope", &candidate.scope, &overlay.scope, rejected);
+    push_unallowlisted_diff("cache", &candidate.cache, &overlay.cache, rejected);
+    push_unallowlisted_diff("exclude", &candidate.exclude, &overlay.exclude, rejected);
+    push_unallowlisted_diff(
+        "generated_code",
+        &candidate.generated_code,
+        &overlay.generated_code,
+        rejected,
+    );
+    push_unallowlisted_diff(
+        "language_rules",
+        &candidate.language_rules,
+        &overlay.language_rules,
+        rejected,
+    );
+    push_unallowlisted_diff("weights", &candidate.weights, &overlay.weights, rejected);
+    push_unallowlisted_diff("test_gap", &candidate.test_gap, &overlay.test_gap, rejected);
+    push_unallowlisted_diff(
+        "dangerous_change",
+        &candidate.dangerous_change,
+        &overlay.dangerous_change,
+        rejected,
+    );
+    push_unallowlisted_diff(
+        "dependency_update",
+        &candidate.dependency_update,
+        &overlay.dependency_update,
+        rejected,
+    );
+    push_unallowlisted_diff(
+        "observability",
+        &candidate.observability,
+        &overlay.observability,
+        rejected,
+    );
+    push_unallowlisted_diff("alerts", &candidate.alerts, &overlay.alerts, rejected);
+    push_unallowlisted_diff(
+        "policy_authority",
+        &candidate.policy_authority,
+        &overlay.policy_authority,
+        rejected,
+    );
+    push_unallowlisted_diff("waiver", &candidate.waiver, &overlay.waiver, rejected);
+    push_unallowlisted_diff("plugins", &candidate.plugins, &overlay.plugins, rejected);
+    push_unallowlisted_diff(
+        "integrations",
+        &candidate.integrations,
+        &overlay.integrations,
+        rejected,
+    );
+    push_unallowlisted_diff("release", &candidate.release, &overlay.release, rejected);
+    push_unallowlisted_diff(
+        "compatibility",
+        &candidate.compatibility,
+        &overlay.compatibility,
+        rejected,
+    );
+}
+
+fn push_unallowlisted_diff<T: PartialEq>(
+    key: &str,
+    candidate: &T,
+    overlay: &T,
+    rejected: &mut Vec<String>,
+) {
+    if candidate != overlay {
+        rejected.push(format!("policy.unallowlisted.{key}"));
     }
 }
 

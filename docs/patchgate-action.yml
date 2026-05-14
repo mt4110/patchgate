@@ -1,4 +1,4 @@
-name: patchgate/trust-boundary
+name: patchgate
 
 # Alternatives:
 # - GitLab: docs/patchgate-gitlab-ci.yml

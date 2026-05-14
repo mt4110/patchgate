@@ -12,6 +12,7 @@ Trusted sources are merged in authority order, from lowest to highest precedence
 
 Warn mode can still use a local policy file when no trusted source is available; that report marks `policy_authority.trusted=false`.
 Enforce mode fails when only an untrusted local policy is available, unless a local operator explicitly passes `--allow-untrusted-policy-for-local-enforce`.
+The base ref is a runtime trust anchor and must be supplied by CI with `--base-ref`; it is not read from PR-editable policy config.
 
 ## PR Overlay Rules
 
@@ -55,6 +56,7 @@ patchgate/trust-boundary
 ```
 
 The template passes `--base-ref` from the pull request base SHA and publishes a check-run with the same stable name.
+This check name is intentionally different from the legacy `patchgate` default, so branch-protection rules must be updated to require `patchgate/trust-boundary` before switching templates.
 
 ## Org Bundle Schema
 
@@ -72,6 +74,7 @@ fail_threshold = 80
 ```
 
 Sign the exact bundle bytes with an ed25519 key and provide the base64 public key through `PATCHGATE_POLICY_BUNDLE_PUBLIC_KEY`.
+Keys and signatures may use standard or URL-safe base64, with or without padding.
 
 ```bash
 patchgate policy attest \

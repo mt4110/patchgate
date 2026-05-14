@@ -19,9 +19,8 @@
   - `audit_v2_jsonl_path`
   - `audit_v2_schema_version`
 - `[alerts]`: summary alert threshold
-- `[policy_authority]`: enforce mode で信頼する policy source
+- `[policy_authority]`: trusted policy source settings for enforce mode
   - `enforce_trusted_policy_required`
-  - `base_ref`
   - `protected_policy_ref`
   - `org_bundle_path`
   - `org_bundle_signature_path`

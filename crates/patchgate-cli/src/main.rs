@@ -28,10 +28,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use patchgate_config::{
-    Config, ConfigError, LoadedConfig, PolicyAuthority, PolicyAuthorityConfig,
-    PolicyAuthorityFailure, PolicyAuthorityResolution, PolicyAuthorityResolverInput,
-    PolicyAuthoritySourceInput, PolicyBundleSourceInput, PolicyMigrationError, PolicyPreset,
-    ValidationCategory, POLICY_VERSION_CURRENT,
+    Config, ConfigError, LoadedConfig, PolicyAuthority, PolicyAuthorityFailure,
+    PolicyAuthorityResolution, PolicyAuthorityResolverInput, PolicyAuthoritySourceInput,
+    PolicyBundleSourceInput, PolicyMigrationError, PolicyPreset, ValidationCategory,
+    POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
     failure_codes, CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority,
@@ -1222,7 +1222,8 @@ struct HistoryTrendRow {
 
 type ScanResult<T> = std::result::Result<T, ScanError>;
 const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
-const DEFAULT_GITHUB_CHECK_NAME: &str = "patchgate/trust-boundary";
+const DEFAULT_GITHUB_CHECK_NAME: &str = "patchgate";
+const TRUST_BOUNDARY_DOCS_PATH: &str = "docs/trust-boundary.md";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -2271,6 +2272,15 @@ fn resolve_policy_authority_from_common(
 ) -> Result<PolicyAuthorityCliResolution> {
     let preset = parse_policy_preset(args.policy_preset.as_deref())
         .map_err(|err| anyhow!("invalid --policy-preset value: {err}"))?;
+    resolve_policy_authority_from_common_with_preset(repo_root, config_override, args, preset)
+}
+
+fn resolve_policy_authority_from_common_with_preset(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: &PolicyAuthorityCommonArgs,
+    preset: Option<PolicyPreset>,
+) -> Result<PolicyAuthorityCliResolution> {
     parse_mode(args.mode.as_str(), OptionSource::Cli).map_err(|err| anyhow!("{}", err.render()))?;
 
     let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
@@ -2286,17 +2296,16 @@ fn resolve_policy_authority_from_common(
             .with_path(Some(policy_rel.clone()))
     });
 
-    let default_authority_config = PolicyAuthorityConfig::default();
-    let base_ref = args
-        .base_ref
-        .clone()
-        .unwrap_or_else(|| default_authority_config.base_ref.clone());
-    let base_branch =
-        read_git_file_at_ref(repo_root, base_ref.as_str(), policy_rel.as_str())?.map(|text| {
-            PolicyAuthoritySourceInput::new("base_branch", text)
-                .with_ref(Some(base_ref.clone()))
-                .with_path(Some(policy_rel.clone()))
-        });
+    let base_branch = match args.base_ref.as_deref() {
+        Some(base_ref) => {
+            read_git_file_at_ref(repo_root, base_ref, policy_rel.as_str())?.map(|text| {
+                PolicyAuthoritySourceInput::new("base_branch", text)
+                    .with_ref(Some(base_ref.to_string()))
+                    .with_path(Some(policy_rel.clone()))
+            })
+        }
+        None => None,
+    };
     let trusted_authority_config = base_branch
         .as_ref()
         .and_then(|source| {
@@ -2314,7 +2323,7 @@ fn resolve_policy_authority_from_common(
                 patchgate_config::load_effective_from_text_typed(source.text.as_str(), preset).ok()
             })
             .map(|loaded| loaded.config.policy_authority)
-            .unwrap_or(default_authority_config)
+            .unwrap_or_default()
     };
 
     let protected_ref = args
@@ -5035,7 +5044,7 @@ fn execute_scan(
         dead_letter_output,
     } = scan;
     let telemetry_repo = resolve_telemetry_repo(repo_root, github_repo.as_deref());
-    parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
+    let preset = parse_policy_preset(policy_preset.as_deref()).map_err(|err| {
         ScanError::with_code(
             ScanErrorKind::Input,
             FailureCode::InputInvalidOption,
@@ -5058,17 +5067,25 @@ fn execute_scan(
         allow_untrusted_policy_for_local_enforce,
         format: "json".to_string(),
     };
-    let mut authority_resolution =
-        resolve_policy_authority_from_common(repo_root, config_override, &authority_common)
-            .map_err(policy_authority_resolution_scan_error)?;
+    let mut authority_resolution = resolve_policy_authority_from_common_with_preset(
+        repo_root,
+        config_override,
+        &authority_common,
+        preset,
+    )
+    .map_err(policy_authority_resolution_scan_error)?;
     let requested_mode = mode
         .clone()
         .unwrap_or_else(|| authority_resolution.resolution.config.output.mode.clone());
     if requested_mode != authority_common.mode {
         authority_common.mode = requested_mode.clone();
-        authority_resolution =
-            resolve_policy_authority_from_common(repo_root, config_override, &authority_common)
-                .map_err(policy_authority_resolution_scan_error)?;
+        authority_resolution = resolve_policy_authority_from_common_with_preset(
+            repo_root,
+            config_override,
+            &authority_common,
+            preset,
+        )
+        .map_err(policy_authority_resolution_scan_error)?;
     }
     for warning in &authority_resolution
         .resolution
@@ -6186,7 +6203,25 @@ fn read_git_file_at_ref(
             .map(Some)
             .with_context(|| format!("decode git show output for {ref_name}:{rel_path}"));
     }
-    Ok(None)
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if git_ref_exists(repo_root, ref_name)? {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "trusted policy ref `{ref_name}` is not available for `{rel_path}`: {stderr}"
+    ))
+}
+
+fn git_ref_exists(repo_root: &Path, ref_name: &str) -> Result<bool> {
+    let output = ProcessCommand::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("{ref_name}^{{tree}}"))
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("run git rev-parse for {ref_name}"))?;
+    Ok(output.status.success())
 }
 
 fn non_empty_string(value: &str) -> Option<String> {
@@ -7541,8 +7576,7 @@ fn attach_policy_authority(
             id: finding_id.clone(),
             rule_id: finding_id,
             category: "policy_authority".to_string(),
-            docs_url: "https://github.com/mt4110/patchgate/blob/main/docs/trust-boundary.md"
-                .to_string(),
+            docs_url: TRUST_BOUNDARY_DOCS_PATH.to_string(),
             check: CheckId::PolicyAuthority,
             title: "Policy authority failed".to_string(),
             message: failure.message.clone(),

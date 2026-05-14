@@ -1013,8 +1013,6 @@ impl Default for V2CompatibilityConfig {
 pub struct PolicyAuthorityConfig {
     #[serde(default = "default_true")]
     pub enforce_trusted_policy_required: bool,
-    #[serde(default = "default_policy_base_ref")]
-    pub base_ref: String,
     #[serde(default)]
     pub protected_policy_ref: String,
     #[serde(default)]
@@ -1031,7 +1029,6 @@ impl Default for PolicyAuthorityConfig {
     fn default() -> Self {
         Self {
             enforce_trusted_policy_required: default_true(),
-            base_ref: default_policy_base_ref(),
             protected_policy_ref: default_empty_string(),
             org_bundle_path: default_empty_string(),
             org_bundle_signature_path: default_empty_string(),
@@ -1039,10 +1036,6 @@ impl Default for PolicyAuthorityConfig {
             allow_untrusted_local_enforce: default_false(),
         }
     }
-}
-
-fn default_policy_base_ref() -> String {
-    "HEAD".to_string()
 }
 
 fn default_policy_bundle_public_key_env() -> String {

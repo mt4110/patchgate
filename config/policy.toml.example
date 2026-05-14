@@ -32,7 +32,6 @@ duration_increase_pct = 40
 [policy_authority]
 # Enforce mode treats policy as the judge, not part of the PR being judged.
 enforce_trusted_policy_required = true
-base_ref = "HEAD"
 protected_policy_ref = ""
 org_bundle_path = ""
 org_bundle_signature_path = ""
