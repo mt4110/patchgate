@@ -1,12 +1,18 @@
 {
   "schema_version": 1,
+  "reviewed_at": "2026-05-13T00:00:00Z",
   "exceptions": [
     {
       "repo": "example/repo-internal",
       "kind": "waiver",
       "scope": "provider-bridge",
+      "ticket": "GOV-171",
+      "owner": "developer-experience",
+      "segment": "internal",
       "approved_by": "ops-lead",
-      "expires_at": "2026-04-30T00:00:00Z"
+      "status": "approved",
+      "review_cadence": "biweekly",
+      "expires_at": "2026-06-30T00:00:00Z"
     }
   ]
 }

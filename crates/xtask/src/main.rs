@@ -369,6 +369,14 @@ struct FreezeGateItem<'a> {
 #[derive(Debug, Clone, Deserialize)]
 struct FleetBundleCatalog {
     schema_version: u8,
+    #[serde(default)]
+    generated_at: String,
+    #[serde(default)]
+    segments: Vec<FleetSegmentPolicy>,
+    #[serde(default)]
+    retention_tiers: Vec<AuditRetentionTierPolicy>,
+    #[serde(default)]
+    rollout_waves: Vec<RolloutWavePolicy>,
     bundles: Vec<FleetBundleEntry>,
 }
 
@@ -378,11 +386,50 @@ struct FleetBundleEntry {
     policy_bundle: String,
     wave: String,
     segment: String,
+    #[serde(default)]
+    providers: Vec<String>,
+    #[serde(default)]
+    required_provider_modes: Vec<String>,
+    #[serde(default)]
+    required_provider_capabilities: Vec<String>,
+    #[serde(default)]
+    retention_tier: String,
+    #[serde(default)]
+    cost_ceiling_minutes: Option<u64>,
+    #[serde(default)]
+    phase181_rc_candidate: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FleetSegmentPolicy {
+    segment: String,
+    owner: String,
+    cost_ceiling_minutes: u64,
+    review_cadence: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuditRetentionTierPolicy {
+    tier: String,
+    hot_days: u16,
+    warm_days: u16,
+    cold_days: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RolloutWavePolicy {
+    wave: String,
+    order: u16,
+    max_parallel: u16,
+    entry_gate: String,
+    rollback_trigger: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PluginRegistryIndex {
     schema_version: u8,
+    #[serde(default)]
+    trusted_provenance: Vec<String>,
     plugins: Vec<PluginProvenanceEntry>,
 }
 
@@ -393,11 +440,25 @@ struct PluginProvenanceEntry {
     owner: String,
     provenance: String,
     verified: bool,
+    #[serde(default)]
+    source_repo: String,
+    #[serde(default)]
+    digest: String,
+    #[serde(default)]
+    attestation: String,
+    #[serde(default)]
+    revoked: bool,
+    #[serde(default)]
+    sandbox_profile: String,
+    #[serde(default)]
+    allowed_segments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct GovernanceExceptionsPacket {
     schema_version: u8,
+    #[serde(default)]
+    reviewed_at: String,
     exceptions: Vec<GovernanceExceptionEntry>,
 }
 
@@ -408,6 +469,16 @@ struct GovernanceExceptionEntry {
     scope: String,
     approved_by: String,
     expires_at: String,
+    #[serde(default)]
+    ticket: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    segment: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    review_cadence: String,
 }
 
 #[derive(Debug, Clone)]
@@ -438,7 +509,62 @@ struct ShadowAlignment {
 #[derive(Debug, Clone)]
 struct ProviderArtifactSummary {
     repo: String,
+    provider: String,
     schema_mode: String,
+    capabilities: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FleetRepoRow {
+    repo: String,
+    posture: String,
+    runs: usize,
+    audit_events_v1: usize,
+    audit_events_v2: usize,
+    gate_failures: usize,
+    average_score: f64,
+    ci_minutes: f64,
+    segment: String,
+    wave: String,
+    retention_tier: String,
+    repo_cost_ceiling_minutes: Option<u64>,
+    repo_cost_ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderNegotiationStatus {
+    repo: String,
+    required_providers: Vec<String>,
+    provided_providers: Vec<String>,
+    required_modes: Vec<String>,
+    required_capabilities: Vec<String>,
+    provided_modes: Vec<String>,
+    provided_capabilities: Vec<String>,
+    ready: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentCostStatus {
+    segment: String,
+    actual_minutes: f64,
+    ceiling_minutes: Option<u64>,
+    ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExceptionGovernanceStatus {
+    repo: String,
+    kind: String,
+    scope: String,
+    approved_by: String,
+    ticket: String,
+    owner: String,
+    segment: String,
+    status: String,
+    review_cadence: String,
+    expires_at: String,
+    expired: Option<bool>,
+    valid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2527,6 +2653,357 @@ fn fleet_repo_posture_label(
     }
 }
 
+fn bundle_retention_tier(entry: &FleetBundleEntry) -> String {
+    entry.retention_tier.clone()
+}
+
+fn format_csv(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn provider_negotiation_statuses(
+    catalog: Option<&FleetBundleCatalog>,
+    provider_summaries: &[ProviderArtifactSummary],
+) -> Vec<ProviderNegotiationStatus> {
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    catalog
+        .bundles
+        .iter()
+        .map(|entry| {
+            let matching = provider_summaries
+                .iter()
+                .filter(|summary| summary.repo == entry.repo)
+                .collect::<Vec<_>>();
+            let provided_modes = matching
+                .iter()
+                .map(|summary| summary.schema_mode.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let provided_providers = matching
+                .iter()
+                .map(|summary| summary.provider.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let provided_capabilities = matching
+                .iter()
+                .flat_map(|summary| summary.capabilities.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let required_providers = entry.providers.clone();
+            let required_modes = entry.required_provider_modes.clone();
+            let required_capabilities = entry.required_provider_capabilities.clone();
+            let provider_ready = required_providers.iter().all(|required| {
+                provided_providers
+                    .iter()
+                    .any(|provider| provider == required)
+            });
+            let mode_ready = required_modes.is_empty()
+                || provided_modes
+                    .iter()
+                    .any(|mode| required_modes.iter().any(|required| required == mode));
+            let capability_ready = required_capabilities.iter().all(|required| {
+                provided_capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            });
+            ProviderNegotiationStatus {
+                repo: entry.repo.clone(),
+                required_providers,
+                provided_providers,
+                required_modes,
+                required_capabilities,
+                provided_modes,
+                provided_capabilities,
+                ready: provider_ready && mode_ready && capability_ready,
+            }
+        })
+        .collect()
+}
+
+fn segment_cost_statuses(
+    segment_duration_ms: &BTreeMap<String, u128>,
+    catalog: Option<&FleetBundleCatalog>,
+    fallback_ceiling_minutes: Option<u64>,
+) -> Vec<SegmentCostStatus> {
+    let segment_policies = catalog
+        .map(|catalog| {
+            catalog
+                .segments
+                .iter()
+                .map(|segment| (segment.segment.as_str(), segment.cost_ceiling_minutes))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    segment_duration_ms
+        .iter()
+        .map(|(segment, duration_ms)| {
+            let ceiling_minutes = segment_policies
+                .get(segment.as_str())
+                .copied()
+                .or(fallback_ceiling_minutes);
+            let ceiling_minutes = active_cost_ceiling_minutes(ceiling_minutes);
+            let actual_minutes = *duration_ms as f64 / 60_000.0;
+            let ok = cost_within_ceiling(actual_minutes, ceiling_minutes);
+            SegmentCostStatus {
+                segment: segment.clone(),
+                actual_minutes,
+                ceiling_minutes,
+                ok,
+            }
+        })
+        .collect()
+}
+
+fn active_cost_ceiling_minutes(ceiling_minutes: Option<u64>) -> Option<u64> {
+    ceiling_minutes.filter(|ceiling| *ceiling > 0)
+}
+
+fn cost_within_ceiling(actual_minutes: f64, ceiling_minutes: Option<u64>) -> bool {
+    active_cost_ceiling_minutes(ceiling_minutes)
+        .map_or(true, |ceiling| actual_minutes <= ceiling as f64)
+}
+
+fn repo_cost_ceiling_minutes(
+    entry: Option<&FleetBundleEntry>,
+    segment: &str,
+    segment_cost_ceiling_by_name: &BTreeMap<String, u64>,
+    fallback_ceiling_minutes: Option<u64>,
+) -> Option<u64> {
+    active_cost_ceiling_minutes(entry.and_then(|entry| entry.cost_ceiling_minutes))
+        .or_else(|| active_cost_ceiling_minutes(segment_cost_ceiling_by_name.get(segment).copied()))
+        .or_else(|| active_cost_ceiling_minutes(fallback_ceiling_minutes))
+}
+
+fn audit_v2_evidence_ready(repo_rows: &[FleetRepoRow], required: bool) -> bool {
+    !required || repo_rows.iter().all(|row| row.audit_events_v2 > 0)
+}
+
+fn retention_tier_is_valid(tier: &AuditRetentionTierPolicy) -> bool {
+    tier.hot_days > 0 && tier.hot_days <= tier.warm_days && tier.warm_days <= tier.cold_days
+}
+
+fn non_empty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn bundle_catalog_governance_ready(catalog: Option<&FleetBundleCatalog>) -> Option<bool> {
+    catalog.map(|catalog| {
+        let segment_names = catalog
+            .segments
+            .iter()
+            .map(|segment| segment.segment.as_str())
+            .collect::<BTreeSet<_>>();
+        let tier_names = catalog
+            .retention_tiers
+            .iter()
+            .map(|tier| tier.tier.as_str())
+            .collect::<BTreeSet<_>>();
+        let wave_names = catalog
+            .rollout_waves
+            .iter()
+            .map(|wave| wave.wave.as_str())
+            .collect::<BTreeSet<_>>();
+        let bundle_repo_names = catalog
+            .bundles
+            .iter()
+            .map(|entry| entry.repo.trim())
+            .collect::<BTreeSet<_>>();
+        let segments_valid = !catalog.segments.is_empty()
+            && segment_names.len() == catalog.segments.len()
+            && catalog.segments.iter().all(|segment| {
+                non_empty(&segment.segment)
+                    && non_empty(&segment.owner)
+                    && non_empty(&segment.review_cadence)
+                    && segment.cost_ceiling_minutes > 0
+            });
+        let retention_valid = !catalog.retention_tiers.is_empty()
+            && tier_names.len() == catalog.retention_tiers.len()
+            && catalog.retention_tiers.iter().all(retention_tier_is_valid);
+        let waves_valid = !catalog.rollout_waves.is_empty()
+            && wave_names.len() == catalog.rollout_waves.len()
+            && catalog.rollout_waves.iter().all(|wave| {
+                non_empty(&wave.wave)
+                    && wave.order > 0
+                    && wave.max_parallel > 0
+                    && non_empty(&wave.entry_gate)
+                    && non_empty(&wave.rollback_trigger)
+            });
+        let bundles_valid = !catalog.bundles.is_empty()
+            && bundle_repo_names.len() == catalog.bundles.len()
+            && catalog.bundles.iter().all(|entry| {
+                non_empty(&entry.repo)
+                    && non_empty(&entry.policy_bundle)
+                    && !entry.providers.is_empty()
+                    && entry.providers.iter().all(|provider| non_empty(provider))
+                    && !entry.required_provider_modes.is_empty()
+                    && !entry.required_provider_capabilities.is_empty()
+                    && entry
+                        .required_provider_capabilities
+                        .iter()
+                        .all(|capability| non_empty(capability))
+                    && non_empty(&entry.retention_tier)
+                    && segment_names.contains(entry.segment.as_str())
+                    && wave_names.contains(entry.wave.as_str())
+                    && tier_names.contains(bundle_retention_tier(entry).as_str())
+                    && entry
+                        .cost_ceiling_minutes
+                        .map_or(true, |ceiling| ceiling > 0)
+                    && entry
+                        .required_provider_modes
+                        .iter()
+                        .all(|mode| matches!(mode.as_str(), "v1" | "v2" | "dual"))
+            });
+        catalog.schema_version > 0
+            && ymd_key(&catalog.generated_at).is_some()
+            && segments_valid
+            && retention_valid
+            && waves_valid
+            && bundles_valid
+    })
+}
+
+fn registry_provenance_ready(index: Option<&PluginRegistryIndex>) -> Option<bool> {
+    index.map(|index| {
+        index.schema_version > 0
+            && !index.plugins.is_empty()
+            && !index.trusted_provenance.is_empty()
+            && index
+                .trusted_provenance
+                .iter()
+                .all(|provenance| !provenance.trim().is_empty())
+            && index.plugins.iter().all(|plugin| {
+                plugin.verified
+                    && !plugin.revoked
+                    && !plugin.plugin_id.trim().is_empty()
+                    && !plugin.version.trim().is_empty()
+                    && !plugin.owner.trim().is_empty()
+                    && !plugin.provenance.trim().is_empty()
+                    && !plugin.source_repo.trim().is_empty()
+                    && !plugin.digest.trim().is_empty()
+                    && !plugin.attestation.trim().is_empty()
+                    && !plugin.sandbox_profile.trim().is_empty()
+                    && !plugin.allowed_segments.is_empty()
+                    && plugin
+                        .allowed_segments
+                        .iter()
+                        .all(|segment| !segment.trim().is_empty())
+                    && index
+                        .trusted_provenance
+                        .iter()
+                        .any(|trusted| trusted == &plugin.provenance)
+            })
+    })
+}
+
+fn ymd_key(raw: &str) -> Option<(u16, u8, u8)> {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..10]
+            .iter()
+            .enumerate()
+            .all(|(idx, byte)| idx == 4 || idx == 7 || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = parse_ascii_u16(&bytes[0..4])?;
+    let month = parse_ascii_u8(&bytes[5..7])?;
+    let day = parse_ascii_u8(&bytes[8..10])?;
+    if month == 0 || month > 12 {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if day == 0 || day > max_day {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn parse_ascii_u16(bytes: &[u8]) -> Option<u16> {
+    bytes.iter().try_fold(0u16, |acc, byte| {
+        byte.is_ascii_digit()
+            .then_some(acc * 10 + u16::from(*byte - b'0'))
+    })
+}
+
+fn parse_ascii_u8(bytes: &[u8]) -> Option<u8> {
+    bytes.iter().try_fold(0u8, |acc, byte| {
+        byte.is_ascii_digit().then_some(acc * 10 + (*byte - b'0'))
+    })
+}
+
+fn days_in_month(year: u16, month: u8) -> Option<u8> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn exception_is_expired(expires_at: &str, reviewed_at: &str) -> Option<bool> {
+    let expires = ymd_key(expires_at)?;
+    let reviewed = ymd_key(reviewed_at)?;
+    Some(expires < reviewed)
+}
+
+fn exception_governance_statuses(
+    packet: Option<&GovernanceExceptionsPacket>,
+) -> Vec<ExceptionGovernanceStatus> {
+    let Some(packet) = packet else {
+        return Vec::new();
+    };
+    packet
+        .exceptions
+        .iter()
+        .map(|entry| {
+            let status = entry.status.clone();
+            let expired = exception_is_expired(&entry.expires_at, &packet.reviewed_at);
+            let valid_status = matches!(status.as_str(), "approved" | "active" | "temporary");
+            let valid = valid_status
+                && expired == Some(false)
+                && !entry.repo.trim().is_empty()
+                && !entry.kind.trim().is_empty()
+                && !entry.scope.trim().is_empty()
+                && !entry.approved_by.trim().is_empty()
+                && !entry.ticket.trim().is_empty()
+                && !entry.owner.trim().is_empty()
+                && !entry.segment.trim().is_empty()
+                && !entry.review_cadence.trim().is_empty();
+            ExceptionGovernanceStatus {
+                repo: entry.repo.clone(),
+                kind: entry.kind.clone(),
+                scope: entry.scope.clone(),
+                approved_by: entry.approved_by.clone(),
+                ticket: entry.ticket.clone(),
+                owner: entry.owner.clone(),
+                segment: entry.segment.clone(),
+                status,
+                review_cadence: entry.review_cadence.clone(),
+                expires_at: entry.expires_at.clone(),
+                expired,
+                valid,
+            }
+        })
+        .collect()
+}
+
 fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
@@ -2561,6 +3038,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     let mut repo_names = BTreeSet::<String>::new();
     repo_names.extend(metrics.iter().map(|row| row.repo.clone()));
     repo_names.extend(audits.iter().map(|row| row.repo.clone()));
+    repo_names.extend(audits_v2.iter().map(|row| row.repo.clone()));
     if let Some(catalog) = bundle_catalog.as_ref() {
         repo_names.extend(catalog.bundles.iter().map(|row| row.repo.clone()));
     }
@@ -2573,6 +3051,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     let use_global_replay = repo_names.len() <= 1;
     let mut metrics_by_repo = BTreeMap::<String, Vec<MetricLogRecord>>::new();
     let mut audits_by_repo = BTreeMap::<String, Vec<AuditLogRecord>>::new();
+    let mut audits_v2_by_repo = BTreeMap::<String, Vec<AuditLogV2Record>>::new();
     for row in &metrics {
         metrics_by_repo
             .entry(row.repo.clone())
@@ -2581,6 +3060,12 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     }
     for row in &audits {
         audits_by_repo
+            .entry(row.repo.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    for row in &audits_v2 {
+        audits_v2_by_repo
             .entry(row.repo.clone())
             .or_default()
             .push(row.clone());
@@ -2595,8 +3080,19 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let segment_cost_ceiling_by_name = bundle_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .segments
+                .iter()
+                .map(|segment| (segment.segment.clone(), segment.cost_ceiling_minutes))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let empty_metrics: &[MetricLogRecord] = &[];
     let empty_audits: &[AuditLogRecord] = &[];
+    let empty_audits_v2: &[AuditLogV2Record] = &[];
 
     for repo in &repo_names {
         let repo_metrics = metrics_by_repo
@@ -2607,6 +3103,10 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .get(repo)
             .map(Vec::as_slice)
             .unwrap_or(empty_audits);
+        let repo_audits_v2 = audits_v2_by_repo
+            .get(repo)
+            .map(Vec::as_slice)
+            .unwrap_or(empty_audits_v2);
         let assessment = build_compatibility_assessment(
             repo_metrics,
             repo_audits,
@@ -2625,6 +3125,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         }
         *posture_counts.entry(posture_label.clone()).or_insert(0) += 1;
         let total_duration_ms = repo_metrics.iter().map(|row| row.duration_ms).sum::<u128>();
+        let ci_minutes = total_duration_ms as f64 / 60_000.0;
         let segment = bundle_map
             .get(repo.as_str())
             .map(|entry| entry.segment.clone())
@@ -2635,15 +3136,32 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .iter()
             .filter(|row| row.should_fail.unwrap_or(false))
             .count();
-        repo_rows.push((
-            repo.clone(),
-            posture_label,
-            repo_metrics.len(),
-            repo_audits.len(),
+        let (wave, retention_tier) = bundle_map
+            .get(repo.as_str())
+            .map(|entry| (entry.wave.clone(), bundle_retention_tier(entry)))
+            .unwrap_or_else(|| ("unassigned".to_string(), "standard".to_string()));
+        let repo_cost_ceiling_minutes = repo_cost_ceiling_minutes(
+            bundle_map.get(repo.as_str()).copied(),
+            segment.as_str(),
+            &segment_cost_ceiling_by_name,
+            options.cost_ceiling_minutes,
+        );
+        let repo_cost_ok = cost_within_ceiling(ci_minutes, repo_cost_ceiling_minutes);
+        repo_rows.push(FleetRepoRow {
+            repo: repo.clone(),
+            posture: posture_label,
+            runs: repo_metrics.len(),
+            audit_events_v1: repo_audits.len(),
+            audit_events_v2: repo_audits_v2.len(),
             gate_failures,
             average_score,
+            ci_minutes,
             segment,
-        ));
+            wave,
+            retention_tier,
+            repo_cost_ceiling_minutes,
+            repo_cost_ok,
+        });
     }
 
     let estimated_ci_minutes = metrics
@@ -2661,9 +3179,60 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .entry(summary.schema_mode.clone())
             .or_insert(0) += 1;
     }
+    let provider_negotiations =
+        provider_negotiation_statuses(bundle_catalog.as_ref(), &provider_summaries);
+    let provider_negotiation_ready =
+        provider_negotiations.is_empty() || provider_negotiations.iter().all(|status| status.ready);
+    let segment_cost_rows = segment_cost_statuses(
+        &segment_duration_ms,
+        bundle_catalog.as_ref(),
+        options.cost_ceiling_minutes,
+    );
+    let segment_cost_ok = segment_cost_rows.iter().all(|row| row.ok);
+    let repo_cost_ok = repo_rows.iter().all(|row| row.repo_cost_ok);
+    let audit_v2_ready = audit_v2_evidence_ready(&repo_rows, options.audit_v2_input.is_some());
+    let retention_ready = bundle_catalog.as_ref().map(|catalog| {
+        let tier_names = catalog
+            .retention_tiers
+            .iter()
+            .map(|tier| tier.tier.as_str())
+            .collect::<BTreeSet<_>>();
+        let tiers_valid = catalog.retention_tiers.iter().all(retention_tier_is_valid);
+        let assignments_valid = catalog.bundles.iter().all(|entry| {
+            let tier = bundle_retention_tier(entry);
+            tier_names.contains(tier.as_str())
+        });
+        tiers_valid && assignments_valid
+    });
+    let catalog_governance_ready = bundle_catalog_governance_ready(bundle_catalog.as_ref());
+    let registry_ready = registry_provenance_ready(registry.as_ref());
+    let exception_statuses = exception_governance_statuses(exceptions.as_ref());
+    let exception_packet_ready = exceptions
+        .as_ref()
+        .map(|packet| packet.schema_version > 0 && ymd_key(&packet.reviewed_at).is_some())
+        .unwrap_or(true);
+    let exception_ready = exception_packet_ready
+        && (exception_statuses.is_empty() || exception_statuses.iter().all(|status| status.valid));
+    let audit_drift_clean = {
+        let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2)
+    };
+    let governance_ready = !repo_names.is_empty()
+        && incomplete_telemetry_repos == 0
+        && cost_ceiling_ok
+        && repo_cost_ok
+        && segment_cost_ok
+        && audit_v2_ready
+        && provider_negotiation_ready
+        && catalog_governance_ready.unwrap_or(true)
+        && retention_ready.unwrap_or(true)
+        && registry_ready.unwrap_or(true)
+        && exception_ready
+        && audit_drift_clean;
 
     let mut md = String::new();
     md.push_str("# Fleet Ops Review Packet\n\n");
+    md.push_str(&format!("- governance_ready: {}\n", governance_ready));
     md.push_str(&format!("- repos_seen: {}\n", repo_names.len()));
     md.push_str(&format!("- metrics_runs: {}\n", metrics.len()));
     md.push_str(&format!("- audit_events_v1: {}\n", audits.len()));
@@ -2682,6 +3251,30 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             cost_ceiling_minutes, cost_ceiling_ok
         ));
     }
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!("- audit_v2_evidence_ready: {}\n", audit_v2_ready));
+    md.push_str(&format!(
+        "- provider_negotiation_ready: {}\n",
+        provider_negotiation_ready
+    ));
+    md.push_str(&format!("- repo_cost_ok: {}\n", repo_cost_ok));
+    md.push_str(&format!("- segment_cost_ok: {}\n", segment_cost_ok));
+    md.push_str(&format!(
+        "- registry_provenance_ready: {}\n",
+        optional_bool_label(registry_ready)
+    ));
+    md.push_str(&format!(
+        "- retention_policy_ready: {}\n",
+        optional_bool_label(retention_ready)
+    ));
+    md.push_str(&format!(
+        "- catalog_governance_ready: {}\n",
+        optional_bool_label(catalog_governance_ready)
+    ));
+    md.push_str(&format!(
+        "- exception_governance_ready: {}\n",
+        exception_ready
+    ));
     if let Some(catalog) = bundle_catalog.as_ref() {
         md.push_str(&format!(
             "- bundle_catalog_schema_version: {}\n",
@@ -2706,11 +3299,25 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     if repo_rows.is_empty() {
         md.push_str("- none\n");
     } else {
-        repo_rows.sort_by(|left, right| left.0.cmp(&right.0));
-        for (repo, posture, runs, audit_events, gate_failures, average_score, segment) in repo_rows
-        {
+        repo_rows.sort_by(|left, right| left.repo.cmp(&right.repo));
+        for row in &repo_rows {
             md.push_str(&format!(
-                "- {repo}: posture=`{posture}` runs={runs} audits={audit_events} gate_failures={gate_failures} avg_score={average_score:.2} segment={segment}\n"
+                "- {}: posture=`{}` runs={} audit_v1={} audit_v2={} gate_failures={} avg_score={:.2} ci_minutes={:.2} repo_cost_ceiling={} repo_cost_ok={} segment={} wave={} retention={}\n",
+                row.repo,
+                row.posture,
+                row.runs,
+                row.audit_events_v1,
+                row.audit_events_v2,
+                row.gate_failures,
+                row.average_score,
+                row.ci_minutes,
+                row.repo_cost_ceiling_minutes
+                    .map(|ceiling| ceiling.to_string())
+                    .unwrap_or_else(|| "segment-default".to_string()),
+                row.repo_cost_ok,
+                row.segment,
+                row.wave,
+                row.retention_tier
             ));
         }
     }
@@ -2726,18 +3333,46 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
 
     md.push_str("\n## Bundle Catalog\n");
     if let Some(catalog) = bundle_catalog.as_ref() {
+        if !catalog.generated_at.trim().is_empty() {
+            md.push_str(&format!("- generated_at: {}\n", catalog.generated_at));
+        }
         if catalog.bundles.is_empty() {
             md.push_str("- none\n");
         } else {
             for entry in &catalog.bundles {
                 md.push_str(&format!(
-                    "- repo={} bundle={} wave={} segment={}\n",
-                    entry.repo, entry.policy_bundle, entry.wave, entry.segment
+                    "- repo={} bundle={} wave={} segment={} retention={} repo_cost_ceiling={} providers={} required_modes={} required_capabilities={} phase181_rc_candidate={}\n",
+                    entry.repo,
+                    entry.policy_bundle,
+                    entry.wave,
+                    entry.segment,
+                    bundle_retention_tier(entry),
+                    entry
+                        .cost_ceiling_minutes
+                        .map(|ceiling| ceiling.to_string())
+                        .unwrap_or_else(|| "segment-default".to_string()),
+                    format_csv(&entry.providers),
+                    format_csv(&entry.required_provider_modes),
+                    format_csv(&entry.required_provider_capabilities),
+                    entry.phase181_rc_candidate
                 ));
             }
         }
     } else {
         md.push_str("- not provided\n");
+    }
+
+    md.push_str("\n## Federated Aggregation\n");
+    md.push_str(&format!(
+        "- audit_stream_contracts_clean: {}\n",
+        audit_stream_contracts_are_clean(&audits, &audits_v2)
+    ));
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    for row in &repo_rows {
+        md.push_str(&format!(
+            "- repo={} segment={} wave={} metrics={} audit_v1={} audit_v2={}\n",
+            row.repo, row.segment, row.wave, row.runs, row.audit_events_v1, row.audit_events_v2
+        ));
     }
 
     md.push_str("\n## Provider Capability\n");
@@ -2746,6 +3381,32 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     } else {
         for (mode, count) in provider_mode_counts {
             md.push_str(&format!("- {mode}: {count}\n"));
+        }
+        for summary in &provider_summaries {
+            let capabilities = summary.capabilities.iter().cloned().collect::<Vec<_>>();
+            md.push_str(&format!(
+                "- artifact repo={} provider={} schema_mode={} capabilities={}\n",
+                summary.repo,
+                summary.provider,
+                summary.schema_mode,
+                format_csv(&capabilities)
+            ));
+        }
+    }
+    if !provider_negotiations.is_empty() {
+        md.push_str("\n### Negotiation Contract\n");
+        for status in &provider_negotiations {
+            md.push_str(&format!(
+                "- repo={} ready={} required_providers={} provided_providers={} required_modes={} provided_modes={} required_capabilities={} provided_capabilities={}\n",
+                status.repo,
+                status.ready,
+                format_csv(&status.required_providers),
+                format_csv(&status.provided_providers),
+                format_csv(&status.required_modes),
+                format_csv(&status.provided_modes),
+                format_csv(&status.required_capabilities),
+                format_csv(&status.provided_capabilities)
+            ));
         }
     }
 
@@ -2757,14 +3418,43 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
             .filter(|plugin| plugin.verified)
             .count();
         md.push_str(&format!(
+            "- provenance_ready: {}\n",
+            registry_ready.unwrap_or(false)
+        ));
+        if !index.trusted_provenance.is_empty() {
+            md.push_str(&format!(
+                "- trusted_provenance: {}\n",
+                format_csv(&index.trusted_provenance)
+            ));
+        }
+        md.push_str(&format!(
             "- verified_plugins: {}/{}\n",
             verified,
             index.plugins.len()
         ));
         for plugin in &index.plugins {
+            let provenance_trusted = index
+                .trusted_provenance
+                .iter()
+                .any(|trusted| trusted == &plugin.provenance);
             md.push_str(&format!(
-                "- {}@{} owner={} provenance={} verified={}\n",
-                plugin.plugin_id, plugin.version, plugin.owner, plugin.provenance, plugin.verified
+                "- {}@{} owner={} source_repo={} provenance={} trusted={} verified={} revoked={} digest_present={} attestation_present={} sandbox={} allowed_segments={}\n",
+                plugin.plugin_id,
+                plugin.version,
+                plugin.owner,
+                plugin.source_repo,
+                plugin.provenance,
+                provenance_trusted,
+                plugin.verified,
+                plugin.revoked,
+                !plugin.digest.trim().is_empty(),
+                !plugin.attestation.trim().is_empty(),
+                if plugin.sandbox_profile.trim().is_empty() {
+                    "unspecified"
+                } else {
+                    plugin.sandbox_profile.as_str()
+                },
+                format_csv(&plugin.allowed_segments)
             ));
         }
     } else {
@@ -2773,13 +3463,35 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
 
     md.push_str("\n## Exception Governance\n");
     if let Some(packet) = exceptions.as_ref() {
+        if !packet.reviewed_at.trim().is_empty() {
+            md.push_str(&format!("- reviewed_at: {}\n", packet.reviewed_at));
+        }
         if packet.exceptions.is_empty() {
             md.push_str("- none\n");
         } else {
-            for entry in &packet.exceptions {
+            for status in &exception_statuses {
                 md.push_str(&format!(
-                    "- repo={} kind={} scope={} approved_by={} expires_at={}\n",
-                    entry.repo, entry.kind, entry.scope, entry.approved_by, entry.expires_at
+                    "- repo={} kind={} scope={} ticket={} owner={} segment={} approved_by={} status={} review_cadence={} expires_at={} expired={} valid={}\n",
+                    status.repo,
+                    status.kind,
+                    status.scope,
+                    status.ticket,
+                    status.owner,
+                    if status.segment.trim().is_empty() {
+                        "unspecified"
+                    } else {
+                        status.segment.as_str()
+                    },
+                    status.approved_by,
+                    status.status,
+                    if status.review_cadence.trim().is_empty() {
+                        "unspecified"
+                    } else {
+                        status.review_cadence.as_str()
+                    },
+                    status.expires_at,
+                    optional_bool_label(status.expired),
+                    status.valid
                 ));
             }
         }
@@ -2788,27 +3500,244 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
     }
 
     md.push_str("\n## Audit Retention Tier\n");
-    if audits.len() + audits_v2.len() >= 100 {
-        md.push_str("- hot: 7d\n- warm: 30d\n- cold: 90d\n");
+    if let Some(catalog) = bundle_catalog.as_ref() {
+        if catalog.retention_tiers.is_empty() {
+            md.push_str("- not provided\n");
+        } else {
+            for tier in &catalog.retention_tiers {
+                md.push_str(&format!(
+                    "- tier={} hot={}d warm={}d cold={}d valid={}\n",
+                    tier.tier,
+                    tier.hot_days,
+                    tier.warm_days,
+                    tier.cold_days,
+                    retention_tier_is_valid(tier)
+                ));
+            }
+        }
+        for entry in &catalog.bundles {
+            md.push_str(&format!(
+                "- repo={} retention_tier={}\n",
+                entry.repo,
+                bundle_retention_tier(entry)
+            ));
+        }
+    } else if audits.len() + audits_v2.len() >= 100 {
+        md.push_str("- fallback_hot: 7d\n- fallback_warm: 30d\n- fallback_cold: 90d\n");
     } else {
-        md.push_str("- hot: 14d\n- warm: 60d\n- cold: 180d\n");
+        md.push_str("- fallback_hot: 14d\n- fallback_warm: 60d\n- fallback_cold: 180d\n");
     }
 
     md.push_str("\n## Segment Cost\n");
-    if segment_duration_ms.is_empty() {
-        md.push_str("- none\n");
-    } else {
-        for (segment, duration_ms) in segment_duration_ms {
+    if let Some(catalog) = bundle_catalog.as_ref() {
+        for segment in &catalog.segments {
             md.push_str(&format!(
-                "- {segment}: {:.2} minutes\n",
-                duration_ms as f64 / 60_000.0
+                "- policy segment={} owner={} ceiling={} review_cadence={}\n",
+                segment.segment,
+                segment.owner,
+                segment.cost_ceiling_minutes,
+                segment.review_cadence
             ));
         }
+    }
+    if segment_cost_rows.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for row in &segment_cost_rows {
+            md.push_str(&format!(
+                "- {}: actual={:.2} ceiling={} ok={}\n",
+                row.segment,
+                row.actual_minutes,
+                row.ceiling_minutes
+                    .map(|ceiling| ceiling.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                row.ok
+            ));
+        }
+    }
+    md.push_str("\n## Repo Cost\n");
+    if repo_rows.is_empty() {
+        md.push_str("- none\n");
+    } else {
+        for row in &repo_rows {
+            md.push_str(&format!(
+                "- repo={} actual={:.2} ceiling={} ok={}\n",
+                row.repo,
+                row.ci_minutes,
+                row.repo_cost_ceiling_minutes
+                    .map(|ceiling| ceiling.to_string())
+                    .unwrap_or_else(|| "segment-default".to_string()),
+                row.repo_cost_ok
+            ));
+        }
+    }
+
+    md.push_str("\n## Rollout Waves\n");
+    if let Some(catalog) = bundle_catalog.as_ref() {
+        if catalog.rollout_waves.is_empty() {
+            md.push_str("- not provided\n");
+        } else {
+            let mut waves = catalog.rollout_waves.clone();
+            waves.sort_by_key(|wave| wave.order);
+            for wave in &waves {
+                let repos = catalog
+                    .bundles
+                    .iter()
+                    .filter(|entry| entry.wave == wave.wave)
+                    .map(|entry| entry.repo.clone())
+                    .collect::<Vec<_>>();
+                md.push_str(&format!(
+                    "- wave={} order={} max_parallel={} repos={} entry_gate={} rollback_trigger={}\n",
+                    wave.wave,
+                    wave.order,
+                    wave.max_parallel,
+                    format_csv(&repos),
+                    wave.entry_gate,
+                    wave.rollback_trigger
+                ));
+            }
+            let known_waves = catalog
+                .rollout_waves
+                .iter()
+                .map(|wave| wave.wave.as_str())
+                .collect::<BTreeSet<_>>();
+            let unknown_waves = catalog
+                .bundles
+                .iter()
+                .filter(|entry| !known_waves.contains(entry.wave.as_str()))
+                .map(|entry| entry.wave.clone())
+                .collect::<BTreeSet<_>>();
+            if !unknown_waves.is_empty() {
+                let unknown = unknown_waves.into_iter().collect::<Vec<_>>();
+                md.push_str(&format!("- unknown_waves: {}\n", format_csv(&unknown)));
+            }
+        }
+    } else {
+        md.push_str("- not provided\n");
+    }
+
+    md.push_str("\n## Phase181+ RC Prep Review\n");
+    let provider_status_by_repo = provider_negotiations
+        .iter()
+        .map(|status| (status.repo.as_str(), status.ready))
+        .collect::<BTreeMap<_, _>>();
+    let segment_cost_by_name = segment_cost_rows
+        .iter()
+        .map(|row| (row.segment.as_str(), row.ok))
+        .collect::<BTreeMap<_, _>>();
+    let invalid_exception_repos = exception_statuses
+        .iter()
+        .filter(|status| !status.valid)
+        .map(|status| status.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let candidate_repos = bundle_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .bundles
+                .iter()
+                .filter(|entry| entry.phase181_rc_candidate)
+                .map(|entry| entry.repo.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut phase181_rows = 0usize;
+    for row in &repo_rows {
+        if !candidate_repos.contains(row.repo.as_str()) && row.posture != "start-v2-seed" {
+            continue;
+        }
+        phase181_rows += 1;
+        let provider_ready = provider_status_by_repo
+            .get(row.repo.as_str())
+            .copied()
+            .unwrap_or(provider_negotiations.is_empty());
+        let cost_ready = segment_cost_by_name
+            .get(row.segment.as_str())
+            .copied()
+            .unwrap_or(true);
+        let mut blockers = Vec::new();
+        if row.runs == 0 || row.audit_events_v1 == 0 {
+            blockers.push("telemetry-incomplete".to_string());
+        }
+        if row.audit_events_v2 == 0 {
+            blockers.push("audit-v2-missing".to_string());
+        }
+        if !provider_ready {
+            blockers.push("provider-negotiation".to_string());
+        }
+        if !cost_ready {
+            blockers.push("segment-cost".to_string());
+        }
+        if !row.repo_cost_ok {
+            blockers.push("repo-cost".to_string());
+        }
+        if invalid_exception_repos.contains(row.repo.as_str()) {
+            blockers.push("exception-governance".to_string());
+        }
+        if registry_ready == Some(false) {
+            blockers.push("registry-provenance".to_string());
+        }
+        if catalog_governance_ready == Some(false) {
+            blockers.push("bundle-catalog".to_string());
+        }
+        md.push_str(&format!(
+            "- repo={} prep={} next_packet={} blockers={}\n",
+            row.repo,
+            if blockers.is_empty() {
+                "ready"
+            } else {
+                "blocked"
+            },
+            if blockers.is_empty() {
+                "phase181-rc-hardening"
+            } else {
+                "fleet-review-remediation"
+            },
+            format_csv(&blockers)
+        ));
+    }
+    if phase181_rows == 0 {
+        md.push_str("- no RC-prep candidate repos yet\n");
     }
 
     md.push_str("\n## Review Notes\n");
     if !cost_ceiling_ok {
         md.push_str("- Estimated CI minutes exceed the configured fleet cost ceiling.\n");
+    }
+    if !segment_cost_ok {
+        md.push_str("- One or more segments exceed their configured CI cost ceiling.\n");
+    }
+    if !repo_cost_ok {
+        md.push_str("- One or more repos exceed their configured bundle cost ceiling.\n");
+    }
+    if !provider_negotiation_ready {
+        md.push_str(
+            "- Provider capability negotiation is incomplete for at least one cataloged repo.\n",
+        );
+    }
+    if registry_ready == Some(false) {
+        md.push_str(
+            "- Registry provenance has unverified, revoked, or incomplete plugin entries.\n",
+        );
+    }
+    if retention_ready == Some(false) {
+        md.push_str(
+            "- Audit retention tiers or repo assignments need correction before RC prep.\n",
+        );
+    }
+    if catalog_governance_ready == Some(false) {
+        md.push_str("- Bundle catalog has missing segments, retention tiers, rollout waves, or invalid repo assignments.\n");
+    }
+    if !exception_ready {
+        md.push_str("- Exception governance has expired or incomplete approvals.\n");
+    }
+    if !audit_drift_clean {
+        md.push_str("- Federated audit aggregation is not clean; inspect schema, format, result, and failure code drift.\n");
+    }
+    if !audit_v2_ready {
+        md.push_str(
+            "- One or more repos are missing audit v2 evidence while audit v2 input is required.\n",
+        );
     }
     if provider_summaries.iter().all(|row| row.schema_mode == "v1")
         && !provider_summaries.is_empty()
@@ -2819,7 +3748,7 @@ fn run_fleet_review(options: &OpsOptions) -> Result<()> {
         md.push_str("- Collect at least one repo telemetry stream before using this packet for governance.\n");
     } else if incomplete_telemetry_repos > 0 {
         md.push_str("- Some repos have incomplete telemetry; attach both metrics and audit streams before treating posture as a rollout signal.\n");
-    } else if cost_ceiling_ok {
+    } else if governance_ready {
         md.push_str("- Fleet cost remains within ceiling; continue wave-based rollout review.\n");
     }
 
@@ -3214,6 +4143,62 @@ fn average_metric_score(metrics: &[MetricLogRecord]) -> f64 {
     scores.iter().map(|score| *score as f64).sum::<f64>() / scores.len() as f64
 }
 
+fn collect_string_array_field(value: &serde_json::Value, key: &str) -> BTreeSet<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn provider_capabilities(value: &serde_json::Value, schema_mode: &str) -> BTreeSet<String> {
+    let mut capabilities = collect_string_array_field(value, "capabilities");
+    match schema_mode {
+        "dual" => {
+            capabilities.insert("generic.v1".to_string());
+            capabilities.insert("generic.v2".to_string());
+            capabilities.insert("generic.dual".to_string());
+            capabilities.insert("audit.shadow".to_string());
+            if let Some(v2) = value.get("v2") {
+                capabilities.extend(collect_string_array_field(v2, "capabilities"));
+            }
+        }
+        "v2" => {
+            capabilities.insert("generic.v2".to_string());
+            capabilities.insert("audit.shadow".to_string());
+        }
+        "v1" => {
+            capabilities.insert("generic.v1".to_string());
+        }
+        _ => {}
+    }
+    capabilities
+}
+
+fn provider_identity(value: &serde_json::Value, schema_mode: &str) -> String {
+    if let Some(provider) = value.get("provider").and_then(serde_json::Value::as_str) {
+        return provider.to_string();
+    }
+    if let Some(provider) = value
+        .get("v1")
+        .and_then(|v1| v1.get("provider"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return provider.to_string();
+    }
+    match schema_mode {
+        "dual" | "v2" => "generic".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSummary>> {
     let mut out = Vec::new();
     for path in paths {
@@ -3248,7 +4233,9 @@ fn summarize_provider_inputs(paths: &[PathBuf]) -> Result<Vec<ProviderArtifactSu
             .unwrap_or("unknown");
         out.push(ProviderArtifactSummary {
             repo: repo.to_string(),
+            provider: provider_identity(&value, schema_mode),
             schema_mode: schema_mode.to_string(),
+            capabilities: provider_capabilities(&value, schema_mode),
         });
     }
     Ok(out)
@@ -4071,19 +5058,25 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        aggregate_failure_code_counts, audit_drift_is_clean, audit_stream_contracts_are_clean,
-        average_duration_for_summary, build_audit_drift_summary,
-        build_combined_audit_drift_summary, build_compatibility_assessment,
-        build_freeze_boundary_markdown, build_freeze_scoreboard, build_shadow_alignment,
-        build_siem_handoff_records, build_verify_v1_calibration, candidate_repos,
-        canonical_repo_path, checklist_box, fleet_repo_posture_label, load_json_file,
-        load_jsonl_records, load_release_policy_summary, parse_ops_options, percentile_u128,
-        provider_bridge_ready_for_repos, run_ga_readiness, security_review_is_approved,
-        summarize_delivery_bridge_inputs, summarize_provider_inputs, validate_siem_handoff_input,
-        validate_workload_identity, workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord,
-        AuditLogV2Record, AuditOperationV2, BenchSample, CompatibilityPosture,
-        DeadLetterReplaySummaryRecord, MetricLogRecord, OpsOptions, OpsSubcommand,
-        ProviderArtifactSummary, TEMP_SEQ,
+        active_cost_ceiling_minutes, aggregate_failure_code_counts, audit_drift_is_clean,
+        audit_stream_contracts_are_clean, audit_v2_evidence_ready, average_duration_for_summary,
+        build_audit_drift_summary, build_combined_audit_drift_summary,
+        build_compatibility_assessment, build_freeze_boundary_markdown, build_freeze_scoreboard,
+        build_shadow_alignment, build_siem_handoff_records, build_verify_v1_calibration,
+        bundle_catalog_governance_ready, candidate_repos, canonical_repo_path, checklist_box,
+        cost_within_ceiling, exception_governance_statuses, exception_is_expired,
+        fleet_repo_posture_label, load_json_file, load_jsonl_records, load_release_policy_summary,
+        parse_ops_options, percentile_u128, provider_bridge_ready_for_repos, provider_capabilities,
+        provider_negotiation_statuses, registry_provenance_ready, repo_cost_ceiling_minutes,
+        retention_tier_is_valid, run_ga_readiness, security_review_is_approved,
+        segment_cost_statuses, summarize_delivery_bridge_inputs, summarize_provider_inputs,
+        validate_siem_handoff_input, validate_workload_identity, workspace_root, AuditFailureV2,
+        AuditGateV2, AuditLogRecord, AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy,
+        BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog,
+        FleetBundleEntry, FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry,
+        GovernanceExceptionsPacket, MetricLogRecord, OpsOptions, OpsSubcommand,
+        PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary, RolloutWavePolicy,
+        TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -5303,11 +6296,15 @@ mod tests {
         let summaries = vec![
             ProviderArtifactSummary {
                 repo: "repo-b".to_string(),
+                provider: "generic".to_string(),
                 schema_mode: "dual".to_string(),
+                capabilities: std::collections::BTreeSet::new(),
             },
             ProviderArtifactSummary {
                 repo: "repo-a".to_string(),
+                provider: "generic".to_string(),
                 schema_mode: "v1".to_string(),
+                capabilities: std::collections::BTreeSet::new(),
             },
         ];
 
@@ -5328,8 +6325,33 @@ mod tests {
             .expect("summarize provider inputs");
         assert_eq!(summaries[0].schema_mode, "dual");
         assert_eq!(summaries[0].repo, "example/repo");
+        assert_eq!(summaries[0].provider, "generic");
+        assert!(summaries[0].capabilities.contains("generic.dual"));
+        assert!(summaries[0].capabilities.contains("audit.shadow"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_provider_capabilities_include_shadow_audit() {
+        let dual_value = serde_json::json!({
+            "schema_version": 1,
+            "bridge_format": "patchgate.provider.generic.bridge.v1",
+            "repo": "example/repo",
+            "v1": {"provider": "generic"},
+            "v2": {"publish_format": "patchgate.provider.generic.v2"}
+        });
+        let v2_value = serde_json::json!({
+            "schema_version": 2,
+            "publish_format": "patchgate.provider.generic.v2",
+            "repo": "example/repo",
+            "gate": {},
+            "artifacts": {}
+        });
+
+        assert!(provider_capabilities(&dual_value, "dual").contains("audit.shadow"));
+        assert!(provider_capabilities(&v2_value, "v2").contains("audit.shadow"));
+        assert!(!provider_capabilities(&dual_value, "v1").contains("audit.shadow"));
     }
 
     #[test]
@@ -5347,6 +6369,306 @@ mod tests {
         assert_eq!(summaries[0].schema_mode, "unknown");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_negotiation_requires_catalog_modes_and_capabilities() {
+        let catalog = FleetBundleCatalog {
+            schema_version: 1,
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            segments: Vec::new(),
+            retention_tiers: Vec::new(),
+            rollout_waves: Vec::new(),
+            bundles: vec![FleetBundleEntry {
+                repo: "example/repo".to_string(),
+                policy_bundle: "core-strict".to_string(),
+                wave: "canary".to_string(),
+                segment: "prod".to_string(),
+                providers: vec!["generic".to_string()],
+                required_provider_modes: vec!["dual".to_string()],
+                required_provider_capabilities: vec!["audit.shadow".to_string()],
+                retention_tier: "regulated".to_string(),
+                cost_ceiling_minutes: Some(20),
+                phase181_rc_candidate: true,
+            }],
+        };
+        let mut capabilities = std::collections::BTreeSet::new();
+        capabilities.insert("generic.dual".to_string());
+        capabilities.insert("audit.shadow".to_string());
+        let summaries = vec![ProviderArtifactSummary {
+            repo: "example/repo".to_string(),
+            provider: "generic".to_string(),
+            schema_mode: "dual".to_string(),
+            capabilities,
+        }];
+
+        let statuses = provider_negotiation_statuses(Some(&catalog), &summaries);
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].ready);
+
+        let mut wrong_provider = summaries.clone();
+        wrong_provider[0].provider = "other".to_string();
+        let statuses = provider_negotiation_statuses(Some(&catalog), &wrong_provider);
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].ready);
+
+        let mut multi_provider_catalog = catalog.clone();
+        multi_provider_catalog.bundles[0]
+            .providers
+            .push("internal".to_string());
+        let statuses = provider_negotiation_statuses(Some(&multi_provider_catalog), &summaries);
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].ready);
+
+        let mut complete_provider_set = summaries.clone();
+        complete_provider_set.push(ProviderArtifactSummary {
+            repo: "example/repo".to_string(),
+            provider: "internal".to_string(),
+            schema_mode: "dual".to_string(),
+            capabilities: std::collections::BTreeSet::new(),
+        });
+        let statuses =
+            provider_negotiation_statuses(Some(&multi_provider_catalog), &complete_provider_set);
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].ready);
+    }
+
+    #[test]
+    fn retention_and_segment_cost_policies_are_validated() {
+        let valid = AuditRetentionTierPolicy {
+            tier: "regulated".to_string(),
+            hot_days: 14,
+            warm_days: 90,
+            cold_days: 365,
+        };
+        let invalid = AuditRetentionTierPolicy {
+            tier: "broken".to_string(),
+            hot_days: 90,
+            warm_days: 30,
+            cold_days: 365,
+        };
+        assert!(retention_tier_is_valid(&valid));
+        assert!(!retention_tier_is_valid(&invalid));
+
+        let mut durations = std::collections::BTreeMap::new();
+        durations.insert("prod".to_string(), 31 * 60_000);
+        let catalog = FleetBundleCatalog {
+            schema_version: 1,
+            generated_at: String::new(),
+            segments: vec![FleetSegmentPolicy {
+                segment: "prod".to_string(),
+                owner: "platform".to_string(),
+                cost_ceiling_minutes: 30,
+                review_cadence: "weekly".to_string(),
+            }],
+            retention_tiers: vec![valid],
+            rollout_waves: Vec::new(),
+            bundles: Vec::new(),
+        };
+        let rows = segment_cost_statuses(&durations, Some(&catalog), None);
+        assert_eq!(rows[0].segment, "prod");
+        assert!(!rows[0].ok);
+        let rows = segment_cost_statuses(&durations, None, Some(0));
+        assert_eq!(rows[0].ceiling_minutes, None);
+        assert!(rows[0].ok);
+        assert_eq!(bundle_catalog_governance_ready(Some(&catalog)), Some(false));
+        assert!(cost_within_ceiling(20.0, Some(20)));
+        assert!(!cost_within_ceiling(20.1, Some(20)));
+        assert_eq!(active_cost_ceiling_minutes(Some(0)), None);
+        assert!(cost_within_ceiling(20.1, Some(0)));
+        let mut segment_ceilings = std::collections::BTreeMap::new();
+        segment_ceilings.insert("prod".to_string(), 30);
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "prod", &segment_ceilings, Some(60)),
+            Some(30)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "unknown", &segment_ceilings, Some(60)),
+            Some(60)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(None, "unknown", &segment_ceilings, Some(0)),
+            None
+        );
+
+        let complete_catalog = FleetBundleCatalog {
+            schema_version: 1,
+            generated_at: "2026-05-13T00:00:00Z".to_string(),
+            segments: vec![FleetSegmentPolicy {
+                segment: "prod".to_string(),
+                owner: "platform".to_string(),
+                cost_ceiling_minutes: 30,
+                review_cadence: "weekly".to_string(),
+            }],
+            retention_tiers: vec![AuditRetentionTierPolicy {
+                tier: "regulated".to_string(),
+                hot_days: 14,
+                warm_days: 90,
+                cold_days: 365,
+            }],
+            rollout_waves: vec![RolloutWavePolicy {
+                wave: "canary".to_string(),
+                order: 1,
+                max_parallel: 1,
+                entry_gate: "shadow clean".to_string(),
+                rollback_trigger: "provider drift".to_string(),
+            }],
+            bundles: vec![FleetBundleEntry {
+                repo: "example/repo".to_string(),
+                policy_bundle: "core-strict".to_string(),
+                wave: "canary".to_string(),
+                segment: "prod".to_string(),
+                providers: vec!["generic".to_string()],
+                required_provider_modes: vec!["dual".to_string()],
+                required_provider_capabilities: vec!["audit.shadow".to_string()],
+                retention_tier: "regulated".to_string(),
+                cost_ceiling_minutes: Some(20),
+                phase181_rc_candidate: true,
+            }],
+        };
+        assert_eq!(
+            bundle_catalog_governance_ready(Some(&complete_catalog)),
+            Some(true)
+        );
+        let mut duplicate_repo_catalog = complete_catalog.clone();
+        duplicate_repo_catalog
+            .bundles
+            .push(duplicate_repo_catalog.bundles[0].clone());
+        assert_eq!(
+            bundle_catalog_governance_ready(Some(&duplicate_repo_catalog)),
+            Some(false)
+        );
+        assert_eq!(
+            repo_cost_ceiling_minutes(
+                complete_catalog.bundles.first(),
+                "prod",
+                &segment_ceilings,
+                Some(60)
+            ),
+            Some(20)
+        );
+        let mut missing_provider_contract = complete_catalog.clone();
+        missing_provider_contract.bundles[0]
+            .required_provider_capabilities
+            .clear();
+        assert_eq!(
+            bundle_catalog_governance_ready(Some(&missing_provider_contract)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn audit_v2_evidence_is_required_when_input_is_present() {
+        let rows = vec![
+            FleetRepoRow {
+                repo: "example/repo".to_string(),
+                posture: "stabilize-v1".to_string(),
+                runs: 1,
+                audit_events_v1: 1,
+                audit_events_v2: 1,
+                gate_failures: 0,
+                average_score: 90.0,
+                ci_minutes: 1.0,
+                segment: "prod".to_string(),
+                wave: "canary".to_string(),
+                retention_tier: "regulated".to_string(),
+                repo_cost_ceiling_minutes: Some(10),
+                repo_cost_ok: true,
+            },
+            FleetRepoRow {
+                repo: "example/without-v2".to_string(),
+                posture: "stabilize-v1".to_string(),
+                runs: 1,
+                audit_events_v1: 1,
+                audit_events_v2: 0,
+                gate_failures: 0,
+                average_score: 90.0,
+                ci_minutes: 1.0,
+                segment: "prod".to_string(),
+                wave: "canary".to_string(),
+                retention_tier: "regulated".to_string(),
+                repo_cost_ceiling_minutes: Some(10),
+                repo_cost_ok: true,
+            },
+        ];
+
+        assert!(audit_v2_evidence_ready(&rows, false));
+        assert!(!audit_v2_evidence_ready(&rows, true));
+    }
+
+    #[test]
+    fn registry_and_exception_governance_require_complete_evidence() {
+        let registry = PluginRegistryIndex {
+            schema_version: 1,
+            trusted_provenance: vec!["sigstore".to_string()],
+            plugins: vec![PluginProvenanceEntry {
+                plugin_id: "example/security-rules".to_string(),
+                version: "0.3.0".to_string(),
+                owner: "security".to_string(),
+                provenance: "sigstore".to_string(),
+                verified: true,
+                source_repo: "example/security-rules".to_string(),
+                digest: "sha256:abc".to_string(),
+                attestation: "https://attestations.example/security-rules".to_string(),
+                revoked: false,
+                sandbox_profile: "isolated".to_string(),
+                allowed_segments: vec!["prod".to_string()],
+            }],
+        };
+        assert_eq!(registry_provenance_ready(Some(&registry)), Some(true));
+        let mut incomplete_registry = registry.clone();
+        incomplete_registry.plugins[0].sandbox_profile.clear();
+        assert_eq!(
+            registry_provenance_ready(Some(&incomplete_registry)),
+            Some(false)
+        );
+        let mut untrusted_registry = registry.clone();
+        untrusted_registry.trusted_provenance.clear();
+        assert_eq!(
+            registry_provenance_ready(Some(&untrusted_registry)),
+            Some(false)
+        );
+
+        assert_eq!(
+            exception_is_expired("2026-04-30T00:00:00Z", "2026-05-13T00:00:00Z"),
+            Some(true)
+        );
+        assert_eq!(
+            exception_is_expired("2026-99-99T00:00:00Z", "2026-05-13T00:00:00Z"),
+            None
+        );
+        assert_eq!(
+            exception_is_expired("2026-05-1é", "2026-05-13T00:00:00Z"),
+            None
+        );
+        let packet = GovernanceExceptionsPacket {
+            schema_version: 1,
+            reviewed_at: "2026-05-13T00:00:00Z".to_string(),
+            exceptions: vec![GovernanceExceptionEntry {
+                repo: "example/repo".to_string(),
+                kind: "waiver".to_string(),
+                scope: "provider-bridge".to_string(),
+                approved_by: "ops-lead".to_string(),
+                expires_at: "2026-05-30T00:00:00Z".to_string(),
+                ticket: "SEC-1".to_string(),
+                owner: "platform".to_string(),
+                segment: "prod".to_string(),
+                status: "approved".to_string(),
+                review_cadence: "weekly".to_string(),
+            }],
+        };
+        let statuses = exception_governance_statuses(Some(&packet));
+        assert!(statuses[0].valid);
+
+        let mut invalid_packet = packet.clone();
+        invalid_packet.exceptions[0].expires_at = "not-a-date".to_string();
+        let statuses = exception_governance_statuses(Some(&invalid_packet));
+        assert!(!statuses[0].valid);
+
+        let mut incomplete_exception = packet.clone();
+        incomplete_exception.exceptions[0].review_cadence.clear();
+        let statuses = exception_governance_statuses(Some(&incomplete_exception));
+        assert!(!statuses[0].valid);
     }
 
     #[test]

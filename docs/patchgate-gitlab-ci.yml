@@ -1,5 +1,6 @@
 stages:
   - quality
+  - governance
 
 patchgate:
   stage: quality
@@ -13,8 +14,23 @@ patchgate:
       - target/
       - .cargo/
   script:
-    - cargo run -p patchgate-cli -- scan --mode enforce --scope repo --format json --publish --ci-provider generic --ci-generic-output artifacts/ci-generic.json
+    - mkdir -p artifacts
+    - cargo run -p patchgate-cli -- scan --mode enforce --scope repo --format json --metrics-output artifacts/scan-metrics.jsonl --audit-log-output artifacts/scan-audit.jsonl --audit-log-v2-output artifacts/scan-audit-v2.jsonl --publish --ci-provider generic --ci-generic-schema dual --ci-generic-output artifacts/ci-generic.json
   artifacts:
     when: always
     paths:
       - artifacts/ci-generic.json
+      - artifacts/scan-metrics.jsonl
+      - artifacts/scan-audit.jsonl
+      - artifacts/scan-audit-v2.jsonl
+
+fleet-governance-preview:
+  stage: governance
+  image: rust:1.75
+  script:
+    - mkdir -p artifacts
+    - cargo run -p xtask -- ops fleet-review --metrics-input examples/poc/fleet-lab/scan-metrics.jsonl --audit-input examples/poc/fleet-lab/scan-audit.jsonl --audit-v2-input examples/poc/fleet-lab/scan-audit-v2.jsonl --provider-input examples/poc/fleet-lab/provider-dual.json --provider-input examples/poc/fleet-lab/provider-internal-dual.json --bundle-catalog-input examples/poc/fleet-lab/bundle-catalog.json --registry-input examples/poc/fleet-lab/plugin-registry.json --exceptions-input examples/poc/fleet-lab/exceptions.json --cost-ceiling-minutes 30 --output artifacts/fleet-review.md
+  artifacts:
+    when: always
+    paths:
+      - artifacts/fleet-review.md

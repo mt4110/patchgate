@@ -17,6 +17,8 @@
 - [ ] rollback packet updated
 - [ ] v1.1 freeze boundary inventory reviewed
 - [ ] v2 option matrix and risk register attached to RC packet via `--freeze-boundary-path`
+- [ ] fleet governance packet shows provider negotiation, registry provenance, retention tier, exception governance, and segment cost clean
+- [ ] Phase181+ RC prep review has no `fleet-review-remediation` blocker for candidate repos
 - [ ] RC security review approved (`Continue` checked)
 - [ ] benchmark sign-off attached
 

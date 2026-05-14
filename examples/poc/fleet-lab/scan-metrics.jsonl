@@ -1,0 +1,2 @@
+{"unix_ts":1778619600,"repo":"example/repo","mode":"warn","scope":"worktree","duration_ms":720000,"score":92,"should_fail":false,"failure_code":null}
+{"unix_ts":1778619660,"repo":"example/repo-internal","mode":"warn","scope":"worktree","duration_ms":420000,"score":88,"should_fail":false,"failure_code":null}

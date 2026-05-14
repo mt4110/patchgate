@@ -41,7 +41,7 @@ cargo run -p xtask -- ops freeze-scoreboard \
 
 | Item | Disposition | Owner phase | Reconciliation |
 | --- | --- | --- | --- |
-| fleet registry UI / operator dashboard | `deferred` | Phase171-180 | v1.1 では `fleet-review.md` と JSON inputs を governance artifact とする |
+| fleet registry UI / operator dashboard | `deferred` | Phase171-180 | v1.1 では `fleet-review.md` と bundle / registry / exception / provider capability JSON inputs を governance artifact とする |
 | audit v2 as sole authoritative stream | `v2-seed` | Phase161-170 | dual-write の shadow evidence が clean になるまで audit v1 を主線にする |
 | generic provider v2 default output | `v2-seed` | Phase161-170 | `generic_schema = "dual"` を先に通し、downstream break を観測する |
 | full remote source scan | `non-goal` | none | local / CI-first の運用哲学とコスト境界に合わない |
@@ -85,7 +85,7 @@ cargo run -p xtask -- ops freeze-scoreboard \
 | Plugin trust regression | unsigned / unverified / revoked provenance が release wave に入る | registry provenance と sandbox profile を review | `fleet-review` registry provenance |
 | Migration narrative gap | checklist / migration guide / provider rollout docs が食い違う | docs を同時更新し、path resolve まで RC を止める | candidate checklist, migration guide |
 | Replay residue | dead-letter replay に failed / retained records が残る | drain / justify / defer してから v2 seed へ進める | `compatibility-report`, replay evidence packet |
-| Performance or cost regression | benchmark regression または fleet cost ceiling 超過 | rollout wave を止め、dual-run scope を縮小 | benchmark sign-off, `fleet-review` |
+| Performance or cost regression | benchmark regression または fleet / segment cost ceiling 超過 | rollout wave を止め、dual-run scope を縮小 | benchmark sign-off, `fleet-review` |
 | Security review unresolved | `Continue` 未承認、または mitigation required | reviewer sign-off が clean になるまで hold | `rc-readiness` security review |
 
 ## Release Checklist Freeze Gate

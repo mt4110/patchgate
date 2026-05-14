@@ -245,16 +245,20 @@ cargo run -p xtask -- ops shadow-review \
 
 ```bash
 cargo run -p xtask -- ops fleet-review \
-  --metrics-input artifacts/scan-metrics.jsonl \
-  --audit-input artifacts/scan-audit.jsonl \
-  --audit-v2-input artifacts/scan-audit-v2.jsonl \
-  --provider-input artifacts/provider-dual.json \
+  --metrics-input examples/poc/fleet-lab/scan-metrics.jsonl \
+  --audit-input examples/poc/fleet-lab/scan-audit.jsonl \
+  --audit-v2-input examples/poc/fleet-lab/scan-audit-v2.jsonl \
+  --provider-input examples/poc/fleet-lab/provider-dual.json \
+  --provider-input examples/poc/fleet-lab/provider-internal-dual.json \
   --bundle-catalog-input examples/poc/fleet-lab/bundle-catalog.json \
   --registry-input examples/poc/fleet-lab/plugin-registry.json \
   --exceptions-input examples/poc/fleet-lab/exceptions.json \
   --cost-ceiling-minutes 30 \
   --output artifacts/fleet-review.md
 ```
+
+この packet は repo posture だけでなく、provider capability negotiation、registry provenance、
+retention tier、rollout wave、exception governance、segment cost、Phase181+ RC prep blocker まで同じ出力で確認します。
 
 ### RC readiness packet を生成
 
