@@ -622,6 +622,38 @@ fail_threshold = 80
 }
 
 #[test]
+fn scan_errors_when_explicit_config_file_is_missing() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "--config",
+            "missing-policy.toml",
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "missing explicit config should be a config error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-policy.toml"));
+    assert!(stderr.contains("does not exist"));
+
+    Ok(())
+}
+
+#[test]
 fn enforce_scan_rejects_policy_changing_cli_override() -> TestResult<()> {
     let repo = TestRepo::create()?;
     repo.write_file(

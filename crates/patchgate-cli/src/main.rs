@@ -6182,10 +6182,18 @@ fn policy_authority_relative_path(repo_root: &Path, policy_path: Option<&Path>) 
 
 fn read_optional_policy_file(path: Option<&Path>) -> Result<Option<String>> {
     match path {
-        Some(path) if path.exists() => fs::read_to_string(path)
-            .map(Some)
-            .with_context(|| format!("read policy file {}", path.display())),
-        _ => Ok(None),
+        Some(path) => {
+            if !path
+                .try_exists()
+                .with_context(|| format!("check policy file {}", path.display()))?
+            {
+                return Err(anyhow!("policy file {} does not exist", path.display()));
+            }
+            fs::read_to_string(path)
+                .map(Some)
+                .with_context(|| format!("read policy file {}", path.display()))
+        }
+        None => Ok(None),
     }
 }
 
