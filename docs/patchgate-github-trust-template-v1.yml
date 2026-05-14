@@ -31,21 +31,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p artifacts
+          base_ref="${{ github.sha }}"
+          publish_args=()
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+            publish_args=(
+              --github-publish
+              --github-pr "${{ github.event.pull_request.number }}"
+              --github-suppress-comment-rerun
+            )
+          fi
+
           nix develop --command cargo run -p patchgate-cli -- scan \
             --mode enforce \
             --scope worktree \
             --format json \
-            --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --base-ref "$base_ref" \
             --github-check-name patchgate/trust-boundary \
             --github-repo ${{ github.repository }} \
-            --github-pr ${{ github.event.pull_request.number || 0 }} \
             --github-sha ${{ github.sha }} \
             --metrics-output artifacts/scan-metrics.jsonl \
             --audit-log-output artifacts/scan-audit.jsonl \
             --audit-log-v2-output artifacts/scan-audit-v2.jsonl \
             --github-comment patchgate-comment.md \
-            --github-publish \
-            --github-suppress-comment-rerun
+            "${publish_args[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
