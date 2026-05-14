@@ -103,6 +103,7 @@ fn scan_json_integration_flow_is_stable() -> TestResult<()> {
     assert!(report.get("threshold").is_some());
     assert!(report.get("checks").is_some());
     assert!(report.get("findings").is_some());
+    assert!(report.get("policy_authority").is_some());
 
     Ok(())
 }
@@ -395,6 +396,294 @@ generic_schema = "v1"
 
     let audit_v2 = fs::read_to_string(audit_v2_path)?;
     assert!(audit_v2.contains("\"audit_format\":\"patchgate.audit.v2\""));
+
+    Ok(())
+}
+
+#[test]
+fn enforce_scan_rejects_fork_overlay_that_lowers_policy() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+fail_threshold = 80
+"#,
+    )?;
+    repo.git(&["add", "policy.toml"])?;
+    repo.git(&["commit", "-qm", "add trusted policy"])?;
+
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+fail_threshold = 10
+"#,
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "enforce",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "policy overlay must fail gate, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let report: serde_json::Value = serde_json::from_str(&stdout)?;
+    let rejected = report
+        .pointer("/policy_authority/pr_overlay/rejected_keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing rejected_keys")?;
+    assert!(rejected
+        .iter()
+        .any(|value| value.as_str() == Some("output.fail_threshold")));
+    let findings = report
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing findings")?;
+    assert!(findings.iter().any(|finding| {
+        finding.get("category").and_then(serde_json::Value::as_str) == Some("policy_authority")
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn scan_uses_trusted_mode_when_local_policy_downgrades_to_warn() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+mode = "enforce"
+fail_threshold = 80
+"#,
+    )?;
+    repo.git(&["add", "policy.toml"])?;
+    repo.git(&["commit", "-qm", "add trusted enforce policy"])?;
+
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+mode = "warn"
+fail_threshold = 0
+"#,
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "trusted enforce mode must win over local downgrade: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let report: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(
+        report.get("mode").and_then(serde_json::Value::as_str),
+        Some("enforce")
+    );
+    let rejected = report
+        .pointer("/policy_authority/pr_overlay/rejected_keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing rejected_keys")?;
+    assert!(rejected
+        .iter()
+        .any(|value| value.as_str() == Some("policy.unallowlisted_changes")));
+
+    Ok(())
+}
+
+#[test]
+fn enforce_scan_reports_invalid_pr_policy_overlay_as_authority_failure() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+fail_threshold = 80
+"#,
+    )?;
+    repo.git(&["add", "policy.toml"])?;
+    repo.git(&["commit", "-qm", "add trusted policy"])?;
+
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output
+"#,
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "enforce",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "invalid PR policy overlay must be reported as authority failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let report: serde_json::Value = serde_json::from_str(&stdout)?;
+    let failures = report
+        .pointer("/policy_authority/diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing diagnostics")?;
+    assert!(failures.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|message| message.contains("pr_overlay_invalid"))
+    }));
+    let rejected = report
+        .pointer("/policy_authority/pr_overlay/rejected_keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing rejected_keys")?;
+    assert!(rejected
+        .iter()
+        .any(|value| value.as_str() == Some("policy.parse")));
+
+    Ok(())
+}
+
+#[test]
+fn enforce_scan_rejects_policy_changing_cli_override() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+[output]
+fail_threshold = 80
+"#,
+    )?;
+    repo.git(&["add", "policy.toml"])?;
+    repo.git(&["commit", "-qm", "add trusted policy"])?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "enforce",
+            "--format",
+            "json",
+            "--no-cache",
+            "--threshold",
+            "10",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "enforce CLI policy override must be rejected as input: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("enforce mode does not accept policy-changing CLI overrides"));
+
+    Ok(())
+}
+
+#[test]
+fn enforce_scan_ignores_untrusted_local_authority_relaxation() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "policy.toml",
+        r#"
+policy_version = 2
+
+[output]
+fail_threshold = 0
+
+[policy_authority]
+enforce_trusted_policy_required = false
+allow_untrusted_local_enforce = true
+"#,
+    )?;
+    repo.append_line(
+        "src/lib.rs",
+        "pub fn local_only_policy_change() -> i32 { 14 }",
+    )?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "enforce",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    )?;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "local policy must not relax enforce authority: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let report: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(
+        report
+            .pointer("/policy_authority/trusted")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    let findings = report
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing findings")?;
+    assert!(findings.iter().any(|finding| {
+        finding.get("category").and_then(serde_json::Value::as_str) == Some("policy_authority")
+    }));
 
     Ok(())
 }

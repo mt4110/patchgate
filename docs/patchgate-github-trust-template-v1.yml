@@ -1,0 +1,52 @@
+name: patchgate/trust-boundary
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  trust-boundary:
+    name: patchgate/trust-boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: cachix/install-nix-action@v30
+
+      - name: Materialize PR diff into worktree
+        if: github.event_name == 'pull_request'
+        run: git reset --mixed HEAD^1
+
+      - name: Resolve trusted policy and run gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          nix develop --command cargo run -p patchgate-cli -- scan \
+            --mode enforce \
+            --scope worktree \
+            --format json \
+            --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --github-check-name patchgate/trust-boundary \
+            --metrics-output artifacts/scan-metrics.jsonl \
+            --audit-log-output artifacts/scan-audit.jsonl \
+            --audit-log-v2-output artifacts/scan-audit-v2.jsonl \
+            --github-comment patchgate-comment.md \
+            --github-publish \
+            --github-suppress-comment-rerun
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patchgate-trust-boundary
+          path: |
+            patchgate-comment.md
+            artifacts/scan-metrics.jsonl
+            artifacts/scan-audit.jsonl
+            artifacts/scan-audit-v2.jsonl

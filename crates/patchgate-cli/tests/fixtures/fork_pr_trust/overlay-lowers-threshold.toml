@@ -1,0 +1,6 @@
+policy_version = 2
+
+[output]
+mode = "enforce"
+fail_threshold = 10
+

@@ -19,6 +19,14 @@
   - `audit_v2_jsonl_path`
   - `audit_v2_schema_version`
 - `[alerts]`: summary alert threshold
+- `[policy_authority]`: enforce mode で信頼する policy source
+  - `enforce_trusted_policy_required`
+  - `base_ref`
+  - `protected_policy_ref`
+  - `org_bundle_path`
+  - `org_bundle_signature_path`
+  - `org_bundle_public_key_env`
+  - `allow_untrusted_local_enforce`
 - `[exclude]`, `[generated_code]`, `[language_rules]`
 - `[weights]`
   - `test_gap_max_penalty`
@@ -102,3 +110,4 @@
 
 - `strict`, `balanced`, `relaxed`
 - 適用順: `default < preset < policy file < CLI override`
+- enforce mode では `--threshold`, `--max-changed-files`, `--on-exceed` の CLI 上書きは使わず、trusted base policy か stricter PR overlay に置きます。

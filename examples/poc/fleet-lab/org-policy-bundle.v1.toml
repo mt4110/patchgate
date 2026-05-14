@@ -1,0 +1,14 @@
+schema_version = "patchgate.policy.bundle.v1"
+
+[policy]
+policy_version = 2
+
+[policy.output]
+mode = "enforce"
+fail_threshold = 80
+
+[policy.scope]
+on_exceed = "fail_closed"
+
+[policy.policy_authority]
+enforce_trusted_policy_required = true

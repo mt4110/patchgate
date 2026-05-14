@@ -1,0 +1,28 @@
+policy_version = 2
+
+[output]
+mode = "enforce"
+fail_threshold = 80
+
+[dangerous_change]
+patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+  "helm/**",
+  "migrations/**",
+  "db/migrate/**",
+  "**/auth/**",
+  "**/security/**",
+  "Dockerfile",
+  "docker-compose*.yml",
+  "docker-compose*.yaml",
+]
+critical_patterns = [
+  ".github/workflows/**",
+  "infra/**",
+  "terraform/**",
+  "k8s/**",
+  "migrations/**",
+]

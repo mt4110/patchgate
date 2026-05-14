@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub alerts: AlertConfig,
     #[serde(default)]
+    pub policy_authority: PolicyAuthorityConfig,
+    #[serde(default)]
     pub waiver: WaiverConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
@@ -59,6 +61,7 @@ impl Default for Config {
             dependency_update: DependencyUpdateConfig::default(),
             observability: ObservabilityConfig::default(),
             alerts: AlertConfig::default(),
+            policy_authority: PolicyAuthorityConfig::default(),
             waiver: WaiverConfig::default(),
             plugins: PluginConfig::default(),
             integrations: IntegrationConfig::default(),
@@ -1004,6 +1007,46 @@ impl Default for V2CompatibilityConfig {
             migration_guide_path: default_empty_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyAuthorityConfig {
+    #[serde(default = "default_true")]
+    pub enforce_trusted_policy_required: bool,
+    #[serde(default = "default_policy_base_ref")]
+    pub base_ref: String,
+    #[serde(default)]
+    pub protected_policy_ref: String,
+    #[serde(default)]
+    pub org_bundle_path: String,
+    #[serde(default)]
+    pub org_bundle_signature_path: String,
+    #[serde(default = "default_policy_bundle_public_key_env")]
+    pub org_bundle_public_key_env: String,
+    #[serde(default = "default_false")]
+    pub allow_untrusted_local_enforce: bool,
+}
+
+impl Default for PolicyAuthorityConfig {
+    fn default() -> Self {
+        Self {
+            enforce_trusted_policy_required: default_true(),
+            base_ref: default_policy_base_ref(),
+            protected_policy_ref: default_empty_string(),
+            org_bundle_path: default_empty_string(),
+            org_bundle_signature_path: default_empty_string(),
+            org_bundle_public_key_env: default_policy_bundle_public_key_env(),
+            allow_untrusted_local_enforce: default_false(),
+        }
+    }
+}
+
+fn default_policy_base_ref() -> String {
+    "HEAD".to_string()
+}
+
+fn default_policy_bundle_public_key_env() -> String {
+    "PATCHGATE_POLICY_BUNDLE_PUBLIC_KEY".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

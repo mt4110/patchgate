@@ -23,6 +23,12 @@ Core options:
 - `--format <text|json>`
 - `--scope <staged|worktree|repo>`
 - `--mode <warn|enforce>`
+- `--base-ref <ref>` (enforce の trusted base policy)
+- `--protected-policy-ref <ref>`
+- `--org-policy-bundle <path>`
+- `--org-policy-bundle-signature <path>`
+- `--org-policy-public-key-env <env_name>`
+- `--allow-untrusted-policy-for-local-enforce` (local escape hatch; CI templateでは使わない)
 - `--threshold <0..=100>`
 - `--max-changed-files <u32>`
 - `--on-exceed <fail_open|fail_closed>`
@@ -72,6 +78,10 @@ Provider/Webhook/Notification options:
 - `--notify-timeout-ms <ms>`
 - `--dead-letter-output <path>` (配信失敗ペイロードをJSONL保存)
 
+`--github-check-name` の推奨固定値は `patchgate/trust-boundary` です。
+branch protection はこの check name を required にしてください。
+enforce mode では policy-changing CLI override (`--threshold`, `--max-changed-files`, `--on-exceed`) は拒否されます。
+
 ### `patchgate history summary`
 
 - `--input <metrics.jsonl>`
@@ -106,6 +116,39 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--require-current-version`
+
+### `patchgate policy resolve`
+
+- `--path <file>`
+- `--policy-preset <strict|balanced|relaxed>`
+- `--mode <warn|enforce>`
+- `--base-ref <ref>`
+- `--head-ref <ref>` (指定時は worktree ではなく head ref の policy を PR overlay として読む)
+- `--protected-policy-ref <ref>`
+- `--org-policy-bundle <path>`
+- `--org-policy-bundle-signature <path>`
+- `--org-policy-public-key-env <env_name>`
+- `--allow-untrusted-policy-for-local-enforce`
+- `--format <text|json>`
+- resolved policy digest、trusted sources、PR overlay の accepted/rejected keys を出力
+
+### `patchgate policy diff`
+
+- `patchgate policy resolve` と同じ authority options
+- PR overlay の accepted/rejected keys だけを確認
+
+### `patchgate policy attest`
+
+- `--bundle <org-policy-bundle.toml>`
+- `--signature <org-policy-bundle.sig>`
+- `--public-key-env <env_name>`
+- `--format <text|json>`
+- `schema_version = "patchgate.policy.bundle.v1"` の signed org bundle を検証
+
+### `patchgate policy verify-authority`
+
+- `patchgate policy resolve` と同じ authority options
+- `--mode enforce` で untrusted policy、署名未検証 bundle、rejected PR overlay がある場合は migration-required exit で止める
 
 ### `patchgate policy migrate`
 

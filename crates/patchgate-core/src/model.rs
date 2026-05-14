@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use patchgate_config::PolicyAuthority;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -18,6 +19,7 @@ pub enum CheckId {
     DangerousChange,
     DependencyUpdate,
     ExternalPlugin,
+    PolicyAuthority,
 }
 
 impl CheckId {
@@ -27,6 +29,7 @@ impl CheckId {
             CheckId::DangerousChange => "dangerous_change",
             CheckId::DependencyUpdate => "dependency_update",
             CheckId::ExternalPlugin => "external_plugin",
+            CheckId::PolicyAuthority => "policy_authority",
         }
     }
 
@@ -36,6 +39,7 @@ impl CheckId {
             CheckId::DangerousChange => "Dangerous file changes",
             CheckId::DependencyUpdate => "Dependency update risk",
             CheckId::ExternalPlugin => "External plugin risk",
+            CheckId::PolicyAuthority => "Policy authority",
         }
     }
 }
@@ -123,6 +127,8 @@ pub struct Report {
     pub supply_chain_signals: Vec<SupplyChainSignal>,
     #[serde(default)]
     pub plugin_invocations: Vec<PluginInvocation>,
+    #[serde(default)]
+    pub policy_authority: PolicyAuthority,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -285,7 +291,16 @@ impl Report {
             diagnostic_hints: diagnostic_hints_from_score(score, should_fail),
             supply_chain_signals: Vec::new(),
             plugin_invocations: Vec::new(),
+            policy_authority: PolicyAuthority::default(),
         }
+    }
+
+    pub fn recompute_score(&mut self) {
+        let total_penalty: u16 = self.checks.iter().map(|c| c.penalty as u16).sum();
+        let capped_penalty = total_penalty.min(100) as u8;
+        self.score = 100u8.saturating_sub(capped_penalty);
+        self.should_fail = self.score < self.threshold;
+        self.review_priority = review_priority_from_score(self.score);
     }
 }
 
