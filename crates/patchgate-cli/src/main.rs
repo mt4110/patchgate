@@ -6206,6 +6206,16 @@ fn policy_authority_relative_path(repo_root: &Path, policy_path: &Path) -> Resul
         std::env::current_dir()?.join(repo_root)
     };
     let repo_root = normalize_absolute_path(&repo_root);
+    let repo_root = if repo_root
+        .try_exists()
+        .with_context(|| format!("check repository root {}", repo_root.display()))?
+    {
+        fs::canonicalize(&repo_root)
+            .with_context(|| format!("canonicalize repository root {}", repo_root.display()))?
+    } else {
+        repo_root
+    };
+    let repo_root = normalize_absolute_path(&repo_root);
     let policy_path = if policy_path.is_absolute() {
         policy_path.to_path_buf()
     } else {
