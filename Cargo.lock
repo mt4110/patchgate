@@ -885,9 +885,12 @@ name = "patchgate-config"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
+ "ed25519-dalek",
  "globset",
  "serde",
+ "sha2",
  "thiserror 1.0.69",
  "toml",
 ]

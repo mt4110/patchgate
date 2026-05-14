@@ -8,6 +8,7 @@ nav:
   - CLI: 03_cli_reference.md
   - Recipes: 04_recipes.md
   - Troubleshooting: 05_troubleshooting.md
+  - Trust Boundary: trust-boundary.md
   - Architecture: ARCHITECTURE.md
   - Security: SECURITY.md
   - Roadmap: ROADMAP.md

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use patchgate_config::PolicyAuthority;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -18,6 +19,7 @@ pub enum CheckId {
     DangerousChange,
     DependencyUpdate,
     ExternalPlugin,
+    PolicyAuthority,
 }
 
 impl CheckId {
@@ -27,6 +29,7 @@ impl CheckId {
             CheckId::DangerousChange => "dangerous_change",
             CheckId::DependencyUpdate => "dependency_update",
             CheckId::ExternalPlugin => "external_plugin",
+            CheckId::PolicyAuthority => "policy_authority",
         }
     }
 
@@ -36,6 +39,7 @@ impl CheckId {
             CheckId::DangerousChange => "Dangerous file changes",
             CheckId::DependencyUpdate => "Dependency update risk",
             CheckId::ExternalPlugin => "External plugin risk",
+            CheckId::PolicyAuthority => "Policy authority",
         }
     }
 }
@@ -123,6 +127,8 @@ pub struct Report {
     pub supply_chain_signals: Vec<SupplyChainSignal>,
     #[serde(default)]
     pub plugin_invocations: Vec<PluginInvocation>,
+    #[serde(default)]
+    pub policy_authority: PolicyAuthority,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -285,7 +291,23 @@ impl Report {
             diagnostic_hints: diagnostic_hints_from_score(score, should_fail),
             supply_chain_signals: Vec::new(),
             plugin_invocations: Vec::new(),
+            policy_authority: PolicyAuthority::default(),
         }
+    }
+
+    pub fn recompute_score(&mut self) {
+        let total_penalty: u16 = self.checks.iter().map(|c| c.penalty as u16).sum();
+        let capped_penalty = total_penalty.min(100) as u8;
+        self.score = 100u8.saturating_sub(capped_penalty);
+        self.should_fail = self.score < self.threshold;
+        self.review_priority = review_priority_from_score(self.score);
+        let mut hints = diagnostic_hints_from_score(self.score, self.should_fail);
+        for hint in self.diagnostic_hints.drain(..) {
+            if !is_score_diagnostic_hint(&hint) && !hints.contains(&hint) {
+                hints.push(hint);
+            }
+        }
+        self.diagnostic_hints = hints;
     }
 }
 
@@ -306,6 +328,12 @@ fn diagnostic_hints_from_score(score: u8, should_fail: bool) -> Vec<String> {
         );
     }
     hints
+}
+
+fn is_score_diagnostic_hint(hint: &str) -> bool {
+    hint == "Gate failed: prioritize critical/high findings first."
+        || hint.starts_with("Score is in P0 band")
+        || hint.starts_with("Score is in P1 band")
 }
 
 pub fn review_priority_from_score(score: u8) -> ReviewPriority {
@@ -366,6 +394,47 @@ mod tests {
 
         assert_eq!(report.score, 0);
         assert_eq!(report.review_priority, ReviewPriority::P0);
+    }
+
+    #[test]
+    fn recompute_score_refreshes_score_hints_and_preserves_custom_hints() {
+        let mut report = Report::new(
+            Vec::new(),
+            vec![sample_check(CheckId::TestGap, 5, 35)],
+            ReportMeta {
+                threshold: 70,
+                mode: "enforce".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        assert!(!report.should_fail);
+        assert!(report.diagnostic_hints.is_empty());
+
+        report
+            .diagnostic_hints
+            .push("Policy authority failure blocks enforce mode.".to_string());
+        report
+            .checks
+            .push(sample_check(CheckId::PolicyAuthority, 100, 100));
+        report.recompute_score();
+
+        assert_eq!(report.score, 0);
+        assert!(report.should_fail);
+        assert!(report
+            .diagnostic_hints
+            .iter()
+            .any(|hint| hint.starts_with("Gate failed:")));
+        assert!(report
+            .diagnostic_hints
+            .iter()
+            .any(|hint| hint.starts_with("Score is in P0 band")));
+        assert!(report
+            .diagnostic_hints
+            .iter()
+            .any(|hint| hint == "Policy authority failure blocks enforce mode."));
     }
 
     #[test]

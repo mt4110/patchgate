@@ -1,5 +1,7 @@
+mod authority;
 mod types;
 
+pub use authority::*;
 pub use types::*;
 
 use std::collections::BTreeSet;
@@ -191,28 +193,7 @@ pub fn load_effective_from_typed(
             source,
         })?;
         let policy_value = parse_toml_value(&text)?;
-        let has_explicit_version = has_explicit_policy_version(&policy_value);
-        let explicit_version = explicit_policy_version(&policy_value);
-        let mut merged = if !has_explicit_version || explicit_version == Some(POLICY_VERSION_LEGACY)
-        {
-            legacy_default_config_value()
-        } else {
-            default_config_value()
-        };
-        if let Some(preset) = preset {
-            let preset_value = parse_toml_value(preset_toml(preset))?;
-            deep_merge(&mut merged, preset_value);
-        }
-        deep_merge(&mut merged, policy_value);
-
-        let mut cfg = parse_config_from_value(merged)?;
-        let source = if has_explicit_version {
-            PolicyVersionSource::Explicit
-        } else {
-            cfg.policy_version = POLICY_VERSION_LEGACY;
-            PolicyVersionSource::LegacyImplicit
-        };
-        (cfg, source)
+        load_effective_from_policy_value(policy_value, preset)?
     } else {
         let mut merged = default_config_value();
         if let Some(preset) = preset {
@@ -234,6 +215,48 @@ pub fn load_effective_from_typed(
         version_source,
         compatibility_warnings,
     })
+}
+
+pub fn load_effective_from_text_typed(
+    text: &str,
+    preset: Option<PolicyPreset>,
+) -> Result<LoadedConfig> {
+    let policy_value = parse_toml_value(text)?;
+    let (config, version_source) = load_effective_from_policy_value(policy_value, preset)?;
+    validate_config(&config)?;
+    let compatibility_warnings = compatibility_warnings(&config, version_source);
+    Ok(LoadedConfig {
+        config,
+        version_source,
+        compatibility_warnings,
+    })
+}
+
+fn load_effective_from_policy_value(
+    policy_value: toml::Value,
+    preset: Option<PolicyPreset>,
+) -> Result<(Config, PolicyVersionSource)> {
+    let has_explicit_version = has_explicit_policy_version(&policy_value);
+    let explicit_version = explicit_policy_version(&policy_value);
+    let mut merged = if !has_explicit_version || explicit_version == Some(POLICY_VERSION_LEGACY) {
+        legacy_default_config_value()
+    } else {
+        default_config_value()
+    };
+    if let Some(preset) = preset {
+        let preset_value = parse_toml_value(preset_toml(preset))?;
+        deep_merge(&mut merged, preset_value);
+    }
+    deep_merge(&mut merged, policy_value);
+
+    let mut cfg = parse_config_from_value(merged)?;
+    let source = if has_explicit_version {
+        PolicyVersionSource::Explicit
+    } else {
+        cfg.policy_version = POLICY_VERSION_LEGACY;
+        PolicyVersionSource::LegacyImplicit
+    };
+    Ok((cfg, source))
 }
 
 pub fn migrate_policy_text(

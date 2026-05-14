@@ -32,7 +32,7 @@ jobs:
           # this makes `git diff` represent the PR delta.
           git reset --mixed HEAD^1
 
-      - name: Run patchgate (idempotent publish + retry/backoff)
+      - name: Run patchgate (trusted policy authority)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -41,6 +41,8 @@ jobs:
             --mode enforce \
             --scope worktree \
             --format json \
+            --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --github-check-name patchgate/trust-boundary \
             --metrics-output artifacts/scan-metrics.jsonl \
             --audit-log-output artifacts/scan-audit.jsonl \
             --audit-log-v2-output artifacts/scan-audit-v2.jsonl \
@@ -82,6 +84,8 @@ jobs:
             --mode warn \
             --scope staged \
             --format json \
+            --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --github-check-name patchgate/trust-boundary \
             --github-publish \
             --github-dry-run \
             --github-repo ${{ github.repository }} \

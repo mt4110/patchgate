@@ -28,7 +28,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use patchgate_config::{
-    Config, ConfigError, LoadedConfig, PolicyMigrationError, PolicyPreset, ValidationCategory,
+    Config, ConfigError, LoadedConfig, PolicyAuthority, PolicyAuthorityFailure,
+    PolicyAuthorityResolution, PolicyAuthorityResolverInput, PolicyAuthoritySourceInput,
+    PolicyBundleSourceInput, PolicyMigrationError, PolicyPreset, ValidationCategory,
     POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
@@ -93,6 +95,30 @@ struct ScanArgs {
     /// Gate mode: warn|enforce
     #[arg(long)]
     mode: Option<String>,
+
+    /// Trusted base ref for enforce-mode policy authority
+    #[arg(long)]
+    base_ref: Option<String>,
+
+    /// Optional protected policy ref (for example refs/patchgate/policy/main)
+    #[arg(long)]
+    protected_policy_ref: Option<String>,
+
+    /// Signed organization policy bundle path
+    #[arg(long)]
+    org_policy_bundle: Option<PathBuf>,
+
+    /// Signature for --org-policy-bundle
+    #[arg(long)]
+    org_policy_bundle_signature: Option<PathBuf>,
+
+    /// Env var containing the org policy bundle public key
+    #[arg(long)]
+    org_policy_public_key_env: Option<String>,
+
+    /// Allow local-only enforce scans to continue as an explicit local escape hatch
+    #[arg(long)]
+    allow_untrusted_policy_for_local_enforce: bool,
 
     /// Fail threshold (0..=100), lower score fails in enforce mode
     #[arg(long)]
@@ -396,6 +422,18 @@ enum PolicyCommand {
     /// Lint policy config and report compatibility status
     Lint(PolicyLintArgs),
 
+    /// Resolve trusted policy authority and PR overlay status
+    Resolve(PolicyResolveArgs),
+
+    /// Show PR overlay policy diff against trusted authority
+    Diff(PolicyDiffArgs),
+
+    /// Verify and emit an org policy bundle authority attestation
+    Attest(PolicyAttestArgs),
+
+    /// Verify policy authority readiness for warn/enforce mode
+    VerifyAuthority(PolicyVerifyAuthorityArgs),
+
     /// Migrate policy config across policy versions
     Migrate(PolicyMigrateArgs),
 
@@ -441,6 +479,90 @@ struct PolicyMigrateArgs {
     /// Overwrite input file. Without this flag, output is dry-run to stdout.
     #[arg(long)]
     write: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct PolicyAuthorityCommonArgs {
+    /// Policy file path (default: auto-discover policy.toml)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Apply policy preset before loading policy file: strict|balanced|relaxed
+    #[arg(long)]
+    policy_preset: Option<String>,
+
+    /// Mode to resolve authority for: warn|enforce
+    #[arg(long, default_value = "warn")]
+    mode: String,
+
+    /// Trusted base ref for base branch policy
+    #[arg(long)]
+    base_ref: Option<String>,
+
+    /// PR/head ref to read overlay policy from; defaults to the worktree file
+    #[arg(long)]
+    head_ref: Option<String>,
+
+    /// Optional protected policy ref (for example refs/patchgate/policy/main)
+    #[arg(long)]
+    protected_policy_ref: Option<String>,
+
+    /// Signed organization policy bundle path
+    #[arg(long)]
+    org_policy_bundle: Option<PathBuf>,
+
+    /// Signature for --org-policy-bundle
+    #[arg(long)]
+    org_policy_bundle_signature: Option<PathBuf>,
+
+    /// Env var containing the org policy bundle public key
+    #[arg(long)]
+    org_policy_public_key_env: Option<String>,
+
+    /// Allow local-only enforce scans to continue as an explicit local escape hatch
+    #[arg(long)]
+    allow_untrusted_policy_for_local_enforce: bool,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Args, Debug)]
+struct PolicyResolveArgs {
+    #[command(flatten)]
+    authority: PolicyAuthorityCommonArgs,
+}
+
+#[derive(Args, Debug)]
+struct PolicyDiffArgs {
+    #[command(flatten)]
+    authority: PolicyAuthorityCommonArgs,
+}
+
+#[derive(Args, Debug)]
+struct PolicyVerifyAuthorityArgs {
+    #[command(flatten)]
+    authority: PolicyAuthorityCommonArgs,
+}
+
+#[derive(Args, Debug)]
+struct PolicyAttestArgs {
+    /// Signed organization policy bundle path
+    #[arg(long)]
+    bundle: PathBuf,
+
+    /// Signature path for --bundle
+    #[arg(long)]
+    signature: PathBuf,
+
+    /// Env var containing the org policy bundle public key
+    #[arg(long, default_value = "PATCHGATE_POLICY_BUNDLE_PUBLIC_KEY")]
+    public_key_env: String,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -1100,6 +1222,10 @@ struct HistoryTrendRow {
 
 type ScanResult<T> = std::result::Result<T, ScanError>;
 const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
+const DEFAULT_GITHUB_CHECK_NAME: &str = "patchgate";
+const POLICY_FILE_CANDIDATES: [&str; 4] =
+    ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"];
+const TRUST_BOUNDARY_DOCS_PATH: &str = "docs/trust-boundary.md";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1348,6 +1474,39 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn canonicalize_existing_prefix(path: &Path, label: &str) -> Result<PathBuf> {
+    let normalized = normalize_absolute_path(path);
+    let mut cursor = normalized.as_path();
+    let mut missing_tail = Vec::new();
+
+    loop {
+        if cursor
+            .try_exists()
+            .with_context(|| format!("check {label} {}", cursor.display()))?
+        {
+            let mut canonical = fs::canonicalize(cursor)
+                .with_context(|| format!("canonicalize {label} {}", cursor.display()))?;
+            for component in missing_tail.iter().rev() {
+                canonical.push(component);
+            }
+            return Ok(normalize_absolute_path(&canonical));
+        }
+
+        let Some(name) = cursor.file_name() else {
+            return Ok(normalized);
+        };
+        missing_tail.push(name.to_os_string());
+
+        let Some(parent) = cursor.parent() else {
+            return Ok(normalized);
+        };
+        if parent == cursor {
+            return Ok(normalized);
+        }
+        cursor = parent;
+    }
 }
 
 const NODE_TEMPLATE_README: &str = include_str!(concat!(
@@ -1613,6 +1772,14 @@ fn run_doctor(repo_root: &Path, config_override: Option<&Path>) -> Result<()> {
 fn execute_policy(repo_root: &Path, config_override: Option<&Path>, policy: PolicyArgs) -> i32 {
     match policy.cmd {
         PolicyCommand::Lint(args) => run_policy_lint(repo_root, config_override, args).as_i32(),
+        PolicyCommand::Resolve(args) => {
+            run_policy_resolve(repo_root, config_override, args).as_i32()
+        }
+        PolicyCommand::Diff(args) => run_policy_diff(repo_root, config_override, args).as_i32(),
+        PolicyCommand::Attest(args) => run_policy_attest(repo_root, args).as_i32(),
+        PolicyCommand::VerifyAuthority(args) => {
+            run_policy_verify_authority(repo_root, config_override, args).as_i32()
+        }
         PolicyCommand::Migrate(args) => {
             run_policy_migrate(repo_root, config_override, args).as_i32()
         }
@@ -1957,6 +2124,476 @@ fn run_policy_lint(
     }
 
     PolicyExitCode::Ok
+}
+
+fn run_policy_resolve(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyResolveArgs,
+) -> PolicyExitCode {
+    let resolved =
+        match resolve_policy_authority_from_common(repo_root, config_override, &args.authority) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("patchgate policy resolve error: {err:#}");
+                return PolicyExitCode::ReadOrParse;
+            }
+        };
+    if let Err(err) = print_policy_authority_resolution(
+        &resolved,
+        args.authority.format.as_str(),
+        PolicyAuthorityPrintMode::Resolve,
+    ) {
+        eprintln!("patchgate policy resolve error: {err}");
+        return PolicyExitCode::IoFailed;
+    }
+    PolicyExitCode::Ok
+}
+
+fn run_policy_diff(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyDiffArgs,
+) -> PolicyExitCode {
+    let resolved =
+        match resolve_policy_authority_from_common(repo_root, config_override, &args.authority) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("patchgate policy diff error: {err:#}");
+                return PolicyExitCode::ReadOrParse;
+            }
+        };
+    if let Err(err) = print_policy_authority_resolution(
+        &resolved,
+        args.authority.format.as_str(),
+        PolicyAuthorityPrintMode::Diff,
+    ) {
+        eprintln!("patchgate policy diff error: {err}");
+        return PolicyExitCode::IoFailed;
+    }
+    if args.authority.mode == "enforce" && !resolved.resolution.enforce_failures.is_empty() {
+        PolicyExitCode::MigrationRequired
+    } else {
+        PolicyExitCode::Ok
+    }
+}
+
+fn run_policy_attest(repo_root: &Path, args: PolicyAttestArgs) -> PolicyExitCode {
+    let bundle_path = resolve_repo_relative_path(repo_root, args.bundle);
+    let signature_path = resolve_repo_relative_path(repo_root, args.signature);
+    let bundle_text = match fs::read_to_string(&bundle_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "patchgate policy attest error: failed to read bundle {}: {err}",
+                bundle_path.display()
+            );
+            return PolicyExitCode::IoFailed;
+        }
+    };
+    let signature_text = match fs::read_to_string(&signature_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "patchgate policy attest error: failed to read signature {}: {err}",
+                signature_path.display()
+            );
+            return PolicyExitCode::IoFailed;
+        }
+    };
+    let public_key_base64 = match std::env::var(args.public_key_env.as_str()) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            eprintln!(
+                "patchgate policy attest error: missing public key env var {}",
+                args.public_key_env
+            );
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+    let resolver_input = PolicyAuthorityResolverInput {
+        mode: "enforce".to_string(),
+        preset: None,
+        base_branch: None,
+        protected_ref: None,
+        local_file: None,
+        org_bundle: Some(PolicyBundleSourceInput {
+            path: Some(bundle_path.display().to_string()),
+            text: bundle_text,
+            signature_path: Some(signature_path.display().to_string()),
+            signature_text: Some(signature_text),
+            public_key_base64,
+        }),
+        enforce_trusted_policy_required: true,
+        allow_untrusted_local_enforce: false,
+    };
+    let resolution = match patchgate_config::resolve_policy_authority(resolver_input) {
+        Ok(resolution) => resolution,
+        Err(err) => {
+            eprintln!("patchgate policy attest error: {err:#}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
+    let resolved = PolicyAuthorityCliResolution {
+        policy_path: "<org-bundle>".to_string(),
+        mode: "enforce".to_string(),
+        resolution,
+    };
+    if let Err(err) = print_policy_authority_resolution(
+        &resolved,
+        args.format.as_str(),
+        PolicyAuthorityPrintMode::Attest,
+    ) {
+        eprintln!("patchgate policy attest error: {err}");
+        return PolicyExitCode::IoFailed;
+    }
+    if resolved.resolution.enforce_failures.is_empty() {
+        PolicyExitCode::Ok
+    } else {
+        PolicyExitCode::MigrationRequired
+    }
+}
+
+fn run_policy_verify_authority(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: PolicyVerifyAuthorityArgs,
+) -> PolicyExitCode {
+    let resolved =
+        match resolve_policy_authority_from_common(repo_root, config_override, &args.authority) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("patchgate policy verify-authority error: {err:#}");
+                return PolicyExitCode::ReadOrParse;
+            }
+        };
+    if let Err(err) = print_policy_authority_resolution(
+        &resolved,
+        args.authority.format.as_str(),
+        PolicyAuthorityPrintMode::Verify,
+    ) {
+        eprintln!("patchgate policy verify-authority error: {err}");
+        return PolicyExitCode::IoFailed;
+    }
+    if resolved.mode == "enforce"
+        && (!resolved.resolution.enforce_failures.is_empty()
+            || !resolved.resolution.authority.trusted)
+    {
+        PolicyExitCode::MigrationRequired
+    } else {
+        PolicyExitCode::Ok
+    }
+}
+
+#[derive(Debug)]
+struct PolicyAuthorityCliResolution {
+    policy_path: String,
+    mode: String,
+    resolution: PolicyAuthorityResolution,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PolicyAuthorityPrintMode {
+    Resolve,
+    Diff,
+    Attest,
+    Verify,
+}
+
+fn resolve_policy_authority_from_common(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: &PolicyAuthorityCommonArgs,
+) -> Result<PolicyAuthorityCliResolution> {
+    let preset = parse_policy_preset(args.policy_preset.as_deref())
+        .map_err(|err| anyhow!("invalid --policy-preset value: {err}"))?;
+    resolve_policy_authority_from_common_with_preset(repo_root, config_override, args, preset)
+}
+
+fn resolve_policy_authority_from_common_with_preset(
+    repo_root: &Path,
+    config_override: Option<&Path>,
+    args: &PolicyAuthorityCommonArgs,
+    preset: Option<PolicyPreset>,
+) -> Result<PolicyAuthorityCliResolution> {
+    parse_mode(args.mode.as_str(), OptionSource::Cli).map_err(|err| anyhow!("{}", err.render()))?;
+
+    let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
+    let policy_candidates = policy_authority_candidate_paths(repo_root, policy_path.as_deref())?;
+    let local_policy = if let Some(head_ref) = args.head_ref.as_deref() {
+        read_git_file_at_ref_candidates(repo_root, head_ref, &policy_candidates, false)?
+    } else {
+        read_optional_policy_file(policy_path.as_deref())?
+            .map(|text| (policy_candidates[0].clone(), text))
+    };
+    let mut resolved_policy_rel = local_policy
+        .as_ref()
+        .map(|(rel_path, _)| rel_path.clone())
+        .unwrap_or_else(|| policy_candidates[0].clone());
+    let local_source = local_policy.map(|(rel_path, text)| {
+        PolicyAuthoritySourceInput::new("local_file", text)
+            .with_ref(args.head_ref.clone())
+            .with_path(Some(rel_path))
+    });
+
+    let base_branch = match args.base_ref.as_deref() {
+        Some(base_ref) => {
+            let base_candidates = if policy_path.is_none() && local_source.is_some() {
+                vec![resolved_policy_rel.clone()]
+            } else {
+                policy_candidates.clone()
+            };
+            read_git_file_at_ref_candidates(repo_root, base_ref, &base_candidates, true)?.map(
+                |(rel_path, text)| {
+                    resolved_policy_rel = rel_path.clone();
+                    PolicyAuthoritySourceInput::new("base_branch", text)
+                        .with_ref(Some(base_ref.to_string()))
+                        .with_path(Some(rel_path))
+                },
+            )
+        }
+        None => None,
+    };
+    let trusted_authority_config = base_branch
+        .as_ref()
+        .and_then(|source| {
+            patchgate_config::load_effective_from_text_typed(source.text.as_str(), preset).ok()
+        })
+        .map(|loaded| loaded.config.policy_authority)
+        .unwrap_or_default();
+    let authority_config_from_trusted_policy = base_branch.is_some();
+    let authority_config = if authority_config_from_trusted_policy || args.mode == "enforce" {
+        trusted_authority_config
+    } else {
+        local_source
+            .as_ref()
+            .and_then(|source| {
+                patchgate_config::load_effective_from_text_typed(source.text.as_str(), preset).ok()
+            })
+            .map(|loaded| loaded.config.policy_authority)
+            .unwrap_or_default()
+    };
+
+    let protected_ref = args
+        .protected_policy_ref
+        .clone()
+        .or_else(|| non_empty_string(authority_config.protected_policy_ref.as_str()));
+    let protected_ref_source = match protected_ref.as_deref() {
+        Some(ref_name) => {
+            let protected_candidates =
+                if policy_path.is_none() && (base_branch.is_some() || local_source.is_some()) {
+                    vec![resolved_policy_rel.clone()]
+                } else {
+                    policy_candidates.clone()
+                };
+            read_git_file_at_ref_candidates(repo_root, ref_name, &protected_candidates, true)?.map(
+                |(rel_path, text)| {
+                    resolved_policy_rel = rel_path.clone();
+                    PolicyAuthoritySourceInput::new("protected_ref", text)
+                        .with_ref(Some(ref_name.to_string()))
+                        .with_path(Some(rel_path))
+                },
+            )
+        }
+        None => None,
+    };
+
+    let bundle_path = args
+        .org_policy_bundle
+        .clone()
+        .or_else(|| non_empty_path(authority_config.org_bundle_path.as_str()));
+    let signature_path = args
+        .org_policy_bundle_signature
+        .clone()
+        .or_else(|| non_empty_path(authority_config.org_bundle_signature_path.as_str()));
+    let public_key_env = args
+        .org_policy_public_key_env
+        .as_deref()
+        .or_else(|| non_empty_str(authority_config.org_bundle_public_key_env.as_str()))
+        .unwrap_or("PATCHGATE_POLICY_BUNDLE_PUBLIC_KEY");
+    let org_bundle = match bundle_path {
+        Some(bundle_path) => {
+            let bundle_path = resolve_repo_relative_path(repo_root, bundle_path);
+            let bundle_text = fs::read_to_string(&bundle_path)
+                .with_context(|| format!("read org policy bundle {}", bundle_path.display()))?;
+            let signature_path =
+                signature_path.map(|path| resolve_repo_relative_path(repo_root, path));
+            let signature_text = match signature_path.as_ref() {
+                Some(path) => Some(fs::read_to_string(path).with_context(|| {
+                    format!("read org policy bundle signature {}", path.display())
+                })?),
+                None => None,
+            };
+            let public_key_base64 = std::env::var(public_key_env).ok();
+            Some(PolicyBundleSourceInput {
+                path: Some(bundle_path.display().to_string()),
+                text: bundle_text,
+                signature_path: signature_path.map(|path| path.display().to_string()),
+                signature_text,
+                public_key_base64,
+            })
+        }
+        None => None,
+    };
+
+    let resolution = patchgate_config::resolve_policy_authority(PolicyAuthorityResolverInput {
+        mode: args.mode.clone(),
+        preset,
+        base_branch,
+        protected_ref: protected_ref_source,
+        local_file: local_source,
+        org_bundle,
+        enforce_trusted_policy_required: authority_config.enforce_trusted_policy_required,
+        allow_untrusted_local_enforce: args.allow_untrusted_policy_for_local_enforce
+            || (authority_config_from_trusted_policy
+                && authority_config.allow_untrusted_local_enforce),
+    })
+    .map_err(|err| anyhow!(err))?;
+
+    Ok(PolicyAuthorityCliResolution {
+        policy_path: resolved_policy_rel,
+        mode: args.mode.clone(),
+        resolution,
+    })
+}
+
+fn policy_authority_resolution_scan_error(err: anyhow::Error) -> ScanError {
+    if error_chain_contains_expired_waiver(&err) {
+        ScanError::with_hint(
+            ScanErrorKind::Config,
+            FailureCode::WaiverExpired,
+            "Update waiver.expires_at or remove expired waiver entries.",
+            err.context("failed to resolve policy authority"),
+        )
+    } else {
+        ScanError::with_code(
+            ScanErrorKind::Config,
+            FailureCode::ConfigLoadFailed,
+            err.context("failed to resolve policy authority"),
+        )
+    }
+}
+
+fn error_chain_contains_expired_waiver(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ConfigError>(),
+            Some(ConfigError::Validation { field, message, .. })
+                if *field == "waiver.entries" && message.contains("expired")
+        )
+    })
+}
+
+fn print_policy_authority_resolution(
+    resolved: &PolicyAuthorityCliResolution,
+    format: &str,
+    mode: PolicyAuthorityPrintMode,
+) -> std::result::Result<(), String> {
+    match format {
+        "json" => {
+            let value = match mode {
+                PolicyAuthorityPrintMode::Resolve
+                | PolicyAuthorityPrintMode::Attest
+                | PolicyAuthorityPrintMode::Verify => {
+                    serde_json::to_value(&resolved.resolution.artifact)
+                        .map_err(|err| format!("failed to encode authority artifact: {err}"))?
+                }
+                PolicyAuthorityPrintMode::Diff => {
+                    serde_json::to_value(&resolved.resolution.authority.pr_overlay)
+                        .map_err(|err| format!("failed to encode policy diff: {err}"))?
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .map_err(|err| format!("failed to encode json: {err}"))?
+            );
+        }
+        "text" => match mode {
+            PolicyAuthorityPrintMode::Diff => {
+                println!("patchgate policy diff");
+                println!("- policy_path: {}", resolved.policy_path);
+                println!(
+                    "- overlay_present: {}",
+                    resolved.resolution.authority.pr_overlay.present
+                );
+                print_string_list(
+                    "- accepted_keys",
+                    &resolved.resolution.authority.pr_overlay.accepted_keys,
+                );
+                print_string_list(
+                    "- rejected_keys",
+                    &resolved.resolution.authority.pr_overlay.rejected_keys,
+                );
+            }
+            PolicyAuthorityPrintMode::Attest => {
+                print_policy_authority_text("patchgate policy attest", resolved);
+            }
+            PolicyAuthorityPrintMode::Verify => {
+                print_policy_authority_text("patchgate policy verify-authority", resolved);
+            }
+            PolicyAuthorityPrintMode::Resolve => {
+                print_policy_authority_text("patchgate policy resolve", resolved);
+            }
+        },
+        other => {
+            return Err(format!(
+                "unsupported --format `{other}` (expected: text|json)"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn print_policy_authority_text(title: &str, resolved: &PolicyAuthorityCliResolution) {
+    println!("{title}");
+    println!("- policy_path: {}", resolved.policy_path);
+    println!("- mode: {}", resolved.mode);
+    println!("- trusted: {}", resolved.resolution.authority.trusted);
+    println!("- digest: {}", resolved.resolution.authority.digest);
+    println!("- sources:");
+    for source in &resolved.resolution.authority.sources {
+        println!(
+            "  - kind={} ref={} path={} trusted={} signature_verified={} digest={}",
+            source.kind,
+            source.ref_name.as_deref().unwrap_or("-"),
+            source.path.as_deref().unwrap_or("-"),
+            source.trusted,
+            source.signature_verified,
+            source.digest
+        );
+    }
+    println!(
+        "- pr_overlay_present: {}",
+        resolved.resolution.authority.pr_overlay.present
+    );
+    print_string_list(
+        "- pr_overlay_accepted_keys",
+        &resolved.resolution.authority.pr_overlay.accepted_keys,
+    );
+    print_string_list(
+        "- pr_overlay_rejected_keys",
+        &resolved.resolution.authority.pr_overlay.rejected_keys,
+    );
+    if resolved.resolution.enforce_failures.is_empty() {
+        println!("- enforce_failures: none");
+    } else {
+        println!("- enforce_failures:");
+        for failure in &resolved.resolution.enforce_failures {
+            println!("  - {}: {}", failure.code, failure.message);
+        }
+    }
+}
+
+fn print_string_list(label: &str, values: &[String]) {
+    if values.is_empty() {
+        println!("{label}: none");
+        return;
+    }
+    println!("{label}:");
+    for value in values {
+        println!("  - {value}");
+    }
 }
 
 fn run_policy_migrate(
@@ -4414,6 +5051,12 @@ fn execute_scan(
         format,
         scope,
         mode,
+        base_ref,
+        protected_policy_ref,
+        org_policy_bundle,
+        org_policy_bundle_signature,
+        org_policy_public_key_env,
+        allow_untrusted_policy_for_local_enforce,
         threshold,
         max_changed_files,
         on_exceed,
@@ -4467,30 +5110,62 @@ fn execute_scan(
     })?;
 
     let config_path = resolve_config_path(repo_root, config_override);
-    let loaded_cfg = load_policy_config(config_path.as_deref(), preset).map_err(|err| {
-        if matches!(
-            &err,
-            ConfigError::Validation { field, message, .. }
-                if *field == "waiver.entries" && message.contains("expired")
-        ) {
-            ScanError::with_hint(
-                ScanErrorKind::Config,
-                FailureCode::WaiverExpired,
-                "Update waiver.expires_at or remove expired waiver entries.",
-                anyhow::Error::new(err).context("failed to load policy config"),
-            )
-        } else {
-            ScanError::with_code(
-                ScanErrorKind::Config,
-                FailureCode::ConfigLoadFailed,
-                anyhow::Error::new(err).context("failed to load policy config"),
-            )
-        }
-    })?;
-    for warning in &loaded_cfg.compatibility_warnings {
+    let provisional_mode = mode.clone().unwrap_or_else(|| "warn".to_string());
+    let mut authority_common = PolicyAuthorityCommonArgs {
+        path: config_path.clone(),
+        policy_preset: policy_preset.clone(),
+        mode: provisional_mode,
+        base_ref,
+        head_ref: None,
+        protected_policy_ref,
+        org_policy_bundle,
+        org_policy_bundle_signature,
+        org_policy_public_key_env,
+        allow_untrusted_policy_for_local_enforce,
+        format: "json".to_string(),
+    };
+    let mut authority_resolution = resolve_policy_authority_from_common_with_preset(
+        repo_root,
+        config_override,
+        &authority_common,
+        preset,
+    )
+    .map_err(policy_authority_resolution_scan_error)?;
+    let requested_mode = mode
+        .clone()
+        .unwrap_or_else(|| authority_resolution.resolution.config.output.mode.clone());
+    if requested_mode != authority_common.mode {
+        authority_common.mode = requested_mode.clone();
+        authority_resolution = resolve_policy_authority_from_common_with_preset(
+            repo_root,
+            config_override,
+            &authority_common,
+            preset,
+        )
+        .map_err(policy_authority_resolution_scan_error)?;
+    }
+    for warning in &authority_resolution
+        .resolution
+        .loaded
+        .compatibility_warnings
+    {
         eprintln!("warning: {warning}");
     }
-    let mut cfg = loaded_cfg.config;
+    if requested_mode == "enforce"
+        && (threshold.is_some() || max_changed_files.is_some() || on_exceed.is_some())
+    {
+        return Err(ScanError::with_hint(
+            ScanErrorKind::Input,
+            FailureCode::InputInvalidOption,
+            "Move enforce-mode policy changes into the trusted base policy or use a stricter PR overlay.",
+            anyhow!(
+                "enforce mode does not accept policy-changing CLI overrides: --threshold, --max-changed-files, --on-exceed"
+            ),
+        ));
+    }
+    let authority = authority_resolution.resolution.authority.clone();
+    let authority_failures = authority_resolution.resolution.enforce_failures.clone();
+    let mut cfg = authority_resolution.resolution.config.clone();
 
     apply_threshold_override(&mut cfg, threshold)?;
     apply_changed_file_overrides(&mut cfg, max_changed_files, on_exceed.as_deref())?;
@@ -4575,12 +5250,13 @@ fn execute_scan(
             }
         }
     } else if cache_enabled {
-        let policy_hash = config_hash(&cfg).map_err(|err| {
-            ScanError::new(
-                ScanErrorKind::Runtime,
-                err.context("failed to hash effective config"),
-            )
-        })?;
+        let policy_hash =
+            effective_policy_hash(&cfg, &authority, &authority_failures).map_err(|err| {
+                ScanError::new(
+                    ScanErrorKind::Runtime,
+                    err.context("failed to hash effective config"),
+                )
+            })?;
         let mut cache_conn = match open_cache_connection(repo_root, &cfg.cache.db_path) {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -4643,6 +5319,12 @@ fn execute_scan(
         profile.evaluate_ms = evaluated.duration_ms;
         evaluated
     };
+    attach_policy_authority(
+        &mut report,
+        authority,
+        &authority_failures,
+        opts.mode.as_str(),
+    );
     profile.skipped_by_cache = report.skipped_by_cache;
     if report.skipped_by_cache {
         profile.check_durations_ms.clear();
@@ -5382,7 +6064,7 @@ fn resolve_publish_request(input: PublishRequestInput) -> Result<PublishRequest>
 
     let auth_mode = GitHubAuthMode::parse(github_auth.as_deref())
         .map_err(|err| anyhow!("invalid value for github_auth: {err}"))?;
-    let check_name = github_check_name.unwrap_or_else(|| "patchgate".to_string());
+    let check_name = github_check_name.unwrap_or_else(|| DEFAULT_GITHUB_CHECK_NAME.to_string());
     let auth = match auth_mode {
         GitHubAuthMode::Token => {
             let token_env = github_token_env.unwrap_or_else(|| "GITHUB_TOKEN".to_string());
@@ -5516,7 +6198,7 @@ fn resolve_config_path(repo_root: &Path, override_path: Option<&Path>) -> Option
         return Some(repo_root.join(path));
     }
 
-    for candidate in ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"] {
+    for candidate in POLICY_FILE_CANDIDATES {
         let path = repo_root.join(candidate);
         if path.exists() {
             return Some(path);
@@ -5535,6 +6217,159 @@ fn resolve_policy_path(
         return resolve_config_path(repo_root, Some(path));
     }
     resolve_config_path(repo_root, config_override)
+}
+
+fn policy_authority_candidate_paths(
+    repo_root: &Path,
+    policy_path: Option<&Path>,
+) -> Result<Vec<String>> {
+    if let Some(path) = policy_path {
+        return Ok(vec![policy_authority_relative_path(repo_root, path)?]);
+    }
+    Ok(POLICY_FILE_CANDIDATES
+        .iter()
+        .map(|candidate| candidate.to_string())
+        .collect())
+}
+
+fn policy_authority_relative_path(repo_root: &Path, policy_path: &Path) -> Result<String> {
+    let repo_root = if repo_root.is_absolute() {
+        repo_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(repo_root)
+    };
+    let repo_root = canonicalize_existing_prefix(&repo_root, "repository root")?;
+    let policy_path = if policy_path.is_absolute() {
+        policy_path.to_path_buf()
+    } else {
+        repo_root.join(policy_path)
+    };
+    let policy_path = canonicalize_existing_prefix(&policy_path, "policy file")?;
+    let relative = policy_path.strip_prefix(&repo_root).with_context(|| {
+        format!(
+            "policy path {} must be inside repository root {} for trusted ref resolution",
+            policy_path.display(),
+            repo_root.display()
+        )
+    })?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", policy_path.display()))?;
+    Ok(relative.replace('\\', "/"))
+}
+
+fn read_optional_policy_file(path: Option<&Path>) -> Result<Option<String>> {
+    match path {
+        Some(path) => {
+            if !path
+                .try_exists()
+                .with_context(|| format!("check policy file {}", path.display()))?
+            {
+                return Err(anyhow!("policy file {} does not exist", path.display()));
+            }
+            fs::read_to_string(path)
+                .map(Some)
+                .with_context(|| format!("read policy file {}", path.display()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn read_git_file_at_ref(
+    repo_root: &Path,
+    ref_name: &str,
+    rel_path: &str,
+    missing_policy_is_error: bool,
+) -> Result<Option<String>> {
+    if ref_name.trim().is_empty() || rel_path.trim().is_empty() {
+        return Ok(None);
+    }
+    let object = format!("{ref_name}:{rel_path}");
+    let output = ProcessCommand::new("git")
+        .arg("show")
+        .arg(object)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("run git show for {ref_name}:{rel_path}"))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(Some)
+            .with_context(|| format!("decode git show output for {ref_name}:{rel_path}"));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if git_ref_exists(repo_root, ref_name)? {
+        if missing_policy_is_error {
+            return Err(anyhow!(
+                "trusted policy ref `{ref_name}` exists but `{rel_path}` is missing: {stderr}"
+            ));
+        }
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "trusted policy ref `{ref_name}` is not available for `{rel_path}`: {stderr}"
+    ))
+}
+
+fn read_git_file_at_ref_candidates(
+    repo_root: &Path,
+    ref_name: &str,
+    rel_paths: &[String],
+    missing_policy_is_error: bool,
+) -> Result<Option<(String, String)>> {
+    if rel_paths.len() == 1 {
+        let rel_path = rel_paths[0].clone();
+        return read_git_file_at_ref(
+            repo_root,
+            ref_name,
+            rel_path.as_str(),
+            missing_policy_is_error,
+        )
+        .map(|text| text.map(|text| (rel_path, text)));
+    }
+
+    for rel_path in rel_paths {
+        if let Some(text) = read_git_file_at_ref(repo_root, ref_name, rel_path.as_str(), false)? {
+            return Ok(Some((rel_path.clone(), text)));
+        }
+    }
+
+    if missing_policy_is_error && git_ref_exists(repo_root, ref_name)? {
+        return Err(anyhow!(
+            "trusted policy ref `{ref_name}` exists but none of the supported policy files are present: {}",
+            rel_paths.join(", ")
+        ));
+    }
+    Ok(None)
+}
+
+fn git_ref_exists(repo_root: &Path, ref_name: &str) -> Result<bool> {
+    let output = ProcessCommand::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("{ref_name}^{{tree}}"))
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("run git rev-parse for {ref_name}"))?;
+    Ok(output.status.success())
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn resolve_comment_suppression_reason(
@@ -6830,6 +7665,83 @@ fn config_hash(cfg: &Config) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serialized)))
 }
 
+fn effective_policy_hash(
+    cfg: &Config,
+    authority: &PolicyAuthority,
+    failures: &[PolicyAuthorityFailure],
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct PolicyHashMaterial<'a> {
+        config_hash: String,
+        authority: &'a PolicyAuthority,
+        enforce_failure_codes: Vec<&'a str>,
+    }
+
+    let material = PolicyHashMaterial {
+        config_hash: config_hash(cfg)?,
+        authority,
+        enforce_failure_codes: failures
+            .iter()
+            .map(|failure| failure.code.as_str())
+            .collect(),
+    };
+    let serialized = serde_json::to_vec(&material)?;
+    Ok(format!("{:x}", Sha256::digest(serialized)))
+}
+
+fn attach_policy_authority(
+    report: &mut Report,
+    authority: PolicyAuthority,
+    failures: &[PolicyAuthorityFailure],
+    mode: &str,
+) {
+    report.policy_authority = authority;
+    if mode != "enforce" || failures.is_empty() {
+        return;
+    }
+    if !report
+        .checks
+        .iter()
+        .any(|check| check.check == CheckId::PolicyAuthority)
+    {
+        report.checks.push(CheckScore {
+            check: CheckId::PolicyAuthority,
+            label: CheckId::PolicyAuthority.label().to_string(),
+            penalty: 100,
+            max_penalty: 100,
+            triggered: true,
+        });
+    }
+    for failure in failures {
+        let finding_id = format!("POLICY-AUTHORITY-{}", failure.code.to_ascii_uppercase());
+        if report
+            .findings
+            .iter()
+            .any(|finding| finding.id == finding_id)
+        {
+            continue;
+        }
+        report.findings.push(Finding {
+            id: finding_id.clone(),
+            rule_id: finding_id,
+            category: "policy_authority".to_string(),
+            docs_url: TRUST_BOUNDARY_DOCS_PATH.to_string(),
+            check: CheckId::PolicyAuthority,
+            title: "Policy authority failed".to_string(),
+            message: failure.message.clone(),
+            severity: Severity::Critical,
+            penalty: 100,
+            location: None,
+            tags: vec!["policy-authority".to_string(), failure.code.clone()],
+        });
+    }
+    report
+        .diagnostic_hints
+        .push("Policy authority failure blocks enforce mode.".to_string());
+    report.recompute_score();
+    report.should_fail = true;
+}
+
 fn build_cache_key(diff_fingerprint: &str, policy_hash: &str, mode: &str, scope: &str) -> String {
     let material = format!(
         "schema={}|cli={}|diff={}|policy={}|mode={}|scope={}",
@@ -6995,6 +7907,10 @@ fn print_text(report: &Report) {
     );
     println!("Mode: {} | Scope: {}", report.mode, report.scope);
     println!("Fingerprint: {}", report.fingerprint);
+    println!(
+        "Policy authority: trusted={} digest={}",
+        report.policy_authority.trusted, report.policy_authority.digest
+    );
     println!("Duration: {}ms", report.duration_ms);
     println!("Changed files: {}", report.changed_files);
     if !report.diagnostic_hints.is_empty() {
@@ -7131,6 +8047,10 @@ fn render_github_comment(report: &Report) -> String {
     ));
     lines.push(format!("- Mode: `{}`", report.mode));
     lines.push(format!("- Scope: `{}`", report.scope));
+    lines.push(format!(
+        "- Policy authority: trusted=`{}` digest=`{}`",
+        report.policy_authority.trusted, report.policy_authority.digest
+    ));
     lines.push(format!("- Changed files: `{}`", report.changed_files));
     lines.push(format!(
         "- Cache: {}",
@@ -7205,6 +8125,38 @@ fn render_github_comment(report: &Report) -> String {
                 "(ok)"
             }
         ));
+    }
+
+    lines.push(String::new());
+    lines.push("### Policy authority".to_string());
+    lines.push(format!("- Trusted: `{}`", report.policy_authority.trusted));
+    lines.push(format!("- Digest: `{}`", report.policy_authority.digest));
+    if report.policy_authority.sources.is_empty() {
+        lines.push("- Sources: none".to_string());
+    } else {
+        lines.push("- Sources:".to_string());
+        for source in &report.policy_authority.sources {
+            lines.push(format!(
+                "  - `{}` ref=`{}` path=`{}` trusted=`{}` signature_verified=`{}`",
+                source.kind,
+                source.ref_name.as_deref().unwrap_or("-"),
+                source.path.as_deref().unwrap_or("-"),
+                source.trusted,
+                source.signature_verified
+            ));
+        }
+    }
+    if report.policy_authority.pr_overlay.present {
+        lines.push(format!(
+            "- PR overlay accepted: `{}`",
+            report.policy_authority.pr_overlay.accepted_keys.join(", ")
+        ));
+        lines.push(format!(
+            "- PR overlay rejected: `{}`",
+            report.policy_authority.pr_overlay.rejected_keys.join(", ")
+        ));
+    } else {
+        lines.push("- PR overlay: none".to_string());
     }
 
     lines.push(String::new());
@@ -7310,7 +8262,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser as _;
-    use patchgate_config::Config;
+    use patchgate_config::{Config, PolicyAuthority, PolicyAuthorityFailure};
     use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
     use patchgate_github::PublishAuth;
     use serde_json::Value;
@@ -7322,16 +8274,17 @@ mod tests {
         build_history_trend, bundle_catalog_artifact_summary, changed_file_limit_fail_open_report,
         ci_template_catalog, delivery_bridge_headers, delivery_bridge_metadata,
         detect_head_sha_from_env, detect_pr_number_from_env, detect_sandbox_capabilities,
-        exception_expired, exception_governance_artifact_summary, gate_exit_code,
-        is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
+        effective_policy_hash, exception_expired, exception_governance_artifact_summary,
+        gate_exit_code, is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
         notification_payload, parse_mode, parse_policy_preset, parse_scope,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
-        registry_provenance_artifact_summary, render_contract_diff_report_json,
-        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        policy_authority_relative_path, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, registry_provenance_artifact_summary,
+        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
+        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -7339,11 +8292,20 @@ mod tests {
         PolicyDiffContractArgs, PolicyExitCode, PolicyLintArgs, PolicyVerifyV1Args,
         PolicyVerifyV2Args, PublishRequestInput, ReadinessProfile, ResolvedScanOptions,
         RetryPolicy, ScanArgs, ScanError, ScanErrorKind, ScanMetricRecord, ScopeMode,
-        WebhookEnvelope,
+        WebhookEnvelope, DEFAULT_GITHUB_CHECK_NAME,
     };
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{ts}-{seq}", std::process::id()))
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
@@ -7422,6 +8384,12 @@ mod tests {
             format: None,
             scope: None,
             mode: None,
+            base_ref: None,
+            protected_policy_ref: None,
+            org_policy_bundle: None,
+            org_policy_bundle_signature: None,
+            org_policy_public_key_env: None,
+            allow_untrusted_policy_for_local_enforce: false,
             threshold: None,
             max_changed_files: None,
             on_exceed: None,
@@ -7788,7 +8756,7 @@ mod tests {
         assert_eq!(req.repo, "env/repo");
         assert_eq!(req.pr_number, 88);
         assert_eq!(req.head_sha, "event-sha-88");
-        assert_eq!(req.check_name, "patchgate");
+        assert_eq!(req.check_name, DEFAULT_GITHUB_CHECK_NAME);
 
         env::remove_var("GITHUB_EVENT_PATH");
         env::remove_var("GITHUB_REPOSITORY");
@@ -8311,6 +9279,36 @@ mod tests {
     }
 
     #[test]
+    fn effective_policy_hash_includes_authority_state() {
+        let cfg = Config::default();
+        let mut trusted_authority = PolicyAuthority {
+            trusted: true,
+            digest: "sha256:same-policy".to_string(),
+            ..PolicyAuthority::default()
+        };
+        trusted_authority.diagnostics.clear();
+        let mut untrusted_authority = trusted_authority.clone();
+        untrusted_authority.trusted = false;
+
+        let trusted_hash =
+            effective_policy_hash(&cfg, &trusted_authority, &[]).expect("trusted hash");
+        let untrusted_hash =
+            effective_policy_hash(&cfg, &untrusted_authority, &[]).expect("untrusted hash");
+        assert_ne!(trusted_hash, untrusted_hash);
+
+        let failure_hash = effective_policy_hash(
+            &cfg,
+            &trusted_authority,
+            &[PolicyAuthorityFailure {
+                code: "untrusted_policy_in_enforce".to_string(),
+                message: "blocked".to_string(),
+            }],
+        )
+        .expect("failure hash");
+        assert_ne!(trusted_hash, failure_hash);
+    }
+
+    #[test]
     fn cache_corruption_detector_matches_known_messages() {
         let err = anyhow::anyhow!("SQLite error: file is not a database");
         assert!(is_likely_cache_corruption(&err));
@@ -8437,6 +9435,31 @@ mod tests {
         let resolved =
             resolve_policy_path(&repo_root, Some(&global), Some(&subcmd)).expect("resolved path");
         assert_eq!(resolved, repo_root.join("subcmd.toml"));
+    }
+
+    #[test]
+    fn policy_authority_relative_path_rejects_external_absolute_policy_path() {
+        let repo_root = temp_path("patchgate-policy-root");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let external = repo_root
+            .parent()
+            .expect("repo parent")
+            .join("external-policy.toml");
+        let err = policy_authority_relative_path(&repo_root, &external)
+            .expect_err("external absolute policy path must be rejected");
+        assert!(err.to_string().contains("must be inside repository root"));
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_authority_relative_path_rejects_parent_traversal() {
+        let repo_root = temp_path("patchgate-policy-root");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let traversal = PathBuf::from("../outside-policy.toml");
+        let err = policy_authority_relative_path(&repo_root, &traversal)
+            .expect_err("parent traversal must be rejected");
+        assert!(err.to_string().contains("must be inside repository root"));
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]
