@@ -6200,21 +6200,38 @@ fn policy_authority_candidate_paths(
 }
 
 fn policy_authority_relative_path(repo_root: &Path, policy_path: &Path) -> Result<String> {
-    if policy_path.is_absolute() {
-        let relative = policy_path.strip_prefix(repo_root).with_context(|| {
-            format!(
-                "policy path {} must be inside repository root {} for trusted ref resolution",
-                policy_path.display(),
-                repo_root.display()
-            )
-        })?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", policy_path.display()))?;
-        Ok(relative.replace('\\', "/"))
+    let repo_root = if repo_root.is_absolute() {
+        repo_root.to_path_buf()
     } else {
-        Ok(policy_path.to_string_lossy().replace('\\', "/"))
-    }
+        std::env::current_dir()?.join(repo_root)
+    };
+    let repo_root = normalize_absolute_path(&repo_root);
+    let policy_path = if policy_path.is_absolute() {
+        policy_path.to_path_buf()
+    } else {
+        repo_root.join(policy_path)
+    };
+    let policy_path = normalize_absolute_path(&policy_path);
+    let policy_path = if policy_path
+        .try_exists()
+        .with_context(|| format!("check policy file {}", policy_path.display()))?
+    {
+        fs::canonicalize(&policy_path)
+            .with_context(|| format!("canonicalize policy file {}", policy_path.display()))?
+    } else {
+        policy_path
+    };
+    let relative = policy_path.strip_prefix(&repo_root).with_context(|| {
+        format!(
+            "policy path {} must be inside repository root {} for trusted ref resolution",
+            policy_path.display(),
+            repo_root.display()
+        )
+    })?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", policy_path.display()))?;
+    Ok(relative.replace('\\', "/"))
 }
 
 fn read_optional_policy_file(path: Option<&Path>) -> Result<Option<String>> {
@@ -8257,6 +8274,15 @@ mod tests {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    fn temp_path(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{ts}-{seq}", std::process::id()))
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -9389,11 +9415,27 @@ mod tests {
 
     #[test]
     fn policy_authority_relative_path_rejects_external_absolute_policy_path() {
-        let repo_root = PathBuf::from("/tmp/patchgate-repo");
-        let external = PathBuf::from("/tmp/external-policy.toml");
+        let repo_root = temp_path("patchgate-policy-root");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let external = repo_root
+            .parent()
+            .expect("repo parent")
+            .join("external-policy.toml");
         let err = policy_authority_relative_path(&repo_root, &external)
             .expect_err("external absolute policy path must be rejected");
         assert!(err.to_string().contains("must be inside repository root"));
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_authority_relative_path_rejects_parent_traversal() {
+        let repo_root = temp_path("patchgate-policy-root");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let traversal = PathBuf::from("../outside-policy.toml");
+        let err = policy_authority_relative_path(&repo_root, &traversal)
+            .expect_err("parent traversal must be rejected");
+        assert!(err.to_string().contains("must be inside repository root"));
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]
