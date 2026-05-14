@@ -67,7 +67,7 @@ enum Command {
     History(HistoryArgs),
 
     /// Validate and migrate policy files
-    Policy(PolicyArgs),
+    Policy(Box<PolicyArgs>),
 
     /// Manage external plugin templates
     Plugin(PluginArgs),
@@ -483,6 +483,10 @@ struct PolicyVerifyV2Args {
     /// Output format: text|json
     #[arg(long, default_value = "text")]
     format: String,
+
+    /// Readiness profile: standard|ga|lts
+    #[arg(long, default_value = "standard")]
+    readiness_profile: String,
 
     /// Generic provider v2 or dual artifact to validate (repeatable)
     #[arg(long = "provider-input")]
@@ -1125,7 +1129,7 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         Command::Policy(policy) => {
-            let code = execute_policy(&repo_root, cli.config.as_deref(), policy);
+            let code = execute_policy(&repo_root, cli.config.as_deref(), *policy);
             std::process::exit(code);
         }
         Command::Plugin(plugin) => {
@@ -2043,6 +2047,7 @@ struct V2ReadinessReport {
     ready: bool,
     policy_path: String,
     policy_version: u32,
+    readiness_profile: String,
     v1_rc_frozen: bool,
     v1_strict_compatibility: bool,
     v2_shadow_mode: bool,
@@ -2054,6 +2059,9 @@ struct V2ReadinessReport {
     audit_schema_version: u8,
     audit_v2_schema_version: u8,
     audit_v2_output_enabled: bool,
+    lts_active: bool,
+    lts_branch: String,
+    lts_security_sla_hours: u16,
     provider_artifact_ready: Option<bool>,
     audit_dual_write_artifact_ready: Option<bool>,
     plugin_shadow_sample_ready: Option<bool>,
@@ -2145,6 +2153,36 @@ impl ReadinessProfile {
             Self::Strict => "strict",
             Self::Lts => "lts",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2ReadinessProfile {
+    Standard,
+    Ga,
+    Lts,
+}
+
+impl V2ReadinessProfile {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "standard" => Ok(Self::Standard),
+            "ga" => Ok(Self::Ga),
+            "lts" => Ok(Self::Lts),
+            other => Err(format!("`{other}` (expected: standard|ga|lts)")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Ga => "ga",
+            Self::Lts => "lts",
+        }
+    }
+
+    fn requires_v2_lts(self) -> bool {
+        matches!(self, Self::Ga | Self::Lts)
     }
 }
 
@@ -2372,12 +2410,20 @@ fn run_policy_verify_v2(
             return map_config_error_to_policy_exit(&err);
         }
     };
+    let readiness_profile = match V2ReadinessProfile::parse(args.readiness_profile.as_str()) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("patchgate policy verify-v2 error: invalid --readiness-profile: {err}");
+            return PolicyExitCode::ReadOrParse;
+        }
+    };
 
     let artifact_context = build_v2_artifact_context(repo_root, &args);
     let report = build_v2_readiness_report(
         repo_root,
         policy_path.as_path(),
         &loaded.config,
+        readiness_profile,
         artifact_context,
     );
     if let Err(err) = print_v2_readiness_report(&report, args.format.as_str()) {
@@ -3221,6 +3267,7 @@ fn build_v2_readiness_report(
     repo_root: &Path,
     policy_path: &Path,
     cfg: &Config,
+    readiness_profile: V2ReadinessProfile,
     artifact_context: V2ArtifactContext,
 ) -> V2ReadinessReport {
     let mut warnings = Vec::new();
@@ -3232,6 +3279,8 @@ fn build_v2_readiness_report(
     let bridge_mode = cfg.compatibility.v2.bridge_mode.as_str();
     let uses_generic_provider = cfg.integrations.ci.provider == "generic";
     let audit_v2_output_enabled = !cfg.observability.audit_v2_jsonl_path.trim().is_empty();
+    let lts_branch_ready = cfg.release.lts.branch == "lts/v2";
+    let lts_sla_ready = cfg.release.lts.security_sla_hours <= 72;
 
     if !cfg.compatibility.v1.rc_frozen {
         warnings.push("verify-v2 requires compatibility.v1.rc_frozen=true".to_string());
@@ -3313,6 +3362,24 @@ fn build_v2_readiness_report(
                 .to_string(),
         );
     }
+    if readiness_profile.requires_v2_lts() {
+        if !cfg.release.lts.active {
+            warnings.push("v2 GA/LTS readiness requires release.lts.active=true".to_string());
+            next_actions.push("Enable release.lts before promoting the v2 GA packet.".to_string());
+        }
+        if !lts_branch_ready {
+            warnings.push("v2 GA/LTS readiness requires release.lts.branch=lts/v2".to_string());
+            next_actions
+                .push("Set release.lts.branch to `lts/v2` for the v2 LTS line.".to_string());
+        }
+        if !lts_sla_ready {
+            warnings.push(
+                "v2 GA/LTS readiness expects release.lts.security_sla_hours <= 72".to_string(),
+            );
+            next_actions
+                .push("Set release.lts.security_sla_hours to 72 or lower for v2 LTS.".to_string());
+        }
+    }
 
     let ready = cfg.policy_version == POLICY_VERSION_CURRENT
         && cfg.compatibility.v1.rc_frozen
@@ -3324,7 +3391,9 @@ fn build_v2_readiness_report(
             || cfg.integrations.ci.generic_schema != "v1")
         && (!matches!(bridge_mode, "audit" | "full") || audit_v2_output_enabled)
         && migration_guide_exists
-        && artifact_context.ready();
+        && artifact_context.ready()
+        && (!readiness_profile.requires_v2_lts()
+            || (cfg.release.lts.active && lts_branch_ready && lts_sla_ready));
 
     if ready {
         if artifact_context.has_checks() {
@@ -3339,6 +3408,7 @@ fn build_v2_readiness_report(
         ready,
         policy_path: policy_path.display().to_string(),
         policy_version: cfg.policy_version,
+        readiness_profile: readiness_profile.as_str().to_string(),
         v1_rc_frozen: cfg.compatibility.v1.rc_frozen,
         v1_strict_compatibility: !cfg.compatibility.v1.allow_legacy_config_names,
         v2_shadow_mode: cfg.compatibility.v2.shadow_mode,
@@ -3350,6 +3420,9 @@ fn build_v2_readiness_report(
         audit_schema_version: cfg.observability.audit_schema_version,
         audit_v2_schema_version: cfg.observability.audit_v2_schema_version,
         audit_v2_output_enabled,
+        lts_active: cfg.release.lts.active,
+        lts_branch: cfg.release.lts.branch.clone(),
+        lts_security_sla_hours: cfg.release.lts.security_sla_hours,
         provider_artifact_ready: artifact_context.provider_artifact_ready,
         audit_dual_write_artifact_ready: artifact_context.audit_dual_write_artifact_ready,
         plugin_shadow_sample_ready: artifact_context.plugin_shadow_sample_ready,
@@ -3377,6 +3450,7 @@ fn print_v2_readiness_report(
             println!("- ready: {}", report.ready);
             println!("- policy_path: {}", report.policy_path);
             println!("- policy_version: {}", report.policy_version);
+            println!("- readiness_profile: {}", report.readiness_profile);
             println!("- v1_rc_frozen: {}", report.v1_rc_frozen);
             println!(
                 "- v1_strict_compatibility: {}",
@@ -3399,6 +3473,12 @@ fn print_v2_readiness_report(
             println!(
                 "- audit_v2_output_enabled: {}",
                 report.audit_v2_output_enabled
+            );
+            println!("- lts_active: {}", report.lts_active);
+            println!("- lts_branch: {}", report.lts_branch);
+            println!(
+                "- lts_security_sla_hours: {}",
+                report.lts_security_sla_hours
             );
             print_optional_bool("- provider_artifact_ready", report.provider_artifact_ready);
             print_optional_bool(
@@ -8574,6 +8654,7 @@ bridge_mode = "off"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: Vec::new(),
                 audit_input: None,
                 audit_v2_input: None,
@@ -8630,6 +8711,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: Vec::new(),
                 audit_input: None,
                 audit_v2_input: None,
@@ -8718,6 +8800,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "json".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: vec![PathBuf::from("artifacts/provider-dual.json")],
                 audit_input: Some(PathBuf::from("artifacts/scan-audit.jsonl")),
                 audit_v2_input: Some(PathBuf::from("artifacts/scan-audit-v2.jsonl")),
@@ -8795,6 +8878,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: Vec::new(),
                 audit_input: None,
                 audit_v2_input: None,
@@ -8978,6 +9062,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: vec![PathBuf::from("artifacts/provider-v1.json")],
                 audit_input: None,
                 audit_v2_input: None,
@@ -9041,6 +9126,7 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
                 provider_inputs: Vec::new(),
                 audit_input: None,
                 audit_v2_input: None,
@@ -9097,6 +9183,114 @@ migration_guide_path = "docs/v2-migration-alpha.md"
                 path: Some(policy_path),
                 policy_preset: None,
                 format: "text".to_string(),
+                readiness_profile: "standard".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::Ok);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn policy_verify_v2_ga_profile_requires_lts_v2_branch() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut repo_root = std::env::temp_dir();
+        repo_root.push(format!("patchgate-cli-policy-verify-v2-ga-lts-{seq}"));
+        fs::create_dir_all(&repo_root).expect("create temp root");
+
+        let guide_path = repo_root.join("docs/v2-migration-alpha.md");
+        fs::create_dir_all(guide_path.parent().expect("guide parent")).expect("create guide dir");
+        fs::write(&guide_path, "# v2 migration\n").expect("write guide");
+
+        let policy_path = repo_root.join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[release.lts]
+active = true
+branch = "lts/v1"
+security_sla_hours = 72
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path.clone()),
+                policy_preset: None,
+                format: "text".to_string(),
+                readiness_profile: "ga".to_string(),
+                provider_inputs: Vec::new(),
+                audit_input: None,
+                audit_v2_input: None,
+                plugin_shadow_inputs: Vec::new(),
+                webhook_envelope_inputs: Vec::new(),
+                notification_envelope_inputs: Vec::new(),
+                bundle_catalog_input: None,
+                registry_input: None,
+                exceptions_input: None,
+            },
+        );
+        assert_eq!(code, PolicyExitCode::MigrationRequired);
+
+        fs::write(
+            &policy_path,
+            r#"
+policy_version = 2
+[observability]
+audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"
+audit_v2_schema_version = 2
+[integrations.ci]
+provider = "generic"
+generic_schema = "dual"
+[release.lts]
+active = true
+branch = "lts/v2"
+security_sla_hours = 72
+[compatibility.v1]
+rc_frozen = true
+allow_legacy_config_names = false
+[compatibility.v2]
+shadow_mode = true
+bridge_mode = "full"
+migration_guide_path = "docs/v2-migration-alpha.md"
+"#,
+        )
+        .expect("write v2 lts policy");
+
+        let code = run_policy_verify_v2(
+            &repo_root,
+            None,
+            PolicyVerifyV2Args {
+                path: Some(policy_path),
+                policy_preset: None,
+                format: "json".to_string(),
+                readiness_profile: "ga".to_string(),
                 provider_inputs: Vec::new(),
                 audit_input: None,
                 audit_v2_input: None,

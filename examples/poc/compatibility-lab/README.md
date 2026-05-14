@@ -15,6 +15,11 @@ v1 / v2 bridge の fixture を手元で確認するための最小 lab です。
 - `rc-security-review.md`
 - `bench-compare.json`
 - `policy.v2.toml`
+- `v2-ga-packet.md`
+- `ecosystem-migration-completion.md`
+- `dual-run-decommission.md`
+- `post-ga-telemetry-review.md`
+- `retrospective-cleanup-queue.md`
 - `plugin-shadow-input.v2.json`
 - `webhook-shadow-envelope.json`
 - `notification-shadow-envelope.json`
@@ -36,6 +41,7 @@ cargo run -p xtask -- ops shadow-review \
 
 cargo run -p patchgate-cli -- policy verify-v2 \
   --path examples/poc/compatibility-lab/policy.v2.toml \
+  --readiness-profile ga \
   --provider-input examples/poc/compatibility-lab/provider-dual.json \
   --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
   --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
@@ -112,4 +118,80 @@ cargo run -p xtask -- ops rc-readiness \
   --freeze-boundary-path target/compatibility-lab/v1.1-freeze-boundary.md \
   --sunset-notice-path docs/21_v1_sunset_notice.md \
   --output target/compatibility-lab/v2-rc-readiness.md
+
+cat > target/compatibility-lab/v2-ga-go-no-go.md <<'EOF'
+# V2 GA Go / No-Go Review
+
+## Required Evidence
+- RC readiness: target/compatibility-lab/v2-rc-readiness.md
+- rollback packet: target/compatibility-lab/rollback-packet.json
+- LTS policy: examples/poc/compatibility-lab/policy.v2.toml
+- v1 sunset notice: docs/21_v1_sunset_notice.md
+- support path: docs/22_v2_support_model.md
+
+## Decision
+- [x] Go
+- [ ] No-go
+EOF
+
+cargo run -p xtask -- ops ga-packet \
+  --metrics-input examples/poc/compatibility-lab/scan-metrics.jsonl \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --replay-summary-input examples/poc/compatibility-lab/replay-summary.json \
+  --policy-input examples/poc/compatibility-lab/policy.v2.toml \
+  --rc-readiness-input target/compatibility-lab/v2-rc-readiness.md \
+  --go-no-go-path target/compatibility-lab/v2-ga-go-no-go.md \
+  --fleet-review-input target/compatibility-lab/fleet-review.md \
+  --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+  --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --ops-handbook-path docs/19_v2_ops_handbook.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --phase201-backcast-path docs/20_phase201_plus_backcast.md \
+  --output target/compatibility-lab/v2-ga-packet.md
+
+cargo run -p xtask -- ops migration-completion \
+  --metrics-input examples/poc/compatibility-lab/scan-metrics.jsonl \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --provider-input examples/poc/compatibility-lab/provider-dual.json \
+  --fleet-review-input target/compatibility-lab/fleet-review.md \
+  --rc-readiness-input target/compatibility-lab/v2-rc-readiness.md \
+  --migration-drill-input target/compatibility-lab/migration-drill.json \
+  --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+  --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --output target/compatibility-lab/ecosystem-migration-completion.md
+
+cargo run -p xtask -- ops dual-run-decommission \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --replay-summary-input examples/poc/compatibility-lab/replay-summary.json \
+  --provider-input examples/poc/compatibility-lab/provider-dual.json \
+  --rollback-packet-input target/compatibility-lab/rollback-packet.json \
+  --migration-drill-input target/compatibility-lab/migration-drill.json \
+  --rc-readiness-input target/compatibility-lab/v2-rc-readiness.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --output target/compatibility-lab/dual-run-decommission.md
+
+cargo run -p xtask -- ops post-ga-telemetry \
+  --metrics-input examples/poc/compatibility-lab/scan-metrics.jsonl \
+  --audit-input examples/poc/compatibility-lab/audit-v1.jsonl \
+  --audit-v2-input examples/poc/compatibility-lab/audit-v2.jsonl \
+  --replay-summary-input examples/poc/compatibility-lab/replay-summary.json \
+  --fleet-review-input target/compatibility-lab/fleet-review.md \
+  --ga-packet-input target/compatibility-lab/v2-ga-packet.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --output target/compatibility-lab/post-ga-telemetry-review.md
+
+cargo run -p xtask -- ops retrospective-cleanup \
+  --migration-completion-input target/compatibility-lab/ecosystem-migration-completion.md \
+  --dual-run-decommission-input target/compatibility-lab/dual-run-decommission.md \
+  --post-ga-telemetry-input target/compatibility-lab/post-ga-telemetry-review.md \
+  --ops-handbook-path docs/19_v2_ops_handbook.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --phase201-backcast-path docs/20_phase201_plus_backcast.md \
+  --output target/compatibility-lab/retrospective-cleanup-queue.md
 ```

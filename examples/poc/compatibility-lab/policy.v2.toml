@@ -8,6 +8,12 @@ audit_v2_schema_version = 2
 provider = "generic"
 generic_schema = "dual"
 
+[release.lts]
+active = true
+branch = "lts/v2"
+security_sla_hours = 72
+backport_labels = ["backport/lts-v2"]
+
 [compatibility.v1]
 rc_frozen = true
 allow_legacy_config_names = false

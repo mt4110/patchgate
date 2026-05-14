@@ -51,6 +51,7 @@ patchgate policy verify-v1 --path policy.toml --autofix-output artifacts/policy.
 - Migration drill: `cargo run -p xtask -- ops migration-drill --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --provider-input artifacts/provider-dual.json --rollback-packet-input artifacts/rollback-packet.json --output artifacts/migration-drill.json`
 - SIEM handoff: `cargo run -p xtask -- ops siem-handoff --audit-v2-input artifacts/scan-audit-v2.jsonl --output artifacts/siem-handoff.jsonl`
 - RC/GA packets: `cargo run -p xtask -- ops rc-readiness --contract-freeze-input artifacts/diff-contract.json --migration-drill-input artifacts/migration-drill.json --rollback-packet-input artifacts/rollback-packet.json --fleet-review-input artifacts/fleet-review.md ...` / `cargo run -p xtask -- ops ga-packet --rc-readiness-input artifacts/v2-rc-readiness.md --go-no-go-path artifacts/v2-ga-go-no-go.md ...`
+- Post-GA handoff: `cargo run -p xtask -- ops migration-completion ...`, `cargo run -p xtask -- ops dual-run-decommission ...`, `cargo run -p xtask -- ops post-ga-telemetry ...`, `cargo run -p xtask -- ops retrospective-cleanup ...`
 
 ## 7) SDK template
 

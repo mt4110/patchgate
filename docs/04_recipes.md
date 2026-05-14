@@ -323,6 +323,7 @@ cargo run -p xtask -- ops ga-packet \
   --policy-input artifacts/policy.v2.toml \
   --rc-readiness-input artifacts/v2-rc-readiness.md \
   --go-no-go-path artifacts/v2-ga-go-no-go.md \
+  --fleet-review-input artifacts/fleet-review.md \
   --migration-guide-path docs/16_v2_migration_guide_alpha.md \
   --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
   --ops-handbook-path docs/19_v2_ops_handbook.md \
@@ -330,4 +331,54 @@ cargo run -p xtask -- ops ga-packet \
   --sunset-notice-path docs/21_v1_sunset_notice.md \
   --phase201-backcast-path docs/20_phase201_plus_backcast.md \
   --output artifacts/v2-ga-packet.md
+```
+
+`artifacts/policy.v2.toml` は `[release.lts] active = true`, `branch = "lts/v2"`, `security_sla_hours <= 72` を満たしている必要があります。
+
+### GA後 handoff artifact を生成
+
+```bash
+cargo run -p xtask -- ops migration-completion \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --provider-input artifacts/provider-dual.json \
+  --fleet-review-input artifacts/fleet-review.md \
+  --rc-readiness-input artifacts/v2-rc-readiness.md \
+  --migration-drill-input artifacts/migration-drill.json \
+  --migration-guide-path docs/16_v2_migration_guide_alpha.md \
+  --candidate-checklist-path docs/18_v2_candidate_release_checklist.md \
+  --output artifacts/ecosystem-migration-completion.md
+
+cargo run -p xtask -- ops dual-run-decommission \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+  --provider-input artifacts/provider-dual.json \
+  --rollback-packet-input artifacts/rollback-packet.json \
+  --migration-drill-input artifacts/migration-drill.json \
+  --rc-readiness-input artifacts/v2-rc-readiness.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --output artifacts/dual-run-decommission.md
+
+cargo run -p xtask -- ops post-ga-telemetry \
+  --metrics-input artifacts/scan-metrics.jsonl \
+  --audit-input artifacts/scan-audit.jsonl \
+  --audit-v2-input artifacts/scan-audit-v2.jsonl \
+  --replay-summary-input artifacts/dead-letter-rewrite-summary.json \
+  --fleet-review-input artifacts/fleet-review.md \
+  --ga-packet-input artifacts/v2-ga-packet.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --output artifacts/post-ga-telemetry-review.md
+
+cargo run -p xtask -- ops retrospective-cleanup \
+  --migration-completion-input artifacts/ecosystem-migration-completion.md \
+  --dual-run-decommission-input artifacts/dual-run-decommission.md \
+  --post-ga-telemetry-input artifacts/post-ga-telemetry-review.md \
+  --ops-handbook-path docs/19_v2_ops_handbook.md \
+  --support-model-path docs/22_v2_support_model.md \
+  --sunset-notice-path docs/21_v1_sunset_notice.md \
+  --phase201-backcast-path docs/20_phase201_plus_backcast.md \
+  --output artifacts/retrospective-cleanup-queue.md
 ```

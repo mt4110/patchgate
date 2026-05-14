@@ -33,8 +33,10 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "$API_URL" | jq -r '.[].name')
           echo "labels: $labels"
-          if ! echo "$labels" | grep -Eq '^backport/lts-v1$'; then
-            echo "LTS PR requires label: backport/lts-v1"
+          base_ref="${{ github.event.pull_request.base.ref }}"
+          required_label="backport/${base_ref//\//-}"
+          if ! echo "$labels" | grep -Fxq "$required_label"; then
+            echo "LTS PR requires label: ${required_label}"
             exit 1
           fi
 
@@ -75,7 +77,8 @@ jobs:
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.base.ref == 'main' &&
-      contains(join(github.event.pull_request.labels.*.name, ','), 'backport/lts-v1')
+      (contains(github.event.pull_request.labels.*.name, 'backport/lts-v1') ||
+       contains(github.event.pull_request.labels.*.name, 'backport/lts-v2'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,11 +93,30 @@ jobs:
       - name: Attempt auto backport
         env:
           SOURCE_PR: ${{ github.event.pull_request.number }}
-          TARGET_BRANCH: lts/v1
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          labels_lines="$(printf '%s' "$LABELS" | tr ',' '\n')"
+          has_lts_v1=false
+          has_lts_v2=false
+          if echo "$labels_lines" | grep -Fxq 'backport/lts-v1'; then
+            has_lts_v1=true
+          fi
+          if echo "$labels_lines" | grep -Fxq 'backport/lts-v2'; then
+            has_lts_v2=true
+          fi
+          if [ "$has_lts_v1" = true ] && [ "$has_lts_v2" = true ]; then
+            echo "Choose exactly one LTS backport target label."
+            exit 1
+          fi
+          if [ "$has_lts_v2" = true ]; then
+            TARGET_BRANCH="lts/v2"
+          else
+            TARGET_BRANCH="lts/v1"
+          fi
+          echo "TARGET_BRANCH=${TARGET_BRANCH}" >> "$GITHUB_ENV"
           commits_api="${{ github.api_url }}/repos/${{ github.repository }}/pulls/${SOURCE_PR}/commits?per_page=100"
           commits_file="artifacts/pr-commits.txt"
           : > "$commits_file"
@@ -119,7 +141,8 @@ jobs:
             exit 1
           fi
           source_sha="$(tail -n1 "$commits_file")"
-          backport_branch="backport/pr-${SOURCE_PR}"
+          target_slug="${TARGET_BRANCH//\//-}"
+          backport_branch="backport/${target_slug}-pr-${SOURCE_PR}"
           git fetch origin "$TARGET_BRANCH"
           git checkout -B "$backport_branch" "origin/$TARGET_BRANCH"
           while IFS= read -r commit_sha; do
@@ -149,10 +172,10 @@ jobs:
           SOURCE_PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          existing=$(gh pr list --base lts/v1 --head "$BACKPORT_BRANCH" --json number --jq '.[0].number // empty')
+          existing=$(gh pr list --base "$TARGET_BRANCH" --head "$BACKPORT_BRANCH" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
             gh pr create \
-              --base lts/v1 \
+              --base "$TARGET_BRANCH" \
               --head "$BACKPORT_BRANCH" \
               --title "LTS backport: #${SOURCE_PR}" \
               --body "Auto-generated backport PR from #${SOURCE_PR}."
