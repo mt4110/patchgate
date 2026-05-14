@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-14T00:00:00Z",
+  "drill_id": "phase181-large-scale-migration-drill",
+  "repos_total": 1,
+  "repos_attempted": 1,
+  "repos_succeeded": 1,
+  "repos_failed": 0,
+  "provider_artifacts_checked": 1,
+  "audit_events_replayed": 1,
+  "rollback_rehearsed": true,
+  "dry_run": false,
+  "owners": ["platform-governance"],
+  "blockers": []
+}

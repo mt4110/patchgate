@@ -149,7 +149,9 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
+- `--enforce`
 - v1 contract と v2 bridge contract の差分を要約
+- `--enforce` は `breaking_change_gate_ready=false` のとき migration-required exit で止める
 
 ### `patchgate plugin init`
 

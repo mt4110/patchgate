@@ -1,0 +1,11 @@
+{
+  "case_name": "ci-scale-10k",
+  "baseline_duration_ms": 130,
+  "current_duration_ms": 120,
+  "duration_delta_pct": -7.69,
+  "baseline_changed_files": 10000,
+  "current_changed_files": 10000,
+  "max_regression_pct": 40.0,
+  "regressed": false,
+  "fingerprint": "d8968713495427af4afe43548698f32b61893b0cabbe562cd1ba5972e46924f2"
+}

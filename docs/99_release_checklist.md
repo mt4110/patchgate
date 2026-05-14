@@ -61,8 +61,16 @@ CI/Workflowで自動化済み:
   - [ ] deferred item は owner phase または non-goal rationale を持つ
 - [ ] **V2 Bridge Evidence**: `verify-v2` / `diff-contract` / `shadow-review.md` を確認
 - [ ] **Fleet Governance Evidence**: `fleet-review.md` で bundle / provider negotiation / provenance / retention / rollout wave / exception / segment cost / Phase181+ RC prep を確認
-- [ ] **RC Evidence**: `v2-rc-readiness.md` で candidate gate が green
-- [ ] **GA Evidence**: `v2-ga-packet.md` で LTS / support / sunset / decommission を確認
+- [ ] **RC Contract Freeze**: `diff-contract.json` が `breaking_change_gate_ready = true`
+  - [ ] `patchgate policy diff-contract --format json --enforce`
+- [ ] **RC Evidence**: `v2-rc-readiness.md` で contract freeze / migration drill / audit export v2 / rollback / security / benchmark-cost / countdown gate が green
+  - [ ] `cargo run -p xtask -- ops rollback-packet --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --provider-input artifacts/provider-dual.json --output artifacts/rollback-packet.json`
+  - [ ] `migration-drill.json` は non-dry-run で failed repo 0
+  - [ ] `cargo run -p xtask -- ops migration-drill --metrics-input artifacts/scan-metrics.jsonl --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --provider-input artifacts/provider-dual.json --rollback-packet-input artifacts/rollback-packet.json --output artifacts/migration-drill.json`
+  - [ ] `rollback-packet.json` は `bridge_mode = "off"` / `generic_schema = "v1"` へ戻せる
+  - [ ] `fleet-review.md` は repo / segment cost が green
+- [ ] **GA Evidence**: `v2-ga-packet.md` で RC readiness / go-no-go / LTS / support / sunset / decommission を確認
+  - [ ] manual release workflow input は `rc_security_decision=continue` / `ga_decision=go`
 - [ ] **Docs Sync**: `docs/00..05/99` がCLI実装と一致
 
 ## Release

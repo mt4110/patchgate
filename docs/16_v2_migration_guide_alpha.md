@@ -29,6 +29,7 @@ audit_v2_schema_version = 2
 
 - `patchgate policy verify-v2 --format text`
 - `patchgate policy diff-contract --format text`
+- `patchgate policy diff-contract --format json --enforce > artifacts/diff-contract.json`
 - `patchgate policy verify-v2 --provider-input artifacts/provider-dual.json --audit-input artifacts/scan-audit.jsonl --audit-v2-input artifacts/scan-audit-v2.jsonl --plugin-shadow-input sdk/templates/python-plugin/sample-input.v2.json --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json --format text`
 - `cargo run -p xtask -- ops shadow-review --provider-input artifacts/provider-dual.json --webhook-envelope-input examples/poc/compatibility-lab/webhook-shadow-envelope.json --notification-envelope-input examples/poc/compatibility-lab/notification-shadow-envelope.json ...`
 
@@ -42,9 +43,13 @@ audit_v2_schema_version = 2
 - `compatibility-report.md` が `start-v2-seed`
 - audit drift が 0
 - `v1.1-freeze-boundary.md` の v2 option と risk register が RC gate に接続済み
+- `xtask ops migration-drill` で生成した `migration-drill.json` が non-dry-run / zero failed repo / rollback rehearsed
+- `rollback-packet.json` が `bridge_mode = "off"` / `generic_schema = "v1"` の復帰手順を保持
+- `v2-rc-readiness.md` が contract freeze / audit export v2 / security / cost を green として出力
 
 ## 5. Rollback
 
 - `bridge_mode = "off"` へ戻す
 - `generic_schema = "v1"` へ戻す
 - audit v2 artifact は保持しつつ、判定の主線を v1 に戻す
+- rollback packet を更新し、v1 audit を authoritative signal として再確認する
