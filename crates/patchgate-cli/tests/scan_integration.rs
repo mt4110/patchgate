@@ -654,6 +654,58 @@ fn scan_errors_when_explicit_config_file_is_missing() -> TestResult<()> {
 }
 
 #[test]
+fn scan_resolves_trusted_patchgate_toml_when_worktree_policy_is_deleted() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_file(
+        "patchgate.toml",
+        r#"
+policy_version = 2
+[output]
+mode = "warn"
+fail_threshold = 80
+"#,
+    )?;
+    repo.git(&["add", "patchgate.toml"])?;
+    repo.git(&["commit", "-qm", "add patchgate policy"])?;
+    fs::remove_file(repo.root().join("patchgate.toml"))?;
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--mode",
+            "warn",
+            "--format",
+            "json",
+            "--base-ref",
+            "HEAD",
+            "--no-cache",
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "scan should resolve trusted patchgate.toml: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let report: serde_json::Value = serde_json::from_str(&stdout)?;
+    let source_paths = report
+        .pointer("/policy_authority/sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing authority sources")?;
+    assert!(source_paths.iter().any(|source| {
+        source
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path == "patchgate.toml")
+    }));
+
+    Ok(())
+}
+
+#[test]
 fn enforce_scan_rejects_policy_changing_cli_override() -> TestResult<()> {
     let repo = TestRepo::create()?;
     repo.write_file(

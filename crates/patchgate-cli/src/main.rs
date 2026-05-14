@@ -1223,6 +1223,8 @@ struct HistoryTrendRow {
 type ScanResult<T> = std::result::Result<T, ScanError>;
 const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
 const DEFAULT_GITHUB_CHECK_NAME: &str = "patchgate";
+const POLICY_FILE_CANDIDATES: [&str; 4] =
+    ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"];
 const TRUST_BOUNDARY_DOCS_PATH: &str = "docs/trust-boundary.md";
 
 fn main() -> Result<()> {
@@ -2284,25 +2286,39 @@ fn resolve_policy_authority_from_common_with_preset(
     parse_mode(args.mode.as_str(), OptionSource::Cli).map_err(|err| anyhow!("{}", err.render()))?;
 
     let policy_path = resolve_policy_path(repo_root, config_override, args.path.as_deref());
-    let policy_rel = policy_authority_relative_path(repo_root, policy_path.as_deref())?;
-    let local_text = if let Some(head_ref) = args.head_ref.as_deref() {
-        read_git_file_at_ref(repo_root, head_ref, policy_rel.as_str(), false)?
+    let policy_candidates = policy_authority_candidate_paths(repo_root, policy_path.as_deref())?;
+    let local_policy = if let Some(head_ref) = args.head_ref.as_deref() {
+        read_git_file_at_ref_candidates(repo_root, head_ref, &policy_candidates, false)?
     } else {
         read_optional_policy_file(policy_path.as_deref())?
+            .map(|text| (policy_candidates[0].clone(), text))
     };
-    let local_source = local_text.map(|text| {
+    let mut resolved_policy_rel = local_policy
+        .as_ref()
+        .map(|(rel_path, _)| rel_path.clone())
+        .unwrap_or_else(|| policy_candidates[0].clone());
+    let local_source = local_policy.map(|(rel_path, text)| {
         PolicyAuthoritySourceInput::new("local_file", text)
             .with_ref(args.head_ref.clone())
-            .with_path(Some(policy_rel.clone()))
+            .with_path(Some(rel_path))
     });
 
     let base_branch = match args.base_ref.as_deref() {
-        Some(base_ref) => read_git_file_at_ref(repo_root, base_ref, policy_rel.as_str(), true)?
-            .map(|text| {
-                PolicyAuthoritySourceInput::new("base_branch", text)
-                    .with_ref(Some(base_ref.to_string()))
-                    .with_path(Some(policy_rel.clone()))
-            }),
+        Some(base_ref) => {
+            let base_candidates = if policy_path.is_none() && local_source.is_some() {
+                vec![resolved_policy_rel.clone()]
+            } else {
+                policy_candidates.clone()
+            };
+            read_git_file_at_ref_candidates(repo_root, base_ref, &base_candidates, true)?.map(
+                |(rel_path, text)| {
+                    resolved_policy_rel = rel_path.clone();
+                    PolicyAuthoritySourceInput::new("base_branch", text)
+                        .with_ref(Some(base_ref.to_string()))
+                        .with_path(Some(rel_path))
+                },
+            )
+        }
         None => None,
     };
     let trusted_authority_config = base_branch
@@ -2330,12 +2346,22 @@ fn resolve_policy_authority_from_common_with_preset(
         .clone()
         .or_else(|| non_empty_string(authority_config.protected_policy_ref.as_str()));
     let protected_ref_source = match protected_ref.as_deref() {
-        Some(ref_name) => read_git_file_at_ref(repo_root, ref_name, policy_rel.as_str(), true)?
-            .map(|text| {
-                PolicyAuthoritySourceInput::new("protected_ref", text)
-                    .with_ref(Some(ref_name.to_string()))
-                    .with_path(Some(policy_rel.clone()))
-            }),
+        Some(ref_name) => {
+            let protected_candidates =
+                if policy_path.is_none() && (base_branch.is_some() || local_source.is_some()) {
+                    vec![resolved_policy_rel.clone()]
+                } else {
+                    policy_candidates.clone()
+                };
+            read_git_file_at_ref_candidates(repo_root, ref_name, &protected_candidates, true)?.map(
+                |(rel_path, text)| {
+                    resolved_policy_rel = rel_path.clone();
+                    PolicyAuthoritySourceInput::new("protected_ref", text)
+                        .with_ref(Some(ref_name.to_string()))
+                        .with_path(Some(rel_path))
+                },
+            )
+        }
         None => None,
     };
 
@@ -2392,7 +2418,7 @@ fn resolve_policy_authority_from_common_with_preset(
     .map_err(|err| anyhow!(err))?;
 
     Ok(PolicyAuthorityCliResolution {
-        policy_path: policy_rel,
+        policy_path: resolved_policy_rel,
         mode: args.mode.clone(),
         resolution,
     })
@@ -6139,7 +6165,7 @@ fn resolve_config_path(repo_root: &Path, override_path: Option<&Path>) -> Option
         return Some(repo_root.join(path));
     }
 
-    for candidate in ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"] {
+    for candidate in POLICY_FILE_CANDIDATES {
         let path = repo_root.join(candidate);
         if path.exists() {
             return Some(path);
@@ -6160,23 +6186,34 @@ fn resolve_policy_path(
     resolve_config_path(repo_root, config_override)
 }
 
-fn policy_authority_relative_path(repo_root: &Path, policy_path: Option<&Path>) -> Result<String> {
-    match policy_path {
-        Some(path) if path.is_absolute() => {
-            let relative = path.strip_prefix(repo_root).with_context(|| {
-                format!(
-                    "policy path {} must be inside repository root {} for trusted ref resolution",
-                    path.display(),
-                    repo_root.display()
-                )
-            })?;
-            let relative = relative
-                .to_str()
-                .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", path.display()))?;
-            Ok(relative.replace('\\', "/"))
-        }
-        Some(path) => Ok(path.to_string_lossy().replace('\\', "/")),
-        None => Ok("policy.toml".to_string()),
+fn policy_authority_candidate_paths(
+    repo_root: &Path,
+    policy_path: Option<&Path>,
+) -> Result<Vec<String>> {
+    if let Some(path) = policy_path {
+        return Ok(vec![policy_authority_relative_path(repo_root, path)?]);
+    }
+    Ok(POLICY_FILE_CANDIDATES
+        .iter()
+        .map(|candidate| candidate.to_string())
+        .collect())
+}
+
+fn policy_authority_relative_path(repo_root: &Path, policy_path: &Path) -> Result<String> {
+    if policy_path.is_absolute() {
+        let relative = policy_path.strip_prefix(repo_root).with_context(|| {
+            format!(
+                "policy path {} must be inside repository root {} for trusted ref resolution",
+                policy_path.display(),
+                repo_root.display()
+            )
+        })?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| anyhow!("policy path {} is not valid UTF-8", policy_path.display()))?;
+        Ok(relative.replace('\\', "/"))
+    } else {
+        Ok(policy_path.to_string_lossy().replace('\\', "/"))
     }
 }
 
@@ -6230,6 +6267,38 @@ fn read_git_file_at_ref(
     Err(anyhow!(
         "trusted policy ref `{ref_name}` is not available for `{rel_path}`: {stderr}"
     ))
+}
+
+fn read_git_file_at_ref_candidates(
+    repo_root: &Path,
+    ref_name: &str,
+    rel_paths: &[String],
+    missing_policy_is_error: bool,
+) -> Result<Option<(String, String)>> {
+    if rel_paths.len() == 1 {
+        let rel_path = rel_paths[0].clone();
+        return read_git_file_at_ref(
+            repo_root,
+            ref_name,
+            rel_path.as_str(),
+            missing_policy_is_error,
+        )
+        .map(|text| text.map(|text| (rel_path, text)));
+    }
+
+    for rel_path in rel_paths {
+        if let Some(text) = read_git_file_at_ref(repo_root, ref_name, rel_path.as_str(), false)? {
+            return Ok(Some((rel_path.clone(), text)));
+        }
+    }
+
+    if missing_policy_is_error && git_ref_exists(repo_root, ref_name)? {
+        return Err(anyhow!(
+            "trusted policy ref `{ref_name}` exists but none of the supported policy files are present: {}",
+            rel_paths.join(", ")
+        ));
+    }
+    Ok(None)
 }
 
 fn git_ref_exists(repo_root: &Path, ref_name: &str) -> Result<bool> {
@@ -9322,7 +9391,7 @@ mod tests {
     fn policy_authority_relative_path_rejects_external_absolute_policy_path() {
         let repo_root = PathBuf::from("/tmp/patchgate-repo");
         let external = PathBuf::from("/tmp/external-policy.toml");
-        let err = policy_authority_relative_path(&repo_root, Some(&external))
+        let err = policy_authority_relative_path(&repo_root, &external)
             .expect_err("external absolute policy path must be rejected");
         assert!(err.to_string().contains("must be inside repository root"));
     }
