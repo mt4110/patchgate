@@ -17,8 +17,23 @@ v2 GA 後の support / escalation ルールをまとめます。
 5. `rollback-packet.json` で復帰先が `bridge_mode = "off"` / `generic_schema = "v1"` になっているか確認
 6. rollback trigger に一致する場合は v1 audit を authoritative signal として戻す
 
+## Ownership
+
+- release owner: GA packet / LTS branch / release workflow の判断を持つ
+- support owner: support band triage と customer-facing escalation を持つ
+- security owner: security / critical fix と LTS backport SLA の判断を持つ
+- telemetry owner: post-GA telemetry review と regression handoff を持つ
+
 ## Response expectations
 
 - critical: 24h以内に一次判断
-- standard: 3営業日以内に triage
+- standard: 3 business days 以内に triage
 - advisory: 次回 roadmap review で整理
+
+## Escalation Artifacts
+
+- `artifacts/v2-ga-packet.md`
+- `artifacts/ecosystem-migration-completion.md`
+- `artifacts/dual-run-decommission.md`
+- `artifacts/post-ga-telemetry-review.md`
+- `artifacts/retrospective-cleanup-queue.md`

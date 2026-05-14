@@ -33,6 +33,9 @@ jobs:
           cp config/policy.toml.example artifacts/policy.lts.toml
           cp config/policy.toml.example artifacts/policy.v2.toml
           sed -i 's/^active = false$/active = true/' artifacts/policy.lts.toml
+          sed -i 's/^active = false$/active = true/' artifacts/policy.v2.toml
+          sed -i 's|^branch = "lts/v1"$|branch = "lts/v2"|' artifacts/policy.v2.toml
+          sed -i 's|^backport_labels = .*|backport_labels = ["backport/lts-v2"]|' artifacts/policy.v2.toml
           sed -i 's/^generic_schema = .*/generic_schema = "dual" # v1 | v2 | dual/' artifacts/policy.v2.toml
           sed -i 's|^audit_v2_jsonl_path = ""$|audit_v2_jsonl_path = "artifacts/scan-audit-v2.jsonl"|' artifacts/policy.v2.toml
           sed -i 's/^shadow_mode = false$/shadow_mode = true/' artifacts/policy.v2.toml
@@ -51,6 +54,7 @@ jobs:
             --format text
           cargo run -p patchgate-cli -- policy verify-v2 \
             --path artifacts/policy.v2.toml \
+            --readiness-profile ga \
             --format json > artifacts/verify-v2.json
           cargo run -p patchgate-cli -- policy diff-contract \
             --path artifacts/policy.v2.toml \

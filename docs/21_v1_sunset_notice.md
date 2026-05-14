@@ -8,6 +8,14 @@
 - 新機能は v2 系へ集約
 - dual-run 終了後は v1 provider / audit bridge を段階的に停止
 
+## Compatibility Contract
+
+- v1.1 compatibility window は GA 公開日から +90 日を標準とする
+- provider compatibility は v1 reader の復帰手順が `rollback-packet.json` に残っていることを条件に縮小する
+- audit v1 は +90 review まで authoritative fallback として保持する
+- support model は `docs/22_v2_support_model.md` を正とし、critical case は sunset window 中も v1 rollback を扱えること
+- warning escalation は +60 marker 以降に v1-only provider / audit v1-only signal へ付与する
+
 ## Suggested timeline
 
 1. GA 公開日: `v2` を主線として告知

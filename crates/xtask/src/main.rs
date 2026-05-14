@@ -46,6 +46,10 @@ enum OpsSubcommand {
     FleetReview,
     RcReadiness,
     GaPacket,
+    MigrationCompletion,
+    DualRunDecommission,
+    PostGaTelemetry,
+    RetrospectiveCleanup,
     SiemHandoff,
 }
 
@@ -86,6 +90,10 @@ struct OpsOptions {
     rollback_packet_input: Option<PathBuf>,
     fleet_review_input: Option<PathBuf>,
     rc_readiness_input: Option<PathBuf>,
+    ga_packet_input: Option<PathBuf>,
+    migration_completion_input: Option<PathBuf>,
+    dual_run_decommission_input: Option<PathBuf>,
+    post_ga_telemetry_input: Option<PathBuf>,
     policy_input: Option<PathBuf>,
     migration_guide_path: Option<PathBuf>,
     provider_rollout_path: Option<PathBuf>,
@@ -742,7 +750,33 @@ fn main() -> Result<()> {
 
 fn print_help() {
     eprintln!(
-        "usage:\n  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n  cargo run -p xtask -- ops freeze-boundary --output PATH\n  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n  cargo run -p xtask -- ops rollback-packet --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...]\n  cargo run -p xtask -- ops migration-drill --metrics-input PATH --audit-input PATH --audit-v2-input PATH --rollback-packet-input PATH --output PATH [--provider-input PATH ...]\n  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--contract-freeze-input PATH] [--migration-drill-input PATH] [--rollback-packet-input PATH] [--fleet-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH] [--sunset-notice-path PATH]\n  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--policy-input PATH] [--rc-readiness-input PATH] [--go-no-go-path PATH] [--migration-guide-path PATH] [--candidate-checklist-path PATH] [--ops-handbook-path PATH] [--support-model-path PATH] [--sunset-notice-path PATH] [--phase201-backcast-path PATH]"
+        concat!(
+            "usage:\n",
+            "  cargo run -p xtask -- bench record [--case NAME] [--repo PATH] [--output PATH] [--synthetic-files N] [--synthetic-lines N]\n",
+            "  cargo run -p xtask -- bench compare [--case NAME] [--repo PATH] [--output PATH] [--max-regression-pct N] [--require-baseline] [--append-on-pass] [--report-output PATH] [--synthetic-files N] [--synthetic-lines N]\n",
+            "  cargo run -p xtask -- bench profile [--repo PATH] [--profile-output PATH] [--synthetic-files N] [--synthetic-lines N]\n",
+            "  cargo run -p xtask -- ops weekly-summary --metrics-input PATH --audit-input PATH --output PATH [--trend-output PATH]\n",
+            "  cargo run -p xtask -- ops audit-report --audit-input PATH --output PATH\n",
+            "  cargo run -p xtask -- ops audit-drift-report --audit-input PATH [--audit-v2-input PATH] --output PATH\n",
+            "  cargo run -p xtask -- ops siem-handoff --audit-v2-input PATH --output PATH\n",
+            "  cargo run -p xtask -- ops slo-report --metrics-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n",
+            "  cargo run -p xtask -- ops ga-readiness --metrics-input PATH --audit-input PATH --output PATH [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n",
+            "  cargo run -p xtask -- ops verify-v1-calibrate --metrics-input PATH --output PATH\n",
+            "  cargo run -p xtask -- ops compatibility-report --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n",
+            "  cargo run -p xtask -- ops freeze-scoreboard --metrics-input PATH --audit-input PATH --output PATH [--replay-summary-input PATH] [--availability-target-pct N] [--p95-target-ms N] [--false-positive-target-pct N]\n",
+            "  cargo run -p xtask -- ops freeze-boundary --output PATH\n",
+            "  cargo run -p xtask -- ops replay-normalize --replay-summary-input PATH --output PATH\n",
+            "  cargo run -p xtask -- ops rollback-packet --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...]\n",
+            "  cargo run -p xtask -- ops migration-drill --metrics-input PATH --audit-input PATH --audit-v2-input PATH --rollback-packet-input PATH --output PATH [--provider-input PATH ...]\n",
+            "  cargo run -p xtask -- ops shadow-review --audit-input PATH --audit-v2-input PATH --output PATH [--provider-input PATH ...] [--webhook-envelope-input PATH ...] [--notification-envelope-input PATH ...]\n",
+            "  cargo run -p xtask -- ops fleet-review --metrics-input PATH --audit-input PATH --output PATH [--audit-v2-input PATH] [--provider-input PATH ...] [--bundle-catalog-input PATH] [--registry-input PATH] [--exceptions-input PATH] [--cost-ceiling-minutes N]\n",
+            "  cargo run -p xtask -- ops rc-readiness --metrics-input PATH --audit-input PATH --audit-v2-input PATH --output PATH [--replay-summary-input PATH] [--provider-input PATH ...] [--benchmark-input PATH] [--security-review-input PATH] [--contract-freeze-input PATH] [--migration-drill-input PATH] [--rollback-packet-input PATH] [--fleet-review-input PATH] [--migration-guide-path PATH] [--provider-rollout-path PATH] [--candidate-checklist-path PATH] [--freeze-boundary-path PATH] [--sunset-notice-path PATH]\n",
+            "  cargo run -p xtask -- ops ga-packet --metrics-input PATH --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --policy-input PATH --rc-readiness-input PATH --go-no-go-path PATH --fleet-review-input PATH --migration-guide-path PATH --candidate-checklist-path PATH --ops-handbook-path PATH --support-model-path PATH --sunset-notice-path PATH --phase201-backcast-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops migration-completion --metrics-input PATH --audit-input PATH --audit-v2-input PATH --provider-input PATH ... --fleet-review-input PATH --rc-readiness-input PATH --migration-drill-input PATH --migration-guide-path PATH --candidate-checklist-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops dual-run-decommission --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --provider-input PATH ... --rollback-packet-input PATH --migration-drill-input PATH --rc-readiness-input PATH --sunset-notice-path PATH --support-model-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops post-ga-telemetry --metrics-input PATH --audit-input PATH --audit-v2-input PATH --replay-summary-input PATH --fleet-review-input PATH --ga-packet-input PATH --support-model-path PATH --output PATH\n",
+            "  cargo run -p xtask -- ops retrospective-cleanup --migration-completion-input PATH --dual-run-decommission-input PATH --post-ga-telemetry-input PATH --ops-handbook-path PATH --support-model-path PATH --sunset-notice-path PATH --phase201-backcast-path PATH --output PATH",
+        )
     );
 }
 
@@ -858,7 +892,7 @@ fn parse_bench_options(args: Vec<OsString>) -> Result<BenchOptions> {
 fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut iter = args.into_iter();
     let Some(sub) = iter.next() else {
-        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `freeze-boundary`, `replay-normalize`, `rollback-packet`, `migration-drill`, `shadow-review`, `fleet-review`, `rc-readiness`, or `ga-packet`)");
+        bail!("missing ops subcommand (`weekly-summary`, `audit-report`, `audit-drift-report`, `siem-handoff`, `slo-report`, `ga-readiness`, `verify-v1-calibrate`, `compatibility-report`, `freeze-scoreboard`, `freeze-boundary`, `replay-normalize`, `rollback-packet`, `migration-drill`, `shadow-review`, `fleet-review`, `rc-readiness`, `ga-packet`, `migration-completion`, `dual-run-decommission`, `post-ga-telemetry`, or `retrospective-cleanup`)");
     };
     let subcommand = match sub.to_string_lossy().as_ref() {
         "weekly-summary" => OpsSubcommand::WeeklySummary,
@@ -878,6 +912,10 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         "fleet-review" => OpsSubcommand::FleetReview,
         "rc-readiness" => OpsSubcommand::RcReadiness,
         "ga-packet" => OpsSubcommand::GaPacket,
+        "migration-completion" => OpsSubcommand::MigrationCompletion,
+        "dual-run-decommission" => OpsSubcommand::DualRunDecommission,
+        "post-ga-telemetry" => OpsSubcommand::PostGaTelemetry,
+        "retrospective-cleanup" => OpsSubcommand::RetrospectiveCleanup,
         other => bail!("unsupported ops subcommand `{other}`"),
     };
     let mut metrics_input = PathBuf::from("artifacts/scan-metrics.jsonl");
@@ -899,6 +937,10 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
     let mut rollback_packet_input = None;
     let mut fleet_review_input = None;
     let mut rc_readiness_input = None;
+    let mut ga_packet_input = None;
+    let mut migration_completion_input = None;
+    let mut dual_run_decommission_input = None;
+    let mut post_ga_telemetry_input = None;
     let mut policy_input = None;
     let mut migration_guide_path = None;
     let mut provider_rollout_path = None;
@@ -1030,6 +1072,30 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
                     .ok_or_else(|| anyhow!("missing value for --rc-readiness-input"))?;
                 rc_readiness_input = Some(PathBuf::from(value));
             }
+            "--ga-packet-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --ga-packet-input"))?;
+                ga_packet_input = Some(PathBuf::from(value));
+            }
+            "--migration-completion-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --migration-completion-input"))?;
+                migration_completion_input = Some(PathBuf::from(value));
+            }
+            "--dual-run-decommission-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --dual-run-decommission-input"))?;
+                dual_run_decommission_input = Some(PathBuf::from(value));
+            }
+            "--post-ga-telemetry-input" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for --post-ga-telemetry-input"))?;
+                post_ga_telemetry_input = Some(PathBuf::from(value));
+            }
             "--policy-input" => {
                 let value = iter
                     .next()
@@ -1153,6 +1219,10 @@ fn parse_ops_options(args: Vec<OsString>) -> Result<OpsOptions> {
         rollback_packet_input,
         fleet_review_input,
         rc_readiness_input,
+        ga_packet_input,
+        migration_completion_input,
+        dual_run_decommission_input,
+        post_ga_telemetry_input,
         policy_input,
         migration_guide_path,
         provider_rollout_path,
@@ -1189,6 +1259,10 @@ fn run_ops(options: &OpsOptions) -> Result<()> {
         OpsSubcommand::FleetReview => run_fleet_review(options),
         OpsSubcommand::RcReadiness => run_rc_readiness(options),
         OpsSubcommand::GaPacket => run_ga_packet(options),
+        OpsSubcommand::MigrationCompletion => run_migration_completion(options),
+        OpsSubcommand::DualRunDecommission => run_dual_run_decommission(options),
+        OpsSubcommand::PostGaTelemetry => run_post_ga_telemetry(options),
+        OpsSubcommand::RetrospectiveCleanup => run_retrospective_cleanup(options),
     }
 }
 
@@ -4371,21 +4445,71 @@ fn run_rc_readiness(options: &OpsOptions) -> Result<()> {
 fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
     let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
-    let audit_v2_input = options
-        .audit_v2_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--audit-v2-input is required for ga-packet"))?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "ga-packet",
+    )?;
     let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
-    let replay_summary = options
-        .replay_summary_input
-        .as_deref()
-        .map(load_json_file::<DeadLetterReplaySummaryRecord>)
-        .transpose()?;
-    let policy_input = options
-        .policy_input
-        .as_deref()
-        .ok_or_else(|| anyhow!("--policy-input is required for ga-packet"))?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "ga-packet",
+    )?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
+    let policy_input = required_path(
+        options.policy_input.as_deref(),
+        "--policy-input",
+        "ga-packet",
+    )?;
     let release_policy = load_release_policy_summary(policy_input)?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "ga-packet",
+    )?;
+    let go_no_go_path = required_path(
+        options.go_no_go_path.as_deref(),
+        "--go-no-go-path",
+        "ga-packet",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "ga-packet",
+    )?;
+    let migration_guide_path = required_path(
+        options.migration_guide_path.as_deref(),
+        "--migration-guide-path",
+        "ga-packet",
+    )?;
+    let candidate_checklist_path = required_path(
+        options.candidate_checklist_path.as_deref(),
+        "--candidate-checklist-path",
+        "ga-packet",
+    )?;
+    let ops_handbook_path = required_path(
+        options.ops_handbook_path.as_deref(),
+        "--ops-handbook-path",
+        "ga-packet",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "ga-packet",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "ga-packet",
+    )?;
+    let phase201_backcast_path = required_path(
+        options.phase201_backcast_path.as_deref(),
+        "--phase201-backcast-path",
+        "ga-packet",
+    )?;
     let assessment = build_compatibility_assessment(
         &metrics,
         &audits,
@@ -4400,29 +4524,40 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     let replay_clean = replay_summary
         .as_ref()
         .is_some_and(|summary| summary.failed_records == 0 && summary.retained_records == 0);
-    let migration_guide_present = path_exists(options.migration_guide_path.as_deref());
-    let candidate_checklist_present = path_exists(options.candidate_checklist_path.as_deref());
-    let ops_handbook_present = path_exists(options.ops_handbook_path.as_deref());
-    let support_model_present = path_exists(options.support_model_path.as_deref());
-    let sunset_notice_present = path_exists(options.sunset_notice_path.as_deref());
-    let phase201_backcast_present = path_exists(options.phase201_backcast_path.as_deref());
-    let rc_readiness_ready = rc_readiness_packet_ready(options.rc_readiness_input.as_deref())?;
-    let go_no_go_ready = go_no_go_review_ready(options.go_no_go_path.as_deref())?;
+    let migration_guide_present = path_exists(Some(migration_guide_path));
+    let candidate_checklist_ready = candidate_checklist_ready(Some(candidate_checklist_path))?;
+    let ops_handbook_ready = ops_handbook_ready(Some(ops_handbook_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let phase201_backcast_ready = phase201_backcast_ready(Some(phase201_backcast_path))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let go_no_go_ready = go_no_go_review_ready(Some(go_no_go_path))?;
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
     let lts_ready = release_policy.lts_active
-        && !release_policy.lts_branch.trim().is_empty()
+        && release_policy.lts_branch == "lts/v2"
         && release_policy.security_sla_hours <= 72;
     let docs_ready = migration_guide_present
-        && candidate_checklist_present
-        && ops_handbook_present
-        && support_model_present
-        && sunset_notice_present
-        && phase201_backcast_present;
+        && candidate_checklist_ready
+        && ops_handbook_ready
+        && support_model_ready
+        && sunset_notice_ready
+        && phase201_backcast_ready;
     let dual_run_decommission_ready = replay_clean && shadow.aligned;
     let audit_drift_clean =
         audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
+    let post_ga_telemetry_ready = !metrics.is_empty()
+        && !audits.is_empty()
+        && !audits_v2.is_empty()
+        && assessment.slo.ready
+        && shadow.aligned
+        && audit_drift_clean
+        && replay_clean
+        && fleet_governance_ready
+        && support_model_ready;
     let ga_ready = scoreboard.v2_seed_ready
         && dual_run_decommission_ready
         && audit_drift_clean
+        && post_ga_telemetry_ready
         && lts_ready
         && docs_ready;
     let ga_ready = ga_ready && rc_readiness_ready && go_no_go_ready;
@@ -4433,7 +4568,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
-            "Enable release.lts, set the branch name, and keep security_sla_hours <= 72."
+            "Enable release.lts, set branch to `lts/v2`, and keep security_sla_hours <= 72."
                 .to_string(),
         );
     }
@@ -4441,7 +4576,7 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         push_unique_action(
             &mut next_actions,
             &mut seen_actions,
-            "Refresh migration, checklist, ops handbook, support model, sunset notice, and Phase201+ docs.".to_string(),
+            "Refresh migration, checklist, ops handbook, support model, sunset notice, and Phase201+ docs with GA/LTS handoff markers.".to_string(),
         );
     }
     if !dual_run_decommission_ready {
@@ -4480,6 +4615,13 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
             "Attach a go/no-go review with Go checked, No-go unchecked, and rollback/support/sunset evidence referenced.".to_string(),
         );
     }
+    if !post_ga_telemetry_ready {
+        push_unique_action(
+            &mut next_actions,
+            &mut seen_actions,
+            "Attach clean post-GA telemetry prerequisites: SLO, audit parity, replay recovery, fleet governance, and support model.".to_string(),
+        );
+    }
 
     let mut md = String::new();
     md.push_str("# V2 GA Packet\n\n");
@@ -4497,8 +4639,27 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         dual_run_decommission_ready
     ));
     md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!(
+        "- post_ga_telemetry_ready: {}\n",
+        post_ga_telemetry_ready
+    ));
+    md.push_str(&format!(
+        "- fleet_governance_ready: {}\n",
+        fleet_governance_ready
+    ));
     md.push_str(&format!("- rc_readiness_ready: {}\n", rc_readiness_ready));
     md.push_str(&format!("- go_no_go_ready: {}\n", go_no_go_ready));
+    md.push_str(&format!(
+        "- candidate_checklist_ready: {}\n",
+        candidate_checklist_ready
+    ));
+    md.push_str(&format!("- ops_handbook_ready: {}\n", ops_handbook_ready));
+    md.push_str(&format!("- support_model_ready: {}\n", support_model_ready));
+    md.push_str(&format!("- sunset_notice_ready: {}\n", sunset_notice_ready));
+    md.push_str(&format!(
+        "- phase201_backcast_ready: {}\n",
+        phase201_backcast_ready
+    ));
     md.push_str(&format!("- docs_ready: {}\n\n", docs_ready));
 
     md.push_str("## Checklist\n");
@@ -4531,24 +4692,28 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
         checklist_box(migration_guide_present)
     ));
     md.push_str(&format!(
-        "- {} candidate checklist exists\n",
-        checklist_box(candidate_checklist_present)
+        "- {} candidate checklist has RC/GA markers\n",
+        checklist_box(candidate_checklist_ready)
     ));
     md.push_str(&format!(
-        "- {} ops handbook exists\n",
-        checklist_box(ops_handbook_present)
+        "- {} ops handbook has GA handoff commands\n",
+        checklist_box(ops_handbook_ready)
     ));
     md.push_str(&format!(
-        "- {} support model exists\n",
-        checklist_box(support_model_present)
+        "- {} support model has escalation owners and SLA bands\n",
+        checklist_box(support_model_ready)
     ));
     md.push_str(&format!(
-        "- {} v1 sunset notice exists\n",
-        checklist_box(sunset_notice_present)
+        "- {} v1 sunset notice has countdown and compatibility markers\n",
+        checklist_box(sunset_notice_ready)
     ));
     md.push_str(&format!(
-        "- {} Phase201+ backcast exists\n",
-        checklist_box(phase201_backcast_present)
+        "- {} Phase201+ backcast has entry/packet handoff markers\n",
+        checklist_box(phase201_backcast_ready)
+    ));
+    md.push_str(&format!(
+        "- {} post-GA telemetry review can be generated\n",
+        checklist_box(post_ga_telemetry_ready)
     ));
 
     md.push_str("\n## Next Actions\n");
@@ -4564,6 +4729,527 @@ fn run_ga_packet(options: &OpsOptions) -> Result<()> {
     println!("ga packet written: {}", options.output.display());
     if !ga_ready {
         bail!("v2 ga packet gate failed");
+    }
+    Ok(())
+}
+
+fn run_migration_completion(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "migration-completion",
+    )?;
+    require_non_empty_paths(
+        &options.provider_inputs,
+        "--provider-input",
+        "migration-completion",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "migration-completion",
+    )?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "migration-completion",
+    )?;
+    let migration_drill_input = required_path(
+        options.migration_drill_input.as_deref(),
+        "--migration-drill-input",
+        "migration-completion",
+    )?;
+    let migration_guide_path = required_path(
+        options.migration_guide_path.as_deref(),
+        "--migration-guide-path",
+        "migration-completion",
+    )?;
+    let candidate_checklist_path = required_path(
+        options.candidate_checklist_path.as_deref(),
+        "--candidate-checklist-path",
+        "migration-completion",
+    )?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    let provider_summaries = summarize_provider_inputs(&options.provider_inputs)?;
+    let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
+    let audit_export = validate_audit_export_v2(&audits, &audits_v2);
+    let audit_drift_clean =
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
+    let mut repos = candidate_repos(&metrics, &audits);
+    repos.extend(audits_v2.iter().map(|row| row.repo.clone()));
+    let provider_bridge_ready = provider_bridge_ready_for_repos(&provider_summaries, &repos);
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let migration_drill_ready = migration_drill_ready(Some(migration_drill_input))?;
+    let migration_guide_present = path_exists(Some(migration_guide_path));
+    let candidate_checklist_ready = candidate_checklist_ready(Some(candidate_checklist_path))?;
+    let migration_complete = !repos.is_empty()
+        && provider_bridge_ready
+        && audit_export.ready
+        && audit_drift_clean
+        && shadow.aligned
+        && fleet_governance_ready
+        && rc_readiness_ready
+        && migration_drill_ready
+        && migration_guide_present
+        && candidate_checklist_ready;
+
+    let mut md = String::new();
+    md.push_str("# Ecosystem Migration Completion Board\n\n");
+    md.push_str(&format!(
+        "- generated_at: {}\n",
+        current_utc_timestamp_label()?
+    ));
+    md.push_str(&format!("- migration_complete: {}\n", migration_complete));
+    md.push_str(&format!("- repo_count: {}\n", repos.len()));
+    md.push_str(&format!(
+        "- provider_bridge_ready: {}\n",
+        provider_bridge_ready
+    ));
+    md.push_str(&format!(
+        "- audit_export_v2_valid: {}\n",
+        audit_export.ready
+    ));
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!("- shadow_aligned: {}\n", shadow.aligned));
+    md.push_str(&format!(
+        "- fleet_governance_ready: {}\n",
+        fleet_governance_ready
+    ));
+    md.push_str(&format!("- rc_readiness_ready: {}\n", rc_readiness_ready));
+    md.push_str(&format!(
+        "- migration_drill_ready: {}\n",
+        migration_drill_ready
+    ));
+    md.push_str(&format!(
+        "- migration_guide_present: {}\n",
+        migration_guide_present
+    ));
+    md.push_str(&format!(
+        "- candidate_checklist_ready: {}\n\n",
+        candidate_checklist_ready
+    ));
+
+    md.push_str("## Repo Board\n");
+    if repos.is_empty() {
+        md.push_str("- no repositories have migration telemetry yet\n");
+    } else {
+        for repo in &repos {
+            let modes = provider_summaries
+                .iter()
+                .filter(|summary| summary.repo == *repo)
+                .map(|summary| summary.schema_mode.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let v1_events = audits.iter().filter(|row| row.repo == *repo).count();
+            let v2_events = audits_v2.iter().filter(|row| row.repo == *repo).count();
+            md.push_str(&format!(
+                "- repo={} provider_modes={} audit_v1_events={} audit_v2_events={}\n",
+                repo,
+                format_csv(&modes),
+                v1_events,
+                v2_events
+            ));
+        }
+    }
+
+    md.push_str("\n## Handoff\n");
+    if migration_complete {
+        md.push_str("- Promote this board with the GA packet and keep it as the migration completion source of truth.\n");
+        md.push_str("- Use this board as the input to dual-run decommission review.\n");
+    } else {
+        md.push_str("- Keep v1/v2 dual-run active until every repo has dual or v2 provider evidence, audit v2 parity, RC readiness, and fleet governance sign-off.\n");
+    }
+
+    write_output(&options.output, md.as_str())?;
+    println!(
+        "migration completion board written: {}",
+        options.output.display()
+    );
+    if !migration_complete {
+        bail!("ecosystem migration completion gate failed");
+    }
+    Ok(())
+}
+
+fn run_dual_run_decommission(options: &OpsOptions) -> Result<()> {
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "dual-run-decommission",
+    )?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "dual-run-decommission",
+    )?;
+    require_non_empty_paths(
+        &options.provider_inputs,
+        "--provider-input",
+        "dual-run-decommission",
+    )?;
+    let rollback_packet_input = required_path(
+        options.rollback_packet_input.as_deref(),
+        "--rollback-packet-input",
+        "dual-run-decommission",
+    )?;
+    let migration_drill_input = required_path(
+        options.migration_drill_input.as_deref(),
+        "--migration-drill-input",
+        "dual-run-decommission",
+    )?;
+    let rc_readiness_input = required_path(
+        options.rc_readiness_input.as_deref(),
+        "--rc-readiness-input",
+        "dual-run-decommission",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "dual-run-decommission",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "dual-run-decommission",
+    )?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
+    let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
+    let audit_drift_clean =
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
+    let replay_clean = replay_summary.as_ref().is_some_and(|summary| {
+        !summary.dry_run
+            && summary.rewrite_input
+            && summary.failed_records == 0
+            && summary.retained_records == 0
+    });
+    let repos = shadow_candidate_repos(&audits, &audits_v2);
+    let provider_v1_restore_ready = provider_v1_restore_verified(&options.provider_inputs, &repos)?;
+    let rollback_packet_ready = rollback_packet_input_ready(Some(rollback_packet_input))?;
+    let migration_drill_ready = migration_drill_ready(Some(migration_drill_input))?;
+    let rc_readiness_ready = rc_readiness_packet_ready(Some(rc_readiness_input))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let decommission_ready = !repos.is_empty()
+        && replay_clean
+        && shadow.aligned
+        && audit_drift_clean
+        && provider_v1_restore_ready
+        && rollback_packet_ready
+        && migration_drill_ready
+        && rc_readiness_ready
+        && sunset_notice_ready
+        && support_model_ready;
+
+    let mut md = String::new();
+    md.push_str("# Dual-Run Decommission Plan\n\n");
+    md.push_str(&format!(
+        "- generated_at: {}\n",
+        current_utc_timestamp_label()?
+    ));
+    md.push_str(&format!("- decommission_ready: {}\n", decommission_ready));
+    md.push_str(&format!("- repo_count: {}\n", repos.len()));
+    md.push_str(&format!("- replay_clean: {}\n", replay_clean));
+    md.push_str(&format!("- shadow_aligned: {}\n", shadow.aligned));
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!(
+        "- provider_v1_restore_ready: {}\n",
+        provider_v1_restore_ready
+    ));
+    md.push_str(&format!(
+        "- rollback_packet_ready: {}\n",
+        rollback_packet_ready
+    ));
+    md.push_str(&format!(
+        "- migration_drill_ready: {}\n",
+        migration_drill_ready
+    ));
+    md.push_str(&format!("- rc_readiness_ready: {}\n", rc_readiness_ready));
+    md.push_str(&format!("- sunset_notice_ready: {}\n", sunset_notice_ready));
+    md.push_str(&format!(
+        "- support_model_ready: {}\n\n",
+        support_model_ready
+    ));
+
+    md.push_str("## Sequence\n");
+    md.push_str("- Freeze writes to dual-run bridge settings during the change window.\n");
+    md.push_str("- Preserve audit v1 and audit v2 artifacts before changing provider schema.\n");
+    md.push_str(
+        "- Switch `compatibility.v2.bridge_mode` to `off` after rollback packet verification.\n",
+    );
+    md.push_str("- Switch generic provider output to `v2` after downstream readers confirm v1 restore remains available.\n");
+    md.push_str(
+        "- Keep rollback packet and support escalation open through the +90 review window.\n\n",
+    );
+
+    md.push_str("## Rollback Triggers\n");
+    md.push_str("- audit v2 event count diverges from v1 during the decommission window\n");
+    md.push_str("- downstream provider reader rejects v2-only payloads\n");
+    md.push_str("- delivery replay or notification recovery retains failed records\n");
+    md.push_str("- support model classifies the incident as critical\n");
+
+    write_output(&options.output, md.as_str())?;
+    println!(
+        "dual-run decommission plan written: {}",
+        options.output.display()
+    );
+    if !decommission_ready {
+        bail!("dual-run decommission gate failed");
+    }
+    Ok(())
+}
+
+fn run_post_ga_telemetry(options: &OpsOptions) -> Result<()> {
+    let metrics = load_jsonl_records::<MetricLogRecord>(&options.metrics_input)?;
+    let audits = load_jsonl_records::<AuditLogRecord>(&options.audit_input)?;
+    let audit_v2_input = required_path(
+        options.audit_v2_input.as_deref(),
+        "--audit-v2-input",
+        "post-ga-telemetry",
+    )?;
+    let replay_summary_input = required_path(
+        options.replay_summary_input.as_deref(),
+        "--replay-summary-input",
+        "post-ga-telemetry",
+    )?;
+    let fleet_review_input = required_path(
+        options.fleet_review_input.as_deref(),
+        "--fleet-review-input",
+        "post-ga-telemetry",
+    )?;
+    let audits_v2 = load_jsonl_records::<AuditLogV2Record>(audit_v2_input)?;
+    let replay_summary = Some(load_json_file::<DeadLetterReplaySummaryRecord>(
+        replay_summary_input,
+    )?);
+    let assessment = build_compatibility_assessment(
+        &metrics,
+        &audits,
+        replay_summary.clone(),
+        options.availability_target_pct,
+        options.p95_target_ms,
+        options.false_positive_target_pct,
+    );
+    let shadow = build_shadow_alignment(&audits, &audits_v2);
+    let drift = build_combined_audit_drift_summary(&audits, &audits_v2);
+    let audit_drift_clean =
+        audit_drift_is_clean(&drift) && audit_stream_contracts_are_clean(&audits, &audits_v2);
+    let replay_clean = replay_summary.as_ref().is_some_and(|summary| {
+        !summary.dry_run
+            && summary.rewrite_input
+            && summary.failed_records == 0
+            && summary.retained_records == 0
+    });
+    let fleet_governance_ready = fleet_review_cost_signoff_ready(Some(fleet_review_input))?;
+    let ga_packet_input = options
+        .ga_packet_input
+        .as_deref()
+        .ok_or_else(|| anyhow!("--ga-packet-input is required for post-ga-telemetry"))?;
+    let ga_packet_ready = ga_packet_ready(Some(ga_packet_input))?;
+    let support_model_path = options
+        .support_model_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("--support-model-path is required for post-ga-telemetry"))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let telemetry_review_ready = !metrics.is_empty()
+        && !audits.is_empty()
+        && !audits_v2.is_empty()
+        && assessment.slo.ready
+        && shadow.aligned
+        && audit_drift_clean
+        && replay_clean
+        && fleet_governance_ready
+        && ga_packet_ready
+        && support_model_ready;
+
+    let mut md = String::new();
+    md.push_str("# Post-GA Telemetry Review\n\n");
+    md.push_str(&format!(
+        "- generated_at: {}\n",
+        current_utc_timestamp_label()?
+    ));
+    md.push_str(&format!(
+        "- telemetry_review_ready: {}\n",
+        telemetry_review_ready
+    ));
+    md.push_str(&format!("- runs: {}\n", assessment.slo.runs));
+    md.push_str(&format!(
+        "- availability_pct: {:.2}\n",
+        assessment.slo.availability_pct
+    ));
+    md.push_str(&format!(
+        "- p95_duration_ms: {}\n",
+        assessment.slo.p95_duration_ms
+    ));
+    md.push_str(&format!(
+        "- gate_failure_rate_pct: {:.2}\n",
+        assessment.slo.gate_failure_rate_pct
+    ));
+    md.push_str(&format!("- slo_ready: {}\n", assessment.slo.ready));
+    md.push_str(&format!("- shadow_aligned: {}\n", shadow.aligned));
+    md.push_str(&format!("- audit_drift_clean: {}\n", audit_drift_clean));
+    md.push_str(&format!("- replay_clean: {}\n", replay_clean));
+    md.push_str(&format!(
+        "- fleet_governance_ready: {}\n",
+        fleet_governance_ready
+    ));
+    md.push_str(&format!("- ga_packet_ready: {}\n", ga_packet_ready));
+    md.push_str(&format!(
+        "- support_model_ready: {}\n\n",
+        support_model_ready
+    ));
+
+    md.push_str("## Review Focus\n");
+    md.push_str(
+        "- Watch score, duration, and gate failure deltas after the GA packet is promoted.\n",
+    );
+    md.push_str("- Compare audit v1/v2 parity until the dual-run decommission plan is complete.\n");
+    md.push_str("- Escalate through the support model when telemetry changes from steady-state to regression.\n\n");
+
+    md.push_str("## Next Actions\n");
+    if telemetry_review_ready {
+        md.push_str("- keep the telemetry review cadence attached to Phase201+ planning\n");
+        md.push_str("- use this review as the input for retrospective cleanup\n");
+    } else {
+        for action in &assessment.next_actions {
+            md.push_str(&format!("- {action}\n"));
+        }
+        if !replay_clean {
+            md.push_str(
+                "- attach a non-dry-run replay summary with zero failed and retained records\n",
+            );
+        }
+        if !fleet_governance_ready {
+            md.push_str(
+                "- attach a fleet review with governance, repo cost, and segment cost green\n",
+            );
+        }
+    }
+
+    write_output(&options.output, md.as_str())?;
+    println!(
+        "post-GA telemetry review written: {}",
+        options.output.display()
+    );
+    if !telemetry_review_ready {
+        bail!("post-GA telemetry review gate failed");
+    }
+    Ok(())
+}
+
+fn run_retrospective_cleanup(options: &OpsOptions) -> Result<()> {
+    let migration_completion_input = required_path(
+        options.migration_completion_input.as_deref(),
+        "--migration-completion-input",
+        "retrospective-cleanup",
+    )?;
+    let dual_run_decommission_input = required_path(
+        options.dual_run_decommission_input.as_deref(),
+        "--dual-run-decommission-input",
+        "retrospective-cleanup",
+    )?;
+    let post_ga_telemetry_input = required_path(
+        options.post_ga_telemetry_input.as_deref(),
+        "--post-ga-telemetry-input",
+        "retrospective-cleanup",
+    )?;
+    let ops_handbook_path = required_path(
+        options.ops_handbook_path.as_deref(),
+        "--ops-handbook-path",
+        "retrospective-cleanup",
+    )?;
+    let support_model_path = required_path(
+        options.support_model_path.as_deref(),
+        "--support-model-path",
+        "retrospective-cleanup",
+    )?;
+    let sunset_notice_path = required_path(
+        options.sunset_notice_path.as_deref(),
+        "--sunset-notice-path",
+        "retrospective-cleanup",
+    )?;
+    let phase201_backcast_path = required_path(
+        options.phase201_backcast_path.as_deref(),
+        "--phase201-backcast-path",
+        "retrospective-cleanup",
+    )?;
+    let migration_completion_ready =
+        migration_completion_board_ready(Some(migration_completion_input))?;
+    let dual_run_decommission_ready =
+        dual_run_decommission_plan_ready(Some(dual_run_decommission_input))?;
+    let post_ga_telemetry_ready = post_ga_telemetry_review_ready(Some(post_ga_telemetry_input))?;
+    let ops_handbook_ready = ops_handbook_ready(Some(ops_handbook_path))?;
+    let support_model_ready = support_model_ready(Some(support_model_path))?;
+    let sunset_notice_ready = sunset_notice_ready(Some(sunset_notice_path))?;
+    let phase201_backcast_ready = phase201_backcast_ready(Some(phase201_backcast_path))?;
+    let cleanup_queue_ready = migration_completion_ready
+        && dual_run_decommission_ready
+        && post_ga_telemetry_ready
+        && ops_handbook_ready
+        && support_model_ready
+        && sunset_notice_ready
+        && phase201_backcast_ready;
+
+    let mut md = String::new();
+    md.push_str("# Retrospective And Cleanup Queue\n\n");
+    md.push_str(&format!(
+        "- generated_at: {}\n",
+        current_utc_timestamp_label()?
+    ));
+    md.push_str(&format!("- cleanup_queue_ready: {}\n", cleanup_queue_ready));
+    md.push_str(&format!(
+        "- migration_completion_ready: {}\n",
+        migration_completion_ready
+    ));
+    md.push_str(&format!(
+        "- dual_run_decommission_ready: {}\n",
+        dual_run_decommission_ready
+    ));
+    md.push_str(&format!(
+        "- post_ga_telemetry_ready: {}\n",
+        post_ga_telemetry_ready
+    ));
+    md.push_str(&format!("- ops_handbook_ready: {}\n", ops_handbook_ready));
+    md.push_str(&format!("- support_model_ready: {}\n", support_model_ready));
+    md.push_str(&format!("- sunset_notice_ready: {}\n", sunset_notice_ready));
+    md.push_str(&format!(
+        "- phase201_backcast_ready: {}\n\n",
+        phase201_backcast_ready
+    ));
+
+    md.push_str("## Cleanup Queue\n");
+    md.push_str("- retire v1-only provider fixtures after +90 review closes\n");
+    md.push_str(
+        "- keep rollback packet fixture until the support model closes the last critical window\n",
+    );
+    md.push_str(
+        "- move dual-run docs from active procedure to historical reference after decommission\n",
+    );
+    md.push_str("- backcast Phase201+ items from telemetry review, migration board, and support tickets\n\n");
+
+    md.push_str("## Retrospective Prompts\n");
+    md.push_str(
+        "- Which GA evidence was reviewed by humans instead of only generated by automation?\n",
+    );
+    md.push_str("- Which support cases changed the LTS or sunset policy?\n");
+    md.push_str("- Which dual-run artifacts are still useful after v2-only operation?\n");
+
+    write_output(&options.output, md.as_str())?;
+    println!(
+        "retrospective cleanup queue written: {}",
+        options.output.display()
+    );
+    let output_packet_ready = retrospective_cleanup_queue_ready(Some(&options.output))?;
+    if !cleanup_queue_ready || !output_packet_ready {
+        bail!("retrospective cleanup queue gate failed");
     }
     Ok(())
 }
@@ -4843,6 +5529,17 @@ fn path_exists(path: Option<&Path>) -> bool {
     path.is_some_and(Path::exists)
 }
 
+fn required_path<'a>(path: Option<&'a Path>, flag: &str, command: &str) -> Result<&'a Path> {
+    path.ok_or_else(|| anyhow!("{flag} is required for {command}"))
+}
+
+fn require_non_empty_paths(paths: &[PathBuf], flag: &str, command: &str) -> Result<()> {
+    if paths.is_empty() {
+        bail!("{flag} is required for {command}");
+    }
+    Ok(())
+}
+
 fn security_review_is_approved(path: Option<&Path>) -> Result<bool> {
     let Some(path) = path.filter(|path| path.exists()) else {
         return Ok(false);
@@ -5010,6 +5707,89 @@ fn deprecation_countdown_markers_ready(path: Option<&Path>) -> Result<bool> {
         && raw.contains("dual-run"))
 }
 
+fn markdown_packet_ready(path: Option<&Path>, title: &str, required: &[&str]) -> Result<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(raw.contains(title) && required.iter().all(|marker| raw.contains(marker)))
+}
+
+fn sunset_notice_ready(path: Option<&Path>) -> Result<bool> {
+    Ok(deprecation_countdown_markers_ready(path)?
+        && markdown_packet_ready(
+            path,
+            "# V1 Sunset Notice",
+            &[
+                "## Compatibility Contract",
+                "v1.1 compatibility window",
+                "security / critical fix",
+                "provider compatibility",
+                "audit v1",
+                "support model",
+            ],
+        )?)
+}
+
+fn support_model_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# V2 Support Model",
+        &[
+            "## Support bands",
+            "## Escalation",
+            "## Ownership",
+            "critical",
+            "standard",
+            "advisory",
+            "release owner",
+            "support owner",
+            "security owner",
+            "24h",
+            "3 business days",
+        ],
+    )
+}
+
+fn ops_handbook_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# V2 Ops Handbook",
+        &[
+            "## Core artifacts",
+            "## Steady-state loop",
+            "## GA command",
+            "ecosystem-migration-completion.md",
+            "dual-run-decommission.md",
+            "post-ga-telemetry-review.md",
+            "retrospective-cleanup-queue.md",
+            "migration-completion",
+            "dual-run-decommission",
+            "post-ga-telemetry",
+            "retrospective-cleanup",
+        ],
+    )
+}
+
+fn phase201_backcast_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# Phase Backcast (201+)",
+        &[
+            "## Entry conditions",
+            "## First planning packets",
+            "ecosystem migration completion",
+            "dual-run decommission",
+            "post-GA telemetry",
+            "retrospective cleanup",
+            "## Phase201-210 candidates",
+        ],
+    )
+}
+
 fn candidate_checklist_ready(path: Option<&Path>) -> Result<bool> {
     let Some(path) = path else {
         return Ok(false);
@@ -5087,6 +5867,98 @@ fn go_no_go_review_ready(path: Option<&Path>) -> Result<bool> {
         && raw.contains("LTS policy")
         && raw.contains("v1 sunset")
         && raw.contains("support"))
+}
+
+fn ga_packet_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# V2 GA Packet",
+        &[
+            "- ga_ready: true",
+            "- lts_active: true",
+            "- lts_branch: lts/v2",
+            "- dual_run_decommission_ready: true",
+            "- post_ga_telemetry_ready: true",
+            "- fleet_governance_ready: true",
+            "- rc_readiness_ready: true",
+            "- go_no_go_ready: true",
+            "- support_model_ready: true",
+            "- sunset_notice_ready: true",
+            "- phase201_backcast_ready: true",
+            "- docs_ready: true",
+            "- [x] LTS policy is active and within SLA",
+        ],
+    )
+}
+
+fn migration_completion_board_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# Ecosystem Migration Completion Board",
+        &[
+            "- migration_complete: true",
+            "- provider_bridge_ready: true",
+            "- audit_export_v2_valid: true",
+            "- audit_drift_clean: true",
+            "- shadow_aligned: true",
+            "- fleet_governance_ready: true",
+            "- rc_readiness_ready: true",
+            "- migration_drill_ready: true",
+            "- migration_guide_present: true",
+            "- candidate_checklist_ready: true",
+        ],
+    )
+}
+
+fn dual_run_decommission_plan_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# Dual-Run Decommission Plan",
+        &[
+            "- decommission_ready: true",
+            "- replay_clean: true",
+            "- shadow_aligned: true",
+            "- audit_drift_clean: true",
+            "- provider_v1_restore_ready: true",
+            "- rollback_packet_ready: true",
+            "- migration_drill_ready: true",
+            "- rc_readiness_ready: true",
+            "- sunset_notice_ready: true",
+            "- support_model_ready: true",
+        ],
+    )
+}
+
+fn post_ga_telemetry_review_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# Post-GA Telemetry Review",
+        &[
+            "- telemetry_review_ready: true",
+            "- slo_ready: true",
+            "- shadow_aligned: true",
+            "- audit_drift_clean: true",
+            "- replay_clean: true",
+            "- fleet_governance_ready: true",
+            "- ga_packet_ready: true",
+            "- support_model_ready: true",
+        ],
+    )
+}
+
+fn retrospective_cleanup_queue_ready(path: Option<&Path>) -> Result<bool> {
+    markdown_packet_ready(
+        path,
+        "# Retrospective And Cleanup Queue",
+        &[
+            "- cleanup_queue_ready: true",
+            "- migration_completion_ready: true",
+            "- dual_run_decommission_ready: true",
+            "- post_ga_telemetry_ready: true",
+            "## Cleanup Queue",
+            "## Retrospective Prompts",
+        ],
+    )
 }
 
 fn validate_audit_export_v2(
@@ -5927,22 +6799,25 @@ mod tests {
         build_shadow_alignment, build_siem_handoff_records, build_verify_v1_calibration,
         bundle_catalog_governance_ready, candidate_checklist_ready, candidate_repos,
         canonical_repo_path, checklist_box, contract_freeze_input_ready, cost_within_ceiling,
-        deprecation_countdown_markers_ready, exception_governance_statuses, exception_is_expired,
-        fleet_repo_posture_label, fleet_review_cost_signoff_ready, go_no_go_review_ready,
-        load_json_file, load_jsonl_records, load_release_policy_summary, migration_drill_ready,
-        parse_ops_options, percentile_u128, provider_bridge_ready_for_repos, provider_capabilities,
-        provider_negotiation_statuses, rc_readiness_packet_ready, registry_provenance_ready,
-        repo_cost_ceiling_minutes, retention_tier_is_valid, rollback_packet_input_ready,
-        run_ga_readiness, run_migration_drill, run_rollback_packet, security_review_is_approved,
+        deprecation_countdown_markers_ready, dual_run_decommission_plan_ready,
+        exception_governance_statuses, exception_is_expired, fleet_repo_posture_label,
+        fleet_review_cost_signoff_ready, ga_packet_ready, go_no_go_review_ready, load_json_file,
+        load_jsonl_records, load_release_policy_summary, migration_completion_board_ready,
+        migration_drill_ready, ops_handbook_ready, parse_ops_options, percentile_u128,
+        phase201_backcast_ready, post_ga_telemetry_review_ready, provider_bridge_ready_for_repos,
+        provider_capabilities, provider_negotiation_statuses, rc_readiness_packet_ready,
+        registry_provenance_ready, repo_cost_ceiling_minutes, retention_tier_is_valid,
+        retrospective_cleanup_queue_ready, rollback_packet_input_ready, run_ga_readiness,
+        run_migration_drill, run_rollback_packet, security_review_is_approved,
         security_review_packet_ready, segment_cost_statuses, summarize_delivery_bridge_inputs,
-        summarize_provider_inputs, unix_days_to_ymd, validate_audit_export_v2,
-        validate_siem_handoff_input, validate_workload_identity, workspace_root, AuditFailureV2,
-        AuditGateV2, AuditLogRecord, AuditLogV2Record, AuditOperationV2, AuditRetentionTierPolicy,
-        BenchSample, CompatibilityPosture, DeadLetterReplaySummaryRecord, FleetBundleCatalog,
-        FleetBundleEntry, FleetRepoRow, FleetSegmentPolicy, GovernanceExceptionEntry,
-        GovernanceExceptionsPacket, MetricLogRecord, MigrationDrillReport, OpsOptions,
-        OpsSubcommand, PluginProvenanceEntry, PluginRegistryIndex, ProviderArtifactSummary,
-        RolloutWavePolicy, TEMP_SEQ,
+        summarize_provider_inputs, sunset_notice_ready, support_model_ready, unix_days_to_ymd,
+        validate_audit_export_v2, validate_siem_handoff_input, validate_workload_identity,
+        workspace_root, AuditFailureV2, AuditGateV2, AuditLogRecord, AuditLogV2Record,
+        AuditOperationV2, AuditRetentionTierPolicy, BenchSample, CompatibilityPosture,
+        DeadLetterReplaySummaryRecord, FleetBundleCatalog, FleetBundleEntry, FleetRepoRow,
+        FleetSegmentPolicy, GovernanceExceptionEntry, GovernanceExceptionsPacket, MetricLogRecord,
+        MigrationDrillReport, OpsOptions, OpsSubcommand, PluginProvenanceEntry,
+        PluginRegistryIndex, ProviderArtifactSummary, RolloutWavePolicy, TEMP_SEQ,
     };
 
     fn sample(case_name: &str, changed_files: usize, fingerprint: &str) -> BenchSample {
@@ -6369,6 +7244,10 @@ mod tests {
             rollback_packet_input: None,
             fleet_review_input: None,
             rc_readiness_input: None,
+            ga_packet_input: None,
+            migration_completion_input: None,
+            dual_run_decommission_input: None,
+            post_ga_telemetry_input: None,
             policy_input: None,
             migration_guide_path: None,
             provider_rollout_path: None,
@@ -6438,6 +7317,10 @@ mod tests {
             rollback_packet_input: None,
             fleet_review_input: None,
             rc_readiness_input: None,
+            ga_packet_input: None,
+            migration_completion_input: None,
+            dual_run_decommission_input: None,
+            post_ga_telemetry_input: None,
             policy_input: None,
             migration_guide_path: None,
             provider_rollout_path: None,
@@ -8068,6 +8951,93 @@ security_sla_hours = "72"
         )
         .expect("write failed drill");
         assert!(!migration_drill_ready(Some(&drill)).expect("drill should parse"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn ga_handoff_validators_reject_thin_docs_and_artifacts() {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("xtask-ga-handoff-{seq}"));
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let sunset = base.join("sunset.md");
+        fs::write(
+            &sunset,
+            "# V1 Sunset Notice\n\n## Countdown markers\n- +30: verify-v2\n- +60: v1-only warning\n- +90: dual-run decommission with `v2-ga-packet.md`\n\n## Compatibility Contract\n- v1.1 compatibility window stays open\n- security / critical fix only\n- provider compatibility is restored through rollback\n- audit v1 is authoritative fallback\n- support model owns escalation\n",
+        )
+        .expect("write sunset");
+        assert!(sunset_notice_ready(Some(&sunset)).expect("sunset ready"));
+
+        let support = base.join("support.md");
+        fs::write(
+            &support,
+            "# V2 Support Model\n\n## Support bands\n- critical\n- standard\n- advisory\n\n## Escalation\n- use GA packet\n\n## Ownership\n- release owner: platform\n- support owner: support\n- security owner: security\n\n## Response expectations\n- critical: 24h\n- standard: 3 business days\n",
+        )
+        .expect("write support");
+        assert!(support_model_ready(Some(&support)).expect("support ready"));
+
+        let ops = base.join("ops.md");
+        fs::write(
+            &ops,
+            "# V2 Ops Handbook\n\n## Core artifacts\n- ecosystem-migration-completion.md\n- dual-run-decommission.md\n- post-ga-telemetry-review.md\n- retrospective-cleanup-queue.md\n\n## Steady-state loop\n- migration-completion\n- dual-run-decommission\n- post-ga-telemetry\n- retrospective-cleanup\n\n## GA command\ncargo run -p xtask -- ops ga-packet\n",
+        )
+        .expect("write ops");
+        assert!(ops_handbook_ready(Some(&ops)).expect("ops ready"));
+
+        let phase201 = base.join("phase201.md");
+        fs::write(
+            &phase201,
+            "# Phase Backcast (201+)\n\n## Entry conditions\n- v2 GA\n\n## First planning packets\n- ecosystem migration completion\n- dual-run decommission\n- post-GA telemetry\n- retrospective cleanup\n\n## Phase201-210 candidates\n- v2 only\n",
+        )
+        .expect("write phase201");
+        assert!(phase201_backcast_ready(Some(&phase201)).expect("phase201 ready"));
+
+        let ga = base.join("ga.md");
+        fs::write(
+            &ga,
+            "# V2 GA Packet\n\n- ga_ready: true\n- lts_active: true\n- lts_branch: lts/v2\n- dual_run_decommission_ready: true\n- post_ga_telemetry_ready: true\n- fleet_governance_ready: true\n- rc_readiness_ready: true\n- go_no_go_ready: true\n- support_model_ready: true\n- sunset_notice_ready: true\n- phase201_backcast_ready: true\n- docs_ready: true\n\n## Checklist\n- [x] LTS policy is active and within SLA\n",
+        )
+        .expect("write ga");
+        assert!(ga_packet_ready(Some(&ga)).expect("ga ready"));
+        fs::write(
+            &ga,
+            "# V2 GA Packet\n\n- ga_ready: true\n- lts_active: true\n- lts_branch: lts/v1\n- dual_run_decommission_ready: true\n- post_ga_telemetry_ready: true\n- fleet_governance_ready: true\n- rc_readiness_ready: true\n- go_no_go_ready: true\n- support_model_ready: true\n- sunset_notice_ready: true\n- phase201_backcast_ready: true\n- docs_ready: true\n\n## Checklist\n- [x] LTS policy is active and within SLA\n",
+        )
+        .expect("write thin ga");
+        assert!(!ga_packet_ready(Some(&ga)).expect("ga should parse"));
+
+        let migration = base.join("migration.md");
+        fs::write(
+            &migration,
+            "# Ecosystem Migration Completion Board\n\n- migration_complete: true\n- provider_bridge_ready: true\n- audit_export_v2_valid: true\n- audit_drift_clean: true\n- shadow_aligned: true\n- fleet_governance_ready: true\n- rc_readiness_ready: true\n- migration_drill_ready: true\n- migration_guide_present: true\n- candidate_checklist_ready: true\n",
+        )
+        .expect("write migration board");
+        assert!(migration_completion_board_ready(Some(&migration)).expect("migration ready"));
+
+        let decommission = base.join("decommission.md");
+        fs::write(
+            &decommission,
+            "# Dual-Run Decommission Plan\n\n- decommission_ready: true\n- replay_clean: true\n- shadow_aligned: true\n- audit_drift_clean: true\n- provider_v1_restore_ready: true\n- rollback_packet_ready: true\n- migration_drill_ready: true\n- rc_readiness_ready: true\n- sunset_notice_ready: true\n- support_model_ready: true\n",
+        )
+        .expect("write decommission");
+        assert!(dual_run_decommission_plan_ready(Some(&decommission)).expect("decommission ready"));
+
+        let telemetry = base.join("telemetry.md");
+        fs::write(
+            &telemetry,
+            "# Post-GA Telemetry Review\n\n- telemetry_review_ready: true\n- slo_ready: true\n- shadow_aligned: true\n- audit_drift_clean: true\n- replay_clean: true\n- fleet_governance_ready: true\n- ga_packet_ready: true\n- support_model_ready: true\n",
+        )
+        .expect("write telemetry");
+        assert!(post_ga_telemetry_review_ready(Some(&telemetry)).expect("telemetry ready"));
+
+        let cleanup = base.join("cleanup.md");
+        fs::write(
+            &cleanup,
+            "# Retrospective And Cleanup Queue\n\n- cleanup_queue_ready: true\n- migration_completion_ready: true\n- dual_run_decommission_ready: true\n- post_ga_telemetry_ready: true\n\n## Cleanup Queue\n- item\n\n## Retrospective Prompts\n- prompt\n",
+        )
+        .expect("write cleanup");
+        assert!(retrospective_cleanup_queue_ready(Some(&cleanup)).expect("cleanup ready"));
 
         let _ = fs::remove_dir_all(base);
     }

@@ -22,6 +22,10 @@ CI/Workflowで自動化済み:
 - Fleet review (`xtask ops fleet-review`)
 - RC readiness (`xtask ops rc-readiness`)
 - GA packet (`xtask ops ga-packet`)
+- ecosystem migration completion (`xtask ops migration-completion`)
+- dual-run decommission (`xtask ops dual-run-decommission`)
+- post-GA telemetry review (`xtask ops post-ga-telemetry`)
+- retrospective cleanup queue (`xtask ops retrospective-cleanup`)
 - LTS backport label check
 
 ## Pre-Release
@@ -49,7 +53,7 @@ CI/Workflowで自動化済み:
   - [ ] `xtask ops audit-drift-report` 実行
   - [ ] `xtask ops shadow-review` 実行（v2 dual-write時）
 - [ ] **LTS Policy**:
-  - [ ] `release.lts.branch` / `security_sla_hours` / `backport_labels` を確認
+  - [ ] v2 GA policy は `release.lts.branch = "lts/v2"` / `security_sla_hours <= 72` / `backport_labels` を確認
   - [ ] `lts-backport.yml` の動作確認
 - [ ] **GA Readiness**: `ga-readiness.yml` artifact確認
 - [ ] **Compatibility Evidence**: `compatibility-report.md` で posture が意図と一致
@@ -71,6 +75,12 @@ CI/Workflowで自動化済み:
   - [ ] `fleet-review.md` は repo / segment cost が green
 - [ ] **GA Evidence**: `v2-ga-packet.md` で RC readiness / go-no-go / LTS / support / sunset / decommission を確認
   - [ ] manual release workflow input は `rc_security_decision=continue` / `ga_decision=go`
+  - [ ] `post_ga_telemetry_ready = true`
+- [ ] **Post-GA Handoff**:
+  - [ ] `ecosystem-migration-completion.md` が provider bridge / audit v2 / fleet governance / migration drill green
+  - [ ] `dual-run-decommission.md` が replay / rollback / v1 restore / support model green
+  - [ ] `post-ga-telemetry-review.md` が SLO / audit parity / replay recovery green
+  - [ ] `retrospective-cleanup-queue.md` が Phase201+ backcast と cleanup queue に接続
 - [ ] **Docs Sync**: `docs/00..05/99` がCLI実装と一致
 
 ## Release

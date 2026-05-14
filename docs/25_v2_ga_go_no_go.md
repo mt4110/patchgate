@@ -9,6 +9,7 @@
 - v1 sunset notice: `docs/21_v1_sunset_notice.md`
 - support path: `docs/22_v2_support_model.md`
 - LTS policy: `artifacts/policy.v2.toml`
+- post-GA handoff: `artifacts/ecosystem-migration-completion.md`, `artifacts/dual-run-decommission.md`, `artifacts/post-ga-telemetry-review.md`
 
 ## Go Conditions
 
@@ -16,7 +17,9 @@
 - rollback remains available through dual-run
 - v1 sunset countdown markers are published
 - support and escalation owners are named
+- LTS branch is `lts/v2` and security SLA is 72h or lower
 - audit drift, benchmark, and cost sign-off have no open blocker
+- migration completion, dual-run decommission, and post-GA telemetry artifacts are green
 
 ## No-Go Conditions
 
@@ -24,7 +27,9 @@
 - rollback cannot restore `bridge_mode = "off"` and `generic_schema = "v1"`
 - v1 sunset notice lacks +30 / +60 / +90 markers
 - support or security SLA owner is missing
+- LTS branch still points at `lts/v1`
 - benchmark or fleet cost sign-off regresses
+- post-GA telemetry review lacks audit v2 parity or support escalation path
 
 ## Decision
 

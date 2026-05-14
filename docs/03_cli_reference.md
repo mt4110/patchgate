@@ -130,6 +130,7 @@ Provider/Webhook/Notification options:
 - `--path <file>`
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
+- `--readiness-profile <standard|ga|lts>`
 - `--provider-input <provider-dual-or-v2.json>` (repeatable)
 - `--audit-input <scan-audit.jsonl>`
 - `--audit-v2-input <scan-audit-v2.jsonl>`
@@ -141,6 +142,7 @@ Provider/Webhook/Notification options:
 - `--exceptions-input <exceptions.json>`
 - v2 shadow / bridge の準備状態を検証
 - 主に `compatibility.v2.*`, `integrations.ci.generic_schema`, `observability.audit_v2_*` を確認
+- `--readiness-profile ga|lts` は `release.lts.active=true`, `release.lts.branch="lts/v2"`, `security_sla_hours <= 72` も確認
 - artifact input を渡した場合は provider dual/v2、audit dual-write、plugin v2 shadow envelope、webhook / notification bridge envelope の実体も確認
 - fleet artifact input を渡した場合は bundle catalog、registry provenance、org exception governance の実体も確認
 
@@ -152,6 +154,58 @@ Provider/Webhook/Notification options:
 - `--enforce`
 - v1 contract と v2 bridge contract の差分を要約
 - `--enforce` は `breaking_change_gate_ready=false` のとき migration-required exit で止める
+
+### `cargo run -p xtask -- ops migration-completion`
+
+- `--metrics-input <scan-metrics.jsonl>`
+- `--audit-input <scan-audit.jsonl>`
+- `--audit-v2-input <scan-audit-v2.jsonl>`
+- `--provider-input <provider-dual-or-v2.json>` (repeatable)
+- `--fleet-review-input <fleet-review.md>`
+- `--rc-readiness-input <v2-rc-readiness.md>`
+- `--migration-drill-input <migration-drill.json>`
+- `--migration-guide-path <docs/16_v2_migration_guide_alpha.md>`
+- `--candidate-checklist-path <docs/18_v2_candidate_release_checklist.md>`
+- `--output <ecosystem-migration-completion.md>`
+- provider bridge / audit v2 parity / fleet governance / RC readiness を repo board として固定
+
+### `cargo run -p xtask -- ops dual-run-decommission`
+
+- `--audit-input <scan-audit.jsonl>`
+- `--audit-v2-input <scan-audit-v2.jsonl>`
+- `--replay-summary-input <dead-letter-rewrite-summary.json>`
+- `--provider-input <provider-dual-or-v2.json>` (repeatable)
+- `--rollback-packet-input <rollback-packet.json>`
+- `--migration-drill-input <migration-drill.json>`
+- `--rc-readiness-input <v2-rc-readiness.md>`
+- `--sunset-notice-path <docs/21_v1_sunset_notice.md>`
+- `--support-model-path <docs/22_v2_support_model.md>`
+- `--output <dual-run-decommission.md>`
+- dual-run停止前に rollback restore / replay recovery / sunset compatibility / support model を確認
+
+### `cargo run -p xtask -- ops post-ga-telemetry`
+
+- `--metrics-input <scan-metrics.jsonl>`
+- `--audit-input <scan-audit.jsonl>`
+- `--audit-v2-input <scan-audit-v2.jsonl>`
+- `--replay-summary-input <dead-letter-rewrite-summary.json>`
+- `--fleet-review-input <fleet-review.md>`
+- `--ga-packet-input <v2-ga-packet.md>`
+- `--support-model-path <docs/22_v2_support_model.md>`
+- `--output <post-ga-telemetry-review.md>`
+- GA後の SLO / audit parity / replay recovery / escalation signal をまとめる
+
+### `cargo run -p xtask -- ops retrospective-cleanup`
+
+- `--migration-completion-input <ecosystem-migration-completion.md>`
+- `--dual-run-decommission-input <dual-run-decommission.md>`
+- `--post-ga-telemetry-input <post-ga-telemetry-review.md>`
+- `--ops-handbook-path <docs/19_v2_ops_handbook.md>`
+- `--support-model-path <docs/22_v2_support_model.md>`
+- `--sunset-notice-path <docs/21_v1_sunset_notice.md>`
+- `--phase201-backcast-path <docs/20_phase201_plus_backcast.md>`
+- `--output <retrospective-cleanup-queue.md>`
+- GA/LTS handoff 後に残す fixture と削除候補を cleanup queue として固定
 
 ### `patchgate plugin init`
 
