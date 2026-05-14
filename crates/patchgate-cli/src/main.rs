@@ -1476,6 +1476,39 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn canonicalize_existing_prefix(path: &Path, label: &str) -> Result<PathBuf> {
+    let normalized = normalize_absolute_path(path);
+    let mut cursor = normalized.as_path();
+    let mut missing_tail = Vec::new();
+
+    loop {
+        if cursor
+            .try_exists()
+            .with_context(|| format!("check {label} {}", cursor.display()))?
+        {
+            let mut canonical = fs::canonicalize(cursor)
+                .with_context(|| format!("canonicalize {label} {}", cursor.display()))?;
+            for component in missing_tail.iter().rev() {
+                canonical.push(component);
+            }
+            return Ok(normalize_absolute_path(&canonical));
+        }
+
+        let Some(name) = cursor.file_name() else {
+            return Ok(normalized);
+        };
+        missing_tail.push(name.to_os_string());
+
+        let Some(parent) = cursor.parent() else {
+            return Ok(normalized);
+        };
+        if parent == cursor {
+            return Ok(normalized);
+        }
+        cursor = parent;
+    }
+}
+
 const NODE_TEMPLATE_README: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdk/templates/node-plugin/README.md"
@@ -6205,32 +6238,13 @@ fn policy_authority_relative_path(repo_root: &Path, policy_path: &Path) -> Resul
     } else {
         std::env::current_dir()?.join(repo_root)
     };
-    let repo_root = normalize_absolute_path(&repo_root);
-    let repo_root = if repo_root
-        .try_exists()
-        .with_context(|| format!("check repository root {}", repo_root.display()))?
-    {
-        fs::canonicalize(&repo_root)
-            .with_context(|| format!("canonicalize repository root {}", repo_root.display()))?
-    } else {
-        repo_root
-    };
-    let repo_root = normalize_absolute_path(&repo_root);
+    let repo_root = canonicalize_existing_prefix(&repo_root, "repository root")?;
     let policy_path = if policy_path.is_absolute() {
         policy_path.to_path_buf()
     } else {
         repo_root.join(policy_path)
     };
-    let policy_path = normalize_absolute_path(&policy_path);
-    let policy_path = if policy_path
-        .try_exists()
-        .with_context(|| format!("check policy file {}", policy_path.display()))?
-    {
-        fs::canonicalize(&policy_path)
-            .with_context(|| format!("canonicalize policy file {}", policy_path.display()))?
-    } else {
-        policy_path
-    };
+    let policy_path = canonicalize_existing_prefix(&policy_path, "policy file")?;
     let relative = policy_path.strip_prefix(&repo_root).with_context(|| {
         format!(
             "policy path {} must be inside repository root {} for trusted ref resolution",
