@@ -1629,17 +1629,17 @@ fn prepare_verified_plugin_execution_artifact(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = ctx
-        .repo_root
-        .join("target")
-        .join("patchgate-plugin-exec")
-        .join(format!("{}-{nonce}", std::process::id()));
-    fs::create_dir_all(dir.as_path()).with_context(|| {
+    let dir = std::env::temp_dir().join(format!(
+        "patchgate-plugin-exec-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(dir.as_path()).with_context(|| {
         format!(
             "failed to create verified plugin execution directory {}",
             dir.display()
         )
     })?;
+    restrict_plugin_execution_dir_permissions(dir.as_path())?;
     let copied_artifact_path = dir.join(artifact_name);
     fs::copy(
         trust.artifact_path.as_path(),
@@ -1710,6 +1710,26 @@ fn paths_match_for_artifact(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+#[cfg(unix)]
+fn restrict_plugin_execution_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("failed to read permissions for {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).with_context(|| {
+        format!(
+            "failed to restrict verified plugin execution directory {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_plugin_execution_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn plugin_signature_key_envs(signature: &patchgate_config::PluginSignatureConfig) -> Vec<String> {
