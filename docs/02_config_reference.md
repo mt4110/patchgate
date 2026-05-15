@@ -34,6 +34,9 @@
   - `plugin_max_penalty`
 - `[test_gap]`, `[dangerous_change]`, `[dependency_update]`
 - `[waiver]`
+  - `entries = [{ check_id, reason, approver, expires_at }]`
+  - optional v1 binding fields: `waiver_id`, `gate_id`, `evidence_id`, `ticket`
+  - `gate_id = "critical-supply-chain"` or `check_id = "critical_supply_chain"` can scope a waiver to the critical supply-chain hard gate.
 
 ## Plugin sections (Phase81-83)
 

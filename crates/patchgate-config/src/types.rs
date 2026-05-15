@@ -1050,7 +1050,15 @@ pub struct WaiverConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WaiverEntry {
+    #[serde(default)]
+    pub waiver_id: String,
     pub check_id: String,
+    #[serde(default)]
+    pub gate_id: String,
+    #[serde(default)]
+    pub evidence_id: String,
+    #[serde(default)]
+    pub ticket: String,
     pub reason: String,
     pub approver: String,
     pub expires_at: String,

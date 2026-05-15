@@ -107,6 +107,65 @@ fn scan_json_integration_flow_is_stable() -> TestResult<()> {
     assert!(report.get("checks").is_some());
     assert!(report.get("findings").is_some());
     assert!(report.get("policy_authority").is_some());
+    assert_eq!(
+        report.get("decision").and_then(|v| v.get("schema_version")),
+        Some(&serde_json::Value::String(
+            "patchgate.decision.v1".to_string()
+        ))
+    );
+    assert!(report.get("evidence").is_some());
+
+    Ok(())
+}
+
+#[test]
+fn decision_replay_accepts_scan_report_json() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.append_line("src/lib.rs", "pub fn replayed() -> i32 { 4 }")?;
+    let report_path = repo.root().join("artifacts/report.json");
+
+    let output = run_patchgate(
+        repo.root(),
+        &[
+            "scan",
+            "--scope",
+            "worktree",
+            "--format",
+            "json",
+            "--mode",
+            "warn",
+            "--no-cache",
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "scan should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::create_dir_all(report_path.parent().ok_or("missing report parent")?)?;
+    fs::write(&report_path, output.stdout)?;
+
+    let replay = run_patchgate(
+        repo.root(),
+        &[
+            "decision",
+            "replay",
+            "--input",
+            report_path.to_str().ok_or("invalid report path utf8")?,
+            "--format",
+            "json",
+        ],
+    )?;
+    assert!(
+        replay.status.success(),
+        "decision replay should succeed: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let decision: serde_json::Value = serde_json::from_slice(&replay.stdout)?;
+    assert_eq!(
+        decision.get("schema_version").and_then(|v| v.as_str()),
+        Some("patchgate.decision.v1")
+    );
 
     Ok(())
 }

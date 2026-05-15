@@ -204,6 +204,12 @@ impl Runner {
             report.diagnostic_hints.extend(plugin_outcome.diagnostics);
         }
         report.plugin_invocations = plugin_outcome.invocations;
+        report.refresh_decision(&self.policy.waiver.entries, Vec::new());
+        if report.decision.has_failed_hard_gate() {
+            report
+                .diagnostic_hints
+                .push("Hard gate failure blocks the decision independently of score.".to_string());
+        }
         Ok(report)
     }
 
@@ -2962,7 +2968,7 @@ mod tests {
             fingerprint: "dummy".to_string(),
         };
 
-        let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
+        let report = runner.evaluate(&ctx, diff, "enforce").expect("evaluate");
         assert!(
             report
                 .supply_chain_signals
@@ -2970,6 +2976,14 @@ mod tests {
                 .any(|s| s.id == "SCM-002"),
             "lockfile add/remove with CI change should trigger SCM-002"
         );
+        assert!(
+            report.decision.hard_gates.iter().any(|gate| {
+                gate.gate_id == "critical-supply-chain"
+                    && gate.result == crate::model::GateDecisionResult::Fail
+            }),
+            "critical supply-chain evidence should become an unwaived hard gate"
+        );
+        assert_eq!(report.decision.result, crate::model::DecisionResult::Fail);
     }
 
     #[test]

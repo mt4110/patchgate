@@ -34,8 +34,9 @@ use patchgate_config::{
     POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
-    failure_codes, CheckId, CheckScore, Context, Finding, Report, ReportMeta, ReviewPriority,
-    Runner, ScopeMode, Severity,
+    failure_codes, CheckId, CheckScore, Context, Decision, DecisionResult, Finding,
+    GateDecisionResult, Report, ReportMeta, ReviewPriority, Runner, ScopeMode, Severity,
+    DECISION_SCHEMA_VERSION,
 };
 
 #[derive(Parser, Debug)]
@@ -73,6 +74,9 @@ enum Command {
 
     /// Manage external plugin templates
     Plugin(PluginArgs),
+
+    /// Replay decision artifacts and print the gate outcome
+    Decision(DecisionArgs),
 
     /// Replay delivery dead-letter records
     Delivery(DeliveryArgs),
@@ -346,6 +350,29 @@ struct PluginArgs {
 struct DeliveryArgs {
     #[command(subcommand)]
     cmd: DeliveryCommand,
+}
+
+#[derive(Args, Debug)]
+struct DecisionArgs {
+    #[command(subcommand)]
+    cmd: DecisionCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DecisionCommand {
+    /// Replay a decision or scan report JSON artifact
+    Replay(DecisionReplayArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DecisionReplayArgs {
+    /// Decision JSON or scan report JSON containing a decision field
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output format: text|json
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1262,6 +1289,10 @@ fn main() -> Result<()> {
             let code = execute_plugin(&repo_root, plugin);
             std::process::exit(code);
         }
+        Command::Decision(decision) => {
+            let code = execute_decision(decision);
+            std::process::exit(code);
+        }
         Command::Delivery(delivery) => {
             let code = execute_delivery(delivery);
             std::process::exit(code);
@@ -1281,6 +1312,18 @@ fn execute_plugin(repo_root: &Path, plugin: PluginArgs) -> i32 {
     }
 }
 
+fn execute_decision(decision: DecisionArgs) -> i32 {
+    match decision.cmd {
+        DecisionCommand::Replay(args) => match run_decision_replay(args) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("patchgate decision replay error: {err:#}");
+                2
+            }
+        },
+    }
+}
+
 fn execute_delivery(delivery: DeliveryArgs) -> i32 {
     match delivery.cmd {
         DeliveryCommand::Replay(args) => match run_dead_letter_replay(args) {
@@ -1290,6 +1333,100 @@ fn execute_delivery(delivery: DeliveryArgs) -> i32 {
                 6
             }
         },
+    }
+}
+
+fn run_decision_replay(args: DecisionReplayArgs) -> Result<i32> {
+    let raw = fs::read_to_string(&args.input)
+        .with_context(|| format!("failed to read decision input: {}", args.input.display()))?;
+    let mut value: Value = serde_json::from_str(raw.as_str())
+        .with_context(|| format!("failed to parse decision input: {}", args.input.display()))?;
+    mask_json_string_values(&mut value);
+    let decision = decision_from_replay_value(value)?;
+    match args.format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&decision)?);
+        }
+        "text" => print_decision_text(&decision),
+        other => bail_invalid_decision_format(other)?,
+    }
+    Ok(decision_replay_exit_code(&decision))
+}
+
+fn decision_from_replay_value(value: Value) -> Result<Decision> {
+    if value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == DECISION_SCHEMA_VERSION)
+    {
+        return serde_json::from_value(value).context("failed to decode decision schema v1");
+    }
+    if let Some(decision_value) = value.get("decision").cloned() {
+        let decision: Decision =
+            serde_json::from_value(decision_value).context("failed to decode report decision")?;
+        if decision.schema_version == DECISION_SCHEMA_VERSION {
+            return Ok(decision);
+        }
+    }
+    let mut report: Report = serde_json::from_value(value)
+        .context("input is neither decision JSON nor scan report JSON")?;
+    report.refresh_decision(&[], report.decision.runtime.errors.clone());
+    Ok(report.decision)
+}
+
+fn print_decision_text(decision: &Decision) {
+    println!(
+        "Decision: {} (mode={}, scope={})",
+        decision.result.as_str().to_uppercase(),
+        decision.mode,
+        decision.scope
+    );
+    println!(
+        "Score: {}/{} ({:?}) failed={}",
+        decision.score.value, decision.score.threshold, decision.score.band, decision.score.failed
+    );
+    println!("Policy authority: {}", decision.policy_authority_digest);
+    println!("Diff: {}", decision.diff_digest);
+    if decision.hard_gates.is_empty() {
+        println!("Hard gates: none");
+    } else {
+        println!("Hard gates:");
+        for gate in &decision.hard_gates {
+            println!(
+                "- {}: {:?} evidence={}",
+                gate.gate_id,
+                gate.result,
+                gate.evidence_ids.join(",")
+            );
+        }
+    }
+    if !decision.waivers.is_empty() {
+        println!("Waivers:");
+        for waiver in &decision.waivers {
+            println!(
+                "- {} evidence={} valid={} expires_at={}",
+                waiver.waiver_id, waiver.evidence_id, waiver.valid, waiver.expires_at
+            );
+        }
+    }
+    if decision.runtime.result != patchgate_core::RuntimeDecisionStatus::Ok {
+        println!("Runtime: {:?}", decision.runtime.result);
+        for err in &decision.runtime.errors {
+            println!("- {}:{} {}", err.category, err.code, err.message);
+        }
+    }
+}
+
+fn bail_invalid_decision_format(format: &str) -> Result<()> {
+    Err(anyhow!(
+        "invalid value for decision.replay.format: `{format}` (expected: text|json)"
+    ))
+}
+
+fn decision_replay_exit_code(decision: &Decision) -> i32 {
+    match decision.result {
+        DecisionResult::Pass | DecisionResult::Warn => 0,
+        DecisionResult::Fail | DecisionResult::Error => 1,
     }
 }
 
@@ -5325,6 +5462,7 @@ fn execute_scan(
         &authority_failures,
         opts.mode.as_str(),
     );
+    report.refresh_decision(&cfg.waiver.entries, Vec::new());
     profile.skipped_by_cache = report.skipped_by_cache;
     if report.skipped_by_cache {
         profile.check_durations_ms.clear();
@@ -7908,6 +8046,12 @@ fn print_text(report: &Report) {
     println!("Mode: {} | Scope: {}", report.mode, report.scope);
     println!("Fingerprint: {}", report.fingerprint);
     println!(
+        "Decision: {} | hard_gates={} | evidence={}",
+        report.decision.result.as_str(),
+        report.decision.hard_gates.len(),
+        report.evidence.len()
+    );
+    println!(
         "Policy authority: trusted={} digest={}",
         report.policy_authority.trusted, report.policy_authority.digest
     );
@@ -8009,6 +8153,77 @@ fn sorted_findings_for_comment(findings: &[Finding]) -> Vec<&Finding> {
     sorted
 }
 
+fn comment_result_label(result: DecisionResult) -> &'static str {
+    match result {
+        DecisionResult::Pass => "PASS",
+        DecisionResult::Fail => "FAIL",
+        DecisionResult::Warn => "WARN",
+        DecisionResult::Error => "ERROR",
+    }
+}
+
+fn evidence_summary_for_comment(report: &Report, evidence_id: &str) -> String {
+    report
+        .evidence
+        .iter()
+        .find(|evidence| evidence.evidence_id == evidence_id)
+        .map(|evidence| {
+            let location = evidence
+                .location
+                .as_ref()
+                .map(|location| format!(" `{}`", location.path_display))
+                .unwrap_or_default();
+            format!("{}{}", evidence.message, location)
+        })
+        .unwrap_or_else(|| evidence_id.to_string())
+}
+
+fn evidence_is_waived_for_comment(report: &Report, evidence_id: &str) -> bool {
+    report
+        .decision
+        .waivers
+        .iter()
+        .any(|waiver| waiver.valid && waiver.evidence_id == evidence_id)
+}
+
+fn failed_evidence_ids_for_comment(report: &Report) -> Vec<&str> {
+    report
+        .decision
+        .hard_gates
+        .iter()
+        .filter(|gate| gate.result == GateDecisionResult::Fail)
+        .flat_map(|gate| gate.evidence_ids.iter().map(String::as_str))
+        .filter(|id| !evidence_is_waived_for_comment(report, id))
+        .collect()
+}
+
+fn required_actions_for_comment(report: &Report) -> Vec<String> {
+    let mut actions = Vec::new();
+    for evidence_id in failed_evidence_ids_for_comment(report) {
+        if let Some(evidence) = report
+            .evidence
+            .iter()
+            .find(|evidence| evidence.evidence_id == evidence_id)
+        {
+            if !evidence.remediation.is_empty() && !actions.contains(&evidence.remediation) {
+                actions.push(evidence.remediation.clone());
+            }
+        }
+    }
+    actions
+}
+
+fn score_decision_sentence(report: &Report) -> String {
+    let score = &report.decision.score;
+    if report.decision.has_failed_hard_gate() && !score.failed {
+        "score would pass, but a hard gate failed.".to_string()
+    } else if score.failed {
+        "score is below threshold.".to_string()
+    } else {
+        "score passes.".to_string()
+    }
+}
+
 fn render_github_comment(report: &Report) -> String {
     let mut lines = Vec::new();
     let sorted_findings = sorted_findings_for_comment(&report.findings);
@@ -8035,12 +8250,73 @@ fn render_github_comment(report: &Report) -> String {
 
     lines.push("<!-- patchgate:report -->".to_string());
     lines.push(String::new());
-    lines.push("## patchgate report".to_string());
-    lines.push(String::new());
     lines.push(format!(
-        "- Score: **{}/100** (threshold: **{}**)",
-        report.score, report.threshold
+        "## PatchGate: {}",
+        comment_result_label(report.decision.result)
     ));
+    lines.push(String::new());
+    lines.push(format!("- Decision id: `{}`", report.decision.decision_id));
+    lines.push(format!(
+        "- Mode: `{}` | Scope: `{}`",
+        report.decision.mode, report.decision.scope
+    ));
+    lines.push(format!(
+        "- Policy authority: trusted=`{}` digest=`{}`",
+        report.policy_authority.trusted, report.decision.policy_authority_digest
+    ));
+    lines.push(format!(
+        "- Score: **{}/100** (threshold: **{}**, band: **{:?}**) - {}",
+        report.decision.score.value,
+        report.decision.score.threshold,
+        report.decision.score.band,
+        score_decision_sentence(report)
+    ));
+    if report.decision.hard_gates.is_empty() {
+        lines.push("- Hard gates: none".to_string());
+    } else {
+        let failed_gates: Vec<_> = report
+            .decision
+            .hard_gates
+            .iter()
+            .filter(|gate| gate.result == GateDecisionResult::Fail)
+            .collect();
+        if failed_gates.is_empty() {
+            lines.push(format!(
+                "- Hard gates: {} evaluated, no unwaived failures",
+                report.decision.hard_gates.len()
+            ));
+        } else {
+            lines.push("- Hard gate failures:".to_string());
+            for gate in failed_gates.iter().take(5) {
+                let evidence = gate
+                    .evidence_ids
+                    .iter()
+                    .filter(|id| !evidence_is_waived_for_comment(report, id))
+                    .take(2)
+                    .map(|id| evidence_summary_for_comment(report, id))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                lines.push(format!("  - `{}`: {}", gate.gate_id, evidence));
+            }
+        }
+    }
+    let required_actions = required_actions_for_comment(report);
+    if !required_actions.is_empty() {
+        lines.push("- Required actions:".to_string());
+        for action in required_actions.iter().take(5) {
+            lines.push(format!("  - {action}"));
+        }
+    }
+    if report.decision.has_failed_hard_gate() {
+        lines.push("- Waiver: valid, scoped waiver required for hard-gate bypass.".to_string());
+    } else if !report.decision.waivers.is_empty() {
+        lines.push(format!(
+            "- Waivers: {} valid waiver(s) applied",
+            report.decision.waivers.len()
+        ));
+    }
+    lines.push(String::new());
+    lines.push("### Run summary".to_string());
     lines.push(format!(
         "- Review priority: **{:?}**",
         report.review_priority
@@ -8263,7 +8539,10 @@ mod tests {
 
     use clap::Parser as _;
     use patchgate_config::{Config, PolicyAuthority, PolicyAuthorityFailure};
-    use patchgate_core::{CheckId, CheckScore, Finding, Report, ReportMeta, Severity};
+    use patchgate_core::{
+        CheckId, CheckScore, DecisionResult, Finding, Report, ReportMeta, Severity,
+        SupplyChainSignal,
+    };
     use patchgate_github::PublishAuth;
     use serde_json::Value;
 
@@ -8272,19 +8551,19 @@ mod tests {
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
         build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
         build_history_trend, bundle_catalog_artifact_summary, changed_file_limit_fail_open_report,
-        ci_template_catalog, delivery_bridge_headers, delivery_bridge_metadata,
-        detect_head_sha_from_env, detect_pr_number_from_env, detect_sandbox_capabilities,
-        effective_policy_hash, exception_expired, exception_governance_artifact_summary,
-        gate_exit_code, is_likely_cache_corruption, load_dead_letter_jsonl, load_policy_config,
-        notification_payload, parse_mode, parse_policy_preset, parse_scope,
-        policy_authority_relative_path, pr_head_sha_from_event_payload,
-        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
-        recover_cache_db, redacted_endpoint, registry_provenance_artifact_summary,
-        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
-        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
-        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
-        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
-        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        ci_template_catalog, decision_from_replay_value, delivery_bridge_headers,
+        delivery_bridge_metadata, detect_head_sha_from_env, detect_pr_number_from_env,
+        detect_sandbox_capabilities, effective_policy_hash, exception_expired,
+        exception_governance_artifact_summary, gate_exit_code, is_likely_cache_corruption,
+        load_dead_letter_jsonl, load_policy_config, notification_payload, parse_mode,
+        parse_policy_preset, parse_scope, policy_authority_relative_path,
+        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
+        publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
+        registry_provenance_artifact_summary, render_contract_diff_report_json,
+        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
+        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
+        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
+        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -9251,6 +9530,146 @@ mod tests {
             .expect("critical finding line");
         assert!(critical_line_idx > priority_idx);
         assert!(critical_line_idx < all_idx);
+    }
+
+    #[test]
+    fn github_comment_summarizes_hard_gate_before_findings() {
+        let mut report = Report::new(
+            Vec::new(),
+            vec![CheckScore {
+                check: CheckId::DependencyUpdate,
+                label: "Dependency update risk".to_string(),
+                penalty: 0,
+                max_penalty: 30,
+                triggered: false,
+            }],
+            ReportMeta {
+                threshold: 70,
+                mode: "enforce".to_string(),
+                scope: "pr".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec!["package-lock.json".to_string()],
+            tags: vec!["supply-chain".to_string()],
+        });
+        report.refresh_decision(&[], Vec::new());
+
+        let comment = render_github_comment(&report);
+
+        assert!(comment.contains("## PatchGate: FAIL"));
+        assert!(comment.contains("- Hard gate failures:"));
+        assert!(comment.contains("score would pass, but a hard gate failed."));
+        assert!(
+            comment.find("- Hard gate failures:") < comment.find("### Priority findings"),
+            "hard gate summary should be above the detailed finding list"
+        );
+    }
+
+    #[test]
+    fn github_comment_omits_waived_evidence_from_failed_gate_actions() {
+        let mut waived = finding("waived-critical", Severity::Critical, 10);
+        waived.check = CheckId::DangerousChange;
+        waived.category = CheckId::DangerousChange.as_str().to_string();
+        waived.message = "message-waived-critical".to_string();
+
+        let mut active = finding("active-critical", Severity::Critical, 10);
+        active.check = CheckId::TestGap;
+        active.category = CheckId::TestGap.as_str().to_string();
+        active.message = "message-active-critical".to_string();
+
+        let mut report = Report::new(
+            vec![waived, active],
+            vec![
+                CheckScore {
+                    check: CheckId::DangerousChange,
+                    label: "Dangerous file changes".to_string(),
+                    penalty: 10,
+                    max_penalty: 70,
+                    triggered: true,
+                },
+                CheckScore {
+                    check: CheckId::TestGap,
+                    label: "Test coverage gap".to_string(),
+                    penalty: 10,
+                    max_penalty: 35,
+                    triggered: true,
+                },
+            ],
+            ReportMeta {
+                threshold: 70,
+                mode: "enforce".to_string(),
+                scope: "pr".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let waived_evidence_id = report
+            .evidence
+            .iter()
+            .find(|evidence| evidence.message == "message-waived-critical")
+            .expect("waived evidence")
+            .evidence_id
+            .clone();
+        report.refresh_decision(
+            &[patchgate_config::WaiverEntry {
+                waiver_id: "wv_dangerous_exception".to_string(),
+                check_id: "critical-evidence".to_string(),
+                gate_id: "critical-evidence".to_string(),
+                evidence_id: waived_evidence_id,
+                ticket: "SEC-3".to_string(),
+                reason: "Approved exception".to_string(),
+                approver: "appsec".to_string(),
+                expires_at: "2999-01-01T00:00:00Z".to_string(),
+            }],
+            Vec::new(),
+        );
+
+        let comment = render_github_comment(&report);
+        let decision_summary = comment.split("### Run summary").next().expect("summary");
+
+        assert!(decision_summary.contains("message-active-critical"));
+        assert!(!decision_summary.contains("message-waived-critical"));
+        assert!(decision_summary.contains("Add or update tests covering the changed package."));
+        assert!(!decision_summary
+            .contains("Get the required owner review or split the high-risk change."));
+    }
+
+    #[test]
+    fn decision_replay_reads_embedded_report_decision() {
+        let mut report = Report::new(
+            Vec::new(),
+            vec![CheckScore {
+                check: CheckId::TestGap,
+                label: "Test coverage gap".to_string(),
+                penalty: 40,
+                max_penalty: 40,
+                triggered: true,
+            }],
+            ReportMeta {
+                threshold: 80,
+                mode: "enforce".to_string(),
+                scope: "pr".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        report.refresh_decision(&[], Vec::new());
+        let value = serde_json::to_value(&report).expect("report json");
+
+        let decision = decision_from_replay_value(value).expect("decision replay");
+
+        assert_eq!(decision.result, DecisionResult::Fail);
+        assert!(decision.score.failed);
     }
 
     #[test]
