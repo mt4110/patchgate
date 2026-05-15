@@ -8122,8 +8122,7 @@ fn cache_file_digest(repo_root: &Path, raw_path: &str) -> Result<String> {
     match fs::read(path.as_path()) {
         Ok(bytes) => Ok(format!("sha256:{:x}", Sha256::digest(bytes))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(format!("missing:{trimmed}")),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to read plugin cache material {}", path.display())),
+        Err(err) => Ok(format!("unreadable:{:?}:{trimmed}", err.kind())),
     }
 }
 
@@ -10055,6 +10054,47 @@ mod tests {
             plugin_cache_trust_material_hash(&repo_root, &second).expect("second trust hash");
 
         assert_eq!(first_hash, second_hash);
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_cache_trust_material_tolerates_unreadable_files() {
+        use std::os::unix::net::UnixListener;
+
+        let repo_root = temp_path("patchgate-cli-plugin-cache-unreadable");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let manifest_path = repo_root.join("plugin.toml");
+        let lockfile_path = repo_root.join("patchgate-plugin.lock");
+        let plugin_socket_path = PathBuf::from(format!(
+            "/tmp/pg-{}-{}.sock",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&manifest_path, "version = 1\n").expect("write manifest");
+        fs::write(&lockfile_path, "{}\n").expect("write lockfile");
+        let _ = fs::remove_file(&plugin_socket_path);
+        let listener = UnixListener::bind(&plugin_socket_path).expect("bind plugin socket");
+
+        let mut cfg = Config::default();
+        cfg.plugins.enabled = true;
+        cfg.plugins.lockfile_path = lockfile_path.to_string_lossy().to_string();
+        cfg.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_socket_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+        });
+
+        let hash = plugin_cache_trust_material_hash(&repo_root, &cfg)
+            .expect("trust hash tolerates unreadable plugin cache material");
+
+        assert_eq!(hash.len(), 64);
+        drop(listener);
+        let _ = fs::remove_file(&plugin_socket_path);
         let _ = fs::remove_dir_all(repo_root);
     }
 
