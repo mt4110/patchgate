@@ -264,6 +264,7 @@ fn pr_scope_fetches_missing_refs_heads_base() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn special_path_and_binary_fixtures_cannot_bypass_gate() -> TestResult<()> {
     let repo = TestRepo::create()?;
@@ -287,6 +288,31 @@ fn special_path_and_binary_fixtures_cannot_bypass_gate() -> TestResult<()> {
 
     assert!(report.should_fail);
     assert!(finding_ids.contains("DIFF-001"));
+    assert!(finding_ids.contains("DIFF-004"));
+
+    Ok(())
+}
+
+#[test]
+fn binary_fixture_cannot_bypass_gate_on_all_platforms() -> TestResult<()> {
+    let repo = TestRepo::create()?;
+    repo.write_bytes("fixtures/blob.bin", b"\0base")?;
+    repo.git(&["add", "fixtures/blob.bin"])?;
+    repo.git(&["commit", "-qm", "binary fixture"])?;
+
+    repo.write_bytes("fixtures/blob.bin", b"\0changed\xff")?;
+
+    let runner = Runner::new(Config::default());
+    let report = runner.run(
+        &Context {
+            repo_root: repo.root().to_path_buf(),
+            scope: ScopeMode::Worktree,
+        },
+        "enforce",
+    )?;
+    let finding_ids = file_set(report.findings.iter().map(|finding| finding.id.clone()));
+
+    assert!(report.should_fail);
     assert!(finding_ids.contains("DIFF-004"));
 
     Ok(())
