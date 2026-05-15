@@ -36,6 +36,8 @@ The signature covers the manifest fields that define execution identity: id, ver
 
 `artifacts.lockfile` is the digest of the canonical lock entry binding: lockfile schema version, plugin id, plugin version, source, and signing key fingerprint. Runtime also verifies the concrete `manifest_digest` in `patchgate-plugin.lock`, which avoids a circular manifest-to-lockfile hash while still binding the signed manifest to the lock material.
 
+Unknown manifest fields are rejected instead of ignored.
+
 ## Lockfile
 
 `plugins.lockfile_path` defaults to `patchgate-plugin.lock`.
@@ -56,6 +58,8 @@ The signature covers the manifest fields that define execution identity: id, ver
 ```
 
 In `enforce` mode, the lockfile must contain the plugin id, version, manifest digest, source, and signing key fingerprint that were verified at runtime.
+
+Unknown lockfile fields are rejected instead of ignored.
 
 ## Permissions
 

@@ -552,6 +552,7 @@ struct PluginEvaluationOutcome {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PluginManifest {
     schema_version: String,
     id: String,
@@ -565,6 +566,7 @@ struct PluginManifest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PluginManifestPermissions {
     #[serde(default)]
     network: bool,
@@ -577,18 +579,21 @@ struct PluginManifestPermissions {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PluginManifestArtifacts {
     main: String,
     lockfile: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PluginManifestProducer {
     kind: String,
     emits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PluginManifestSignature {
     key_id: String,
     signature: String,
@@ -608,6 +613,7 @@ struct PluginManifestSigningPayload<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginLockfile {
     #[serde(default = "default_plugin_lock_schema_version")]
     schema_version: String,
@@ -615,6 +621,7 @@ struct PluginLockfile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginLockfileEntry {
     id: String,
     version: String,
@@ -4088,6 +4095,44 @@ mod tests {
         std::fs::write(&lockfile_path, lockfile_json).expect("write lockfile");
         policy.plugins.lockfile_path = lockfile_path.to_string_lossy().to_string();
         (manifest_path, lockfile_path, signing_fingerprint)
+    }
+
+    #[test]
+    fn plugin_manifest_schema_rejects_unknown_fields() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let manifest_toml = format!(
+            r#"
+schema_version = "{}"
+id = "sample"
+version = "0.1.0"
+entrypoint = ["sh"]
+runtime = "sh"
+
+[permissions]
+network = false
+env = []
+read_paths = ["."]
+write_paths = []
+
+[artifacts]
+main = "{}"
+lockfile = "{}"
+
+[producer]
+kind = "scanner-adapter"
+emits = ["{}"]
+
+[signature]
+key_id = "test-key"
+signature = "base64:AA=="
+extra = "ignored"
+"#,
+            PLUGIN_MANIFEST_SCHEMA_VERSION, digest, digest, PLUGIN_OUTPUT_SCHEMA_VERSION
+        );
+
+        let err =
+            toml::from_str::<PluginManifest>(manifest_toml.as_str()).expect_err("unknown field");
+        assert!(format!("{err:#}").contains("unknown field"));
     }
 
     #[test]
