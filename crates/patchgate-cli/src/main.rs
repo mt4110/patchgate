@@ -8178,16 +8178,28 @@ fn evidence_summary_for_comment(report: &Report, evidence_id: &str) -> String {
         .unwrap_or_else(|| evidence_id.to_string())
 }
 
-fn required_actions_for_comment(report: &Report) -> Vec<String> {
-    let failed_evidence_ids: Vec<&str> = report
+fn evidence_is_waived_for_comment(report: &Report, evidence_id: &str) -> bool {
+    report
+        .decision
+        .waivers
+        .iter()
+        .any(|waiver| waiver.valid && waiver.evidence_id == evidence_id)
+}
+
+fn failed_evidence_ids_for_comment(report: &Report) -> Vec<&str> {
+    report
         .decision
         .hard_gates
         .iter()
         .filter(|gate| gate.result == GateDecisionResult::Fail)
         .flat_map(|gate| gate.evidence_ids.iter().map(String::as_str))
-        .collect();
+        .filter(|id| !evidence_is_waived_for_comment(report, id))
+        .collect()
+}
+
+fn required_actions_for_comment(report: &Report) -> Vec<String> {
     let mut actions = Vec::new();
-    for evidence_id in failed_evidence_ids {
+    for evidence_id in failed_evidence_ids_for_comment(report) {
         if let Some(evidence) = report
             .evidence
             .iter()
@@ -8279,6 +8291,7 @@ fn render_github_comment(report: &Report) -> String {
                 let evidence = gate
                     .evidence_ids
                     .iter()
+                    .filter(|id| !evidence_is_waived_for_comment(report, id))
                     .take(2)
                     .map(|id| evidence_summary_for_comment(report, id))
                     .collect::<Vec<_>>()
@@ -9558,6 +9571,76 @@ mod tests {
             comment.find("- Hard gate failures:") < comment.find("### Priority findings"),
             "hard gate summary should be above the detailed finding list"
         );
+    }
+
+    #[test]
+    fn github_comment_omits_waived_evidence_from_failed_gate_actions() {
+        let mut waived = finding("waived-critical", Severity::Critical, 10);
+        waived.check = CheckId::DangerousChange;
+        waived.category = CheckId::DangerousChange.as_str().to_string();
+        waived.message = "message-waived-critical".to_string();
+
+        let mut active = finding("active-critical", Severity::Critical, 10);
+        active.check = CheckId::TestGap;
+        active.category = CheckId::TestGap.as_str().to_string();
+        active.message = "message-active-critical".to_string();
+
+        let mut report = Report::new(
+            vec![waived, active],
+            vec![
+                CheckScore {
+                    check: CheckId::DangerousChange,
+                    label: "Dangerous file changes".to_string(),
+                    penalty: 10,
+                    max_penalty: 70,
+                    triggered: true,
+                },
+                CheckScore {
+                    check: CheckId::TestGap,
+                    label: "Test coverage gap".to_string(),
+                    penalty: 10,
+                    max_penalty: 35,
+                    triggered: true,
+                },
+            ],
+            ReportMeta {
+                threshold: 70,
+                mode: "enforce".to_string(),
+                scope: "pr".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+        let waived_evidence_id = report
+            .evidence
+            .iter()
+            .find(|evidence| evidence.message == "message-waived-critical")
+            .expect("waived evidence")
+            .evidence_id
+            .clone();
+        report.refresh_decision(
+            &[patchgate_config::WaiverEntry {
+                waiver_id: "wv_dangerous_exception".to_string(),
+                check_id: "critical-evidence".to_string(),
+                gate_id: "critical-evidence".to_string(),
+                evidence_id: waived_evidence_id,
+                ticket: "SEC-3".to_string(),
+                reason: "Approved exception".to_string(),
+                approver: "appsec".to_string(),
+                expires_at: "2999-01-01T00:00:00Z".to_string(),
+            }],
+            Vec::new(),
+        );
+
+        let comment = render_github_comment(&report);
+        let decision_summary = comment.split("### Run summary").next().expect("summary");
+
+        assert!(decision_summary.contains("message-active-critical"));
+        assert!(!decision_summary.contains("message-waived-critical"));
+        assert!(decision_summary.contains("Add or update tests covering the changed package."));
+        assert!(!decision_summary
+            .contains("Get the required owner review or split the high-risk change."));
     }
 
     #[test]

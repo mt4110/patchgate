@@ -374,10 +374,14 @@ impl Decision {
             .any(|gate| gate.result == GateDecisionResult::Fail)
     }
 
-    pub fn blocks_merge(&self) -> bool {
+    pub fn has_failing_conditions(&self) -> bool {
         matches!(self.result, DecisionResult::Fail | DecisionResult::Error)
             || self.score.failed
             || self.has_failed_hard_gate()
+    }
+
+    pub fn blocks_merge(&self) -> bool {
+        matches!(self.result, DecisionResult::Fail | DecisionResult::Error)
     }
 }
 
@@ -562,7 +566,7 @@ impl Report {
     ) {
         self.evidence = evidence_from_report(self);
         self.decision = evaluate_decision(self, waivers, runtime_errors);
-        self.should_fail = self.decision.blocks_merge();
+        self.should_fail = self.decision.has_failing_conditions();
     }
 }
 
@@ -1289,6 +1293,28 @@ mod tests {
         assert!(!report.decision.score.failed);
         assert!(report.decision.has_failed_hard_gate());
         assert_eq!(report.decision.result, DecisionResult::Fail);
+        assert!(report.should_fail);
+    }
+
+    #[test]
+    fn warn_decision_conditions_do_not_block_merge() {
+        let mut report =
+            sample_report("warn", vec![sample_check(CheckId::DependencyUpdate, 0, 30)]);
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec!["package-lock.json".to_string()],
+            tags: vec!["supply-chain".to_string()],
+        });
+
+        report.refresh_decision(&[], Vec::new());
+
+        assert_eq!(report.decision.result, DecisionResult::Warn);
+        assert!(report.decision.has_failed_hard_gate());
+        assert!(report.decision.has_failing_conditions());
+        assert!(!report.decision.blocks_merge());
         assert!(report.should_fail);
     }
 
