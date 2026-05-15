@@ -5319,6 +5319,12 @@ fn execute_scan(
 
     let opts = resolve_scan_options(&cfg, format.as_deref(), scope.as_deref(), mode.as_deref())?;
     if opts.mode == "enforce" {
+        if cfg.scope.on_exceed != "fail_closed" {
+            eprintln!(
+                "warning: enforce mode overrides [scope].on_exceed={} to fail_closed",
+                cfg.scope.on_exceed
+            );
+        }
         cfg.scope.on_exceed = "fail_closed".to_string();
     }
     if matches!(opts.scope, ScopeMode::Pr) && base_ref.is_none() {
@@ -6521,7 +6527,9 @@ fn resolve_git_ref_for_authority(repo_root: &Path, ref_name: &str) -> Result<Str
             return Ok(fetched_ref);
         }
     }
-    Ok(ref_name.to_string())
+    Err(anyhow!(
+        "git ref `{ref_name}` could not be resolved after fetch"
+    ))
 }
 
 fn fetch_git_ref_for_authority(repo_root: &Path, ref_name: &str) -> Result<Option<String>> {

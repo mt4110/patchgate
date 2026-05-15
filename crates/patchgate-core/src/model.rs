@@ -976,13 +976,17 @@ fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 }
 
 fn finding_path_bytes_sha256(finding: &Finding, location: &Location) -> String {
-    finding
-        .tags
-        .iter()
-        .find_map(|tag| tag.strip_prefix("path_sha256:"))
-        .filter(|hex| is_sha256_hex(hex))
-        .map(|hex| format!("sha256:{hex}"))
-        .unwrap_or_else(|| sha256_digest_bytes(location.file.as_bytes()))
+    for prefix in ["evidence_path_sha256:", "path_sha256:"] {
+        if let Some(hex) = finding
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix(prefix))
+            .filter(|hex| is_sha256_hex(hex))
+        {
+            return format!("sha256:{hex}");
+        }
+    }
+    sha256_digest_bytes(location.file.as_bytes())
 }
 
 fn stable_prefixed_id(prefix: &str, material: &str) -> String {
@@ -1319,6 +1323,55 @@ mod tests {
             location.path_bytes_sha256,
             sha256_digest_bytes(b"src/bad\\nname.rs")
         );
+    }
+
+    #[test]
+    fn evidence_location_prefers_explicit_evidence_path_identity_tag() {
+        let current_digest = sha256_digest_bytes(b"src/new.rs");
+        let old_digest = sha256_digest_bytes(b"src/old\nname.rs");
+        let current_tag = format!(
+            "path_sha256:{}",
+            current_digest.trim_start_matches("sha256:")
+        );
+        let evidence_tag = format!(
+            "evidence_path_sha256:{}",
+            old_digest.trim_start_matches("sha256:")
+        );
+        let report = Report::new(
+            vec![Finding {
+                id: "DIFF-001".to_string(),
+                rule_id: "DIFF-001".to_string(),
+                category: "diff_correctness".to_string(),
+                docs_url: String::new(),
+                check: CheckId::DiffCorrectness,
+                title: "Path contains control characters".to_string(),
+                message: "old path identity is required".to_string(),
+                severity: Severity::Critical,
+                penalty: 100,
+                location: Some(Location {
+                    file: "src/new.rs".to_string(),
+                    line: None,
+                }),
+                tags: vec![current_tag, evidence_tag],
+            }],
+            vec![sample_check(CheckId::DiffCorrectness, 100, 100)],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let location = report.evidence[0]
+            .location
+            .as_ref()
+            .expect("evidence location");
+
+        assert_eq!(location.path_bytes_sha256, old_digest);
+        assert_ne!(location.path_bytes_sha256, current_digest);
     }
 
     #[test]

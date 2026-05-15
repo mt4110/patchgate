@@ -114,6 +114,7 @@ pub struct DiffFileMetadata {
     pub path_bytes_b64: String,
     pub old_path_id: Option<String>,
     pub old_path_bytes_b64: Option<String>,
+    pub old_path_flags: Vec<PathSafetyFlag>,
     pub file_kind: FileKind,
     pub old_mode: Option<String>,
     pub new_mode: Option<String>,
@@ -360,12 +361,16 @@ fn evaluate_diff_correctness(diff: &DiffData) -> CheckEvaluation {
                     Severity::Critical,
                 ),
             };
-            let finding_penalty = if severity == Severity::Critical {
-                100
-            } else {
-                10
-            };
+            let finding_penalty = 100;
             penalty = penalty.saturating_add(finding_penalty);
+            let mut tags = vec!["diff-correctness".to_string(), "path-safety".to_string()];
+            if file.metadata.old_path_flags.contains(flag) {
+                if let Some(old_path_id) = &file.metadata.old_path_id {
+                    if let Some(tag) = evidence_path_tag(old_path_id) {
+                        tags.push(tag);
+                    }
+                }
+            }
             findings.push(diff_correctness_finding(
                 rule_id,
                 title,
@@ -373,7 +378,7 @@ fn evaluate_diff_correctness(diff: &DiffData) -> CheckEvaluation {
                 severity,
                 finding_penalty,
                 file,
-                vec!["diff-correctness".to_string(), "path-safety".to_string()],
+                tags,
             ));
         }
 
@@ -491,7 +496,11 @@ fn diff_correctness_finding(
     tags.push(file.metadata.file_kind.as_str().to_string());
     tags.push(file.metadata.path_id.clone());
     if let Some(old_path_id) = &file.metadata.old_path_id {
-        tags.push(format!("old_{old_path_id}"));
+        if let Some(hex) = old_path_id.strip_prefix("path_sha256:") {
+            tags.push(format!("old_path_sha256:{hex}"));
+        } else {
+            tags.push(format!("old_path_id:{old_path_id}"));
+        }
     }
     Finding {
         id: rule_id.to_string(),
@@ -511,6 +520,12 @@ fn diff_correctness_finding(
         }),
         tags,
     }
+}
+
+fn evidence_path_tag(path_id: &str) -> Option<String> {
+    path_id
+        .strip_prefix("path_sha256:")
+        .map(|hex| format!("evidence_path_sha256:{hex}"))
 }
 
 fn path_context(file: &ChangedFile) -> String {
@@ -2565,8 +2580,9 @@ fn changed_file_from_raw(
     let mut metadata = metadata_for_path(path_bytes);
     if let Some(old_path_bytes) = old_path_bytes {
         let old_metadata = metadata_for_path(old_path_bytes);
-        metadata.old_path_id = Some(path_id(old_path_bytes));
-        metadata.old_path_bytes_b64 = Some(path_bytes_b64(old_path_bytes));
+        metadata.old_path_id = Some(old_metadata.path_id.clone());
+        metadata.old_path_bytes_b64 = Some(old_metadata.path_bytes_b64.clone());
+        metadata.old_path_flags = old_metadata.path_flags.clone();
         merge_path_flags(&mut metadata.path_flags, old_metadata.path_flags);
     }
     metadata.old_mode = Some(old_mode.clone());
@@ -2614,6 +2630,7 @@ fn metadata_for_path(path_bytes: &[u8]) -> DiffFileMetadata {
         path_bytes_b64: path_bytes_b64(path_bytes),
         old_path_id: None,
         old_path_bytes_b64: None,
+        old_path_flags: Vec::new(),
         file_kind: FileKind::Text,
         old_mode: None,
         new_mode: None,
@@ -2825,29 +2842,37 @@ fn parse_numstat_count(raw: &[u8]) -> Option<u32> {
 fn apply_patch_line_samples(files: &mut BTreeMap<String, ChangedFile>, patch: &[u8]) {
     let display_path_keys = unambiguous_display_path_keys(files);
     let mut current_key: Option<String> = None;
+    let mut in_hunk = false;
 
     for line in patch.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = String::from_utf8_lossy(line);
         if line.starts_with("diff --git ") {
             current_key = None;
+            in_hunk = false;
             continue;
         }
 
-        if let Some(path) = parse_patch_file_header_path(&line, "+++ b/") {
-            current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
+        if line.starts_with("@@") {
+            in_hunk = true;
             continue;
         }
 
-        if let Some(path) = parse_patch_file_header_path(&line, "--- a/") {
-            current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
-            continue;
-        }
+        if !in_hunk {
+            if let Some(path) = parse_patch_file_header_path(&line, "+++ b/") {
+                current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
+                continue;
+            }
 
-        if line.starts_with("+++ /dev/null")
-            || line.starts_with("--- /dev/null")
-            || line.starts_with("@@")
-        {
+            if let Some(path) = parse_patch_file_header_path(&line, "--- a/") {
+                current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
+                continue;
+            }
+
+            if line.starts_with("+++ /dev/null") || line.starts_with("--- /dev/null") {
+                continue;
+            }
+
             continue;
         }
 
@@ -2990,6 +3015,7 @@ fn is_lfs_pointer(blob: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(blob) else {
         return false;
     };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines();
     matches!(
         lines.next(),
@@ -3412,6 +3438,10 @@ mod tests {
             .metadata
             .path_flags
             .contains(&PathSafetyFlag::ControlCharacter));
+        assert!(file
+            .metadata
+            .old_path_flags
+            .contains(&PathSafetyFlag::ControlCharacter));
 
         let eval = evaluate_diff_correctness(&DiffData {
             files: parsed.into_values().collect(),
@@ -3420,7 +3450,19 @@ mod tests {
             head_ref: None,
             merge_base: None,
         });
-        assert!(eval.findings.iter().any(|finding| finding.id == "DIFF-001"));
+        let finding = eval
+            .findings
+            .iter()
+            .find(|finding| finding.id == "DIFF-001")
+            .expect("DIFF-001 finding");
+        assert!(finding
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("old_path_sha256:")));
+        assert!(finding
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("evidence_path_sha256:")));
     }
 
     #[test]
@@ -3443,6 +3485,35 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
 
         let file = files.get("src/lib.rs").expect("src file");
         assert_eq!(file.added_lines.first().map(String::as_str), Some("safe"));
+    }
+
+    #[test]
+    fn patch_line_sampling_keeps_header_like_lines_inside_hunks() {
+        let mut files = parse_name_status("M\tnot-header\nM\tsrc/lib.rs\n");
+        let patch = b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,2 @@\n+++ b/not-header\n+kept\n";
+
+        apply_patch_line_samples(&mut files, patch);
+
+        let file = files.get("src/lib.rs").expect("src file");
+        assert_eq!(
+            file.added_lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["++ b/not-header", "kept"]
+        );
+        let decoy = files.get("not-header").expect("decoy file");
+        assert!(
+            decoy.added_lines.is_empty(),
+            "header-like hunk content must not switch files"
+        );
+    }
+
+    #[test]
+    fn lfs_pointer_allows_utf8_bom() {
+        let pointer = b"\xef\xbb\xbfversion https://git-lfs.github.com/spec/v1\r\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nsize 123\r\n";
+
+        assert!(is_lfs_pointer(pointer));
     }
 
     #[test]
