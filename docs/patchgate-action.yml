@@ -19,18 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # keep base parent reachable for worktree diff materialization
-          fetch-depth: 2
+          # keep base/head history reachable for merge-base diff resolution
+          fetch-depth: 0
 
       - uses: cachix/install-nix-action@v30
-
-      - name: Materialize PR diff into worktree
-        if: github.event_name == 'pull_request'
-        run: |
-          # checkout is pull_request merge commit by default.
-          # move HEAD to base parent while keeping merged tree in worktree.
-          # this makes `git diff` represent the PR delta.
-          git reset --mixed HEAD^1
 
       - name: Run patchgate (trusted policy authority)
         env:
@@ -39,9 +31,10 @@ jobs:
           mkdir -p artifacts
           nix develop --command cargo run -p patchgate-cli -- scan \
             --mode enforce \
-            --scope worktree \
+            --scope pr \
             --format json \
             --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --head-ref ${{ github.event.pull_request.head.sha || github.sha }} \
             --github-check-name patchgate/trust-boundary \
             --metrics-output artifacts/scan-metrics.jsonl \
             --audit-log-output artifacts/scan-audit.jsonl \
@@ -68,23 +61,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # keep base parent reachable for staged diff materialization
-          fetch-depth: 2
+          # keep base/head history reachable for merge-base diff resolution
+          fetch-depth: 0
       - uses: cachix/install-nix-action@v30
-      - name: Materialize PR diff into index
-        if: github.event_name == 'pull_request'
-        run: |
-          # checkout is pull_request merge commit by default.
-          # move HEAD to the base parent while keeping merged tree in index/worktree.
-          # this makes `git diff --cached` represent the PR delta for `--scope staged`.
-          git reset --soft HEAD^1
       - name: Build GitHub publish payload preview
         run: |
           nix develop --command cargo run -p patchgate-cli -- scan \
             --mode warn \
-            --scope staged \
+            --scope pr \
             --format json \
             --base-ref ${{ github.event.pull_request.base.sha || github.sha }} \
+            --head-ref ${{ github.event.pull_request.head.sha || github.sha }} \
             --github-check-name patchgate/trust-boundary \
             --github-publish \
             --github-dry-run \

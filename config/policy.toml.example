@@ -7,9 +7,9 @@ mode = "warn"            # warn | enforce
 fail_threshold = 70       # 0..=100, score below this fails in enforce mode
 
 [scope]
-mode = "staged"          # staged | worktree | repo
+mode = "staged"          # staged | worktree | repo | pr
 max_changed_files = 10000 # large-diff guardrail
-on_exceed = "fail_open"   # fail_open | fail_closed
+on_exceed = "fail_open"   # fail_open | fail_closed (enforce scans use fail_closed)
 
 [cache]
 enabled = true
@@ -45,7 +45,7 @@ globs = [
 ]
 
 [generated_code]
-mode = "exclude" # exclude | decay
+mode = "decay" # exclude | decay
 globs = [
   "**/generated/**",
   "**/*.pb.go",

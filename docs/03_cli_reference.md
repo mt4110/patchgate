@@ -21,9 +21,9 @@ Core options:
 
 - `--policy-preset <strict|balanced|relaxed>`
 - `--format <text|json>`
-- `--scope <staged|worktree|repo>`
+- `--scope <staged|worktree|repo|pr>`
+- `--base-ref <ref>` / `--head-ref <ref>`: `--scope pr` compares `merge-base(base, head)...head`; `head` defaults to `HEAD`. In enforce mode, `--base-ref` is also used for trusted base policy resolution.
 - `--mode <warn|enforce>`
-- `--base-ref <ref>` (trusted base policy for enforce mode)
 - `--protected-policy-ref <ref>`
 - `--org-policy-bundle <path>`
 - `--org-policy-bundle-signature <path>`
