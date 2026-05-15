@@ -175,7 +175,8 @@ lockfile_bonus_penalty = 0
 large_lockfile_bonus_penalty = 0
 
 [waiver]
-# Each waiver entry must include check_id, reason, approver and future expires_at (RFC3339)
+# Each waiver entry must include check_id, reason, approver and future expires_at (RFC3339).
+# Optional waiver_id, gate_id, evidence_id and ticket fields bind exceptions to decision schema v1.
 entries = []
 
 [plugins]

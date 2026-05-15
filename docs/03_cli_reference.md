@@ -94,6 +94,12 @@ Enforce mode rejects policy-changing CLI overrides (`--threshold`, `--max-change
 - `--input <metrics.jsonl>`
 - `--format <text|json>`
 
+### `patchgate decision replay`
+
+- `--input <decision-or-report.json>`
+- `--format <text|json>`
+- `patchgate.decision.v1` artifact, or a scan report containing `decision`, is replayed without rerunning diff checks.
+
 ### `patchgate delivery replay`
 
 - `--input <dead-letter.jsonl>`

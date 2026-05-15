@@ -3,9 +3,12 @@ pub mod model;
 pub mod runner;
 
 pub use model::{
-    CheckId, CheckScore, Finding, PluginChangedFile, PluginFinding, PluginInput,
+    CheckId, CheckScore, Decision, DecisionResult, Evidence, EvidenceConfidence, EvidenceImpact,
+    EvidenceLocation, EvidenceProducer, EvidenceProducerKind, EvidenceRule, Finding,
+    GateDecisionResult, HardGateResult, PluginChangedFile, PluginFinding, PluginInput,
     PluginInputV2Shadow, PluginInvocation, PluginInvocationStatus, PluginOutput,
-    PluginShadowContract, PluginShadowMetadata, Report, ReportMeta, ReviewPriority, Severity,
-    SupplyChainSignal,
+    PluginShadowContract, PluginShadowMetadata, Report, ReportMeta, ReviewPriority,
+    RuntimeDecisionError, RuntimeDecisionStatus, RuntimeResult, ScoreResult, Severity,
+    SupplyChainSignal, WaiverResult, DECISION_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION,
 };
 pub use runner::{ChangeStatus, ChangedFile, Context, DiffData, Runner, ScopeMode};

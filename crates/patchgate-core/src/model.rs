@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
 
-use patchgate_config::PolicyAuthority;
+use chrono::{DateTime, Utc};
+use patchgate_config::{PolicyAuthority, WaiverEntry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const EVIDENCE_SCHEMA_VERSION: &str = "patchgate.evidence.v1";
+pub const DECISION_SCHEMA_VERSION: &str = "patchgate.decision.v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -18,8 +23,10 @@ pub enum CheckId {
     TestGap,
     DangerousChange,
     DependencyUpdate,
+    SupplyChain,
     ExternalPlugin,
     PolicyAuthority,
+    Runtime,
 }
 
 impl CheckId {
@@ -28,8 +35,10 @@ impl CheckId {
             CheckId::TestGap => "test_gap",
             CheckId::DangerousChange => "dangerous_change",
             CheckId::DependencyUpdate => "dependency_update",
+            CheckId::SupplyChain => "supply_chain",
             CheckId::ExternalPlugin => "external_plugin",
             CheckId::PolicyAuthority => "policy_authority",
+            CheckId::Runtime => "runtime",
         }
     }
 
@@ -38,8 +47,10 @@ impl CheckId {
             CheckId::TestGap => "Test coverage gap",
             CheckId::DangerousChange => "Dangerous file changes",
             CheckId::DependencyUpdate => "Dependency update risk",
+            CheckId::SupplyChain => "Supply-chain hard gate",
             CheckId::ExternalPlugin => "External plugin risk",
             CheckId::PolicyAuthority => "Policy authority",
+            CheckId::Runtime => "Runtime",
         }
     }
 }
@@ -129,6 +140,10 @@ pub struct Report {
     pub plugin_invocations: Vec<PluginInvocation>,
     #[serde(default)]
     pub policy_authority: PolicyAuthority,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub decision: Decision,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +154,231 @@ pub struct SupplyChainSignal {
     pub message: String,
     pub related_files: Vec<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceProducerKind {
+    #[default]
+    Builtin,
+    Plugin,
+    Scanner,
+    Policy,
+    Waiver,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceConfidence {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceProducer {
+    #[serde(default)]
+    pub kind: EvidenceProducerKind,
+    pub name: String,
+    pub version: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceRule {
+    pub id: String,
+    pub category: String,
+    pub docs_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceImpact {
+    pub hard_gate_candidate: bool,
+    pub score_penalty: u8,
+    pub max_penalty: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceLocation {
+    pub path_bytes_sha256: String,
+    pub path_display: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Evidence {
+    pub schema_version: String,
+    pub evidence_id: String,
+    pub producer: EvidenceProducer,
+    pub rule: EvidenceRule,
+    pub severity: Severity,
+    #[serde(default)]
+    pub confidence: EvidenceConfidence,
+    pub impact: EvidenceImpact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<EvidenceLocation>,
+    pub message: String,
+    pub remediation: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionResult {
+    #[default]
+    Pass,
+    Fail,
+    Warn,
+    Error,
+}
+
+impl DecisionResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionResult::Pass => "pass",
+            DecisionResult::Fail => "fail",
+            DecisionResult::Warn => "warn",
+            DecisionResult::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateDecisionResult {
+    #[default]
+    Pass,
+    Fail,
+    Waived,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HardGateResult {
+    pub gate_id: String,
+    pub result: GateDecisionResult,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScoreResult {
+    pub value: u8,
+    pub threshold: u8,
+    pub band: ReviewPriority,
+    pub failed: bool,
+}
+
+impl Default for ScoreResult {
+    fn default() -> Self {
+        Self {
+            value: 100,
+            threshold: 70,
+            band: ReviewPriority::P3,
+            failed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaiverResult {
+    pub waiver_id: String,
+    pub evidence_id: String,
+    pub valid: bool,
+    pub expires_at: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub approver: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ticket: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeDecisionStatus {
+    #[default]
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeDecisionError {
+    pub code: String,
+    pub category: String,
+    pub message: String,
+    pub classified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeResult {
+    pub result: RuntimeDecisionStatus,
+    #[serde(default)]
+    pub errors: Vec<RuntimeDecisionError>,
+}
+
+impl Default for RuntimeResult {
+    fn default() -> Self {
+        Self {
+            result: RuntimeDecisionStatus::Ok,
+            errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Decision {
+    pub schema_version: String,
+    pub decision_id: String,
+    pub result: DecisionResult,
+    pub mode: String,
+    pub scope: String,
+    pub policy_authority_digest: String,
+    pub diff_digest: String,
+    #[serde(default)]
+    pub hard_gates: Vec<HardGateResult>,
+    pub score: ScoreResult,
+    #[serde(default)]
+    pub waivers: Vec<WaiverResult>,
+    pub runtime: RuntimeResult,
+}
+
+impl Default for Decision {
+    fn default() -> Self {
+        Self {
+            schema_version: DECISION_SCHEMA_VERSION.to_string(),
+            decision_id: "dec_unresolved".to_string(),
+            result: DecisionResult::Pass,
+            mode: String::new(),
+            scope: String::new(),
+            policy_authority_digest: "sha256:unresolved".to_string(),
+            diff_digest: "sha256:unresolved".to_string(),
+            hard_gates: Vec::new(),
+            score: ScoreResult::default(),
+            waivers: Vec::new(),
+            runtime: RuntimeResult::default(),
+        }
+    }
+}
+
+impl Decision {
+    pub fn has_failed_hard_gate(&self) -> bool {
+        self.hard_gates
+            .iter()
+            .any(|gate| gate.result == GateDecisionResult::Fail)
+    }
+
+    pub fn blocks_merge(&self) -> bool {
+        matches!(self.result, DecisionResult::Fail | DecisionResult::Error)
+            || self.score.failed
+            || self.has_failed_hard_gate()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,7 +514,7 @@ impl Report {
         let should_fail = score < meta.threshold;
         let review_priority = review_priority_from_score(score);
 
-        Self {
+        let mut report = Self {
             findings,
             checks,
             score,
@@ -292,7 +532,11 @@ impl Report {
             supply_chain_signals: Vec::new(),
             plugin_invocations: Vec::new(),
             policy_authority: PolicyAuthority::default(),
-        }
+            evidence: Vec::new(),
+            decision: Decision::default(),
+        };
+        report.refresh_decision(&[], Vec::new());
+        report
     }
 
     pub fn recompute_score(&mut self) {
@@ -308,7 +552,441 @@ impl Report {
             }
         }
         self.diagnostic_hints = hints;
+        self.refresh_decision(&[], self.decision.runtime.errors.clone());
     }
+
+    pub fn refresh_decision(
+        &mut self,
+        waivers: &[WaiverEntry],
+        runtime_errors: Vec<RuntimeDecisionError>,
+    ) {
+        self.evidence = evidence_from_report(self);
+        self.decision = evaluate_decision(self, waivers, runtime_errors);
+        self.should_fail = self.decision.blocks_merge();
+    }
+}
+
+fn evidence_from_report(report: &Report) -> Vec<Evidence> {
+    let mut evidence = Vec::new();
+    for finding in &report.findings {
+        let max_penalty = report
+            .checks
+            .iter()
+            .find(|check| check.check == finding.check)
+            .map(|check| check.max_penalty)
+            .unwrap_or(finding.penalty);
+        evidence.push(evidence_from_finding(finding, max_penalty));
+    }
+    for signal in &report.supply_chain_signals {
+        evidence.push(evidence_from_supply_chain_signal(signal));
+    }
+    evidence
+}
+
+fn evidence_from_finding(finding: &Finding, max_penalty: u8) -> Evidence {
+    let rule_id = non_empty_or(finding.rule_id.as_str(), finding.id.as_str());
+    let category = non_empty_or(finding.category.as_str(), finding.check.as_str());
+    let path = finding
+        .location
+        .as_ref()
+        .map(|location| location.file.as_str())
+        .unwrap_or("");
+    let fingerprint = stable_fingerprint(&[
+        "finding",
+        rule_id,
+        category,
+        finding.title.as_str(),
+        finding.message.as_str(),
+        path,
+    ]);
+    let producer_kind = match finding.check {
+        CheckId::ExternalPlugin => EvidenceProducerKind::Plugin,
+        CheckId::PolicyAuthority => EvidenceProducerKind::Policy,
+        CheckId::Runtime => EvidenceProducerKind::Runtime,
+        _ => EvidenceProducerKind::Builtin,
+    };
+    Evidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION.to_string(),
+        evidence_id: stable_prefixed_id("ev", fingerprint.as_str()),
+        producer: EvidenceProducer {
+            kind: producer_kind,
+            name: finding.check.as_str().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            digest: stable_fingerprint(&["producer", finding.check.as_str()]),
+        },
+        rule: EvidenceRule {
+            id: rule_id.to_string(),
+            category: category.to_string(),
+            docs_url: finding.docs_url.clone(),
+        },
+        severity: finding.severity,
+        confidence: confidence_for_severity(finding.severity),
+        impact: EvidenceImpact {
+            hard_gate_candidate: finding.severity == Severity::Critical,
+            score_penalty: finding.penalty,
+            max_penalty,
+        },
+        location: finding.location.as_ref().map(|location| EvidenceLocation {
+            path_bytes_sha256: sha256_digest_bytes(location.file.as_bytes()),
+            path_display: location.file.clone(),
+            old_path_display: None,
+            line: location.line,
+        }),
+        message: finding.message.clone(),
+        remediation: remediation_for_finding(finding),
+        tags: finding.tags.clone(),
+        fingerprint,
+    }
+}
+
+fn evidence_from_supply_chain_signal(signal: &SupplyChainSignal) -> Evidence {
+    let path = signal
+        .related_files
+        .first()
+        .map(String::as_str)
+        .unwrap_or("");
+    let fingerprint = stable_fingerprint(&[
+        "supply_chain",
+        signal.id.as_str(),
+        signal.title.as_str(),
+        signal.message.as_str(),
+        path,
+    ]);
+    Evidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION.to_string(),
+        evidence_id: stable_prefixed_id("ev", fingerprint.as_str()),
+        producer: EvidenceProducer {
+            kind: EvidenceProducerKind::Builtin,
+            name: CheckId::SupplyChain.as_str().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            digest: stable_fingerprint(&["producer", CheckId::SupplyChain.as_str()]),
+        },
+        rule: EvidenceRule {
+            id: signal.id.clone(),
+            category: CheckId::SupplyChain.as_str().to_string(),
+            docs_url: "docs/SECURITY.md".to_string(),
+        },
+        severity: signal.severity,
+        confidence: EvidenceConfidence::High,
+        impact: EvidenceImpact {
+            hard_gate_candidate: signal.severity == Severity::Critical,
+            score_penalty: 0,
+            max_penalty: 0,
+        },
+        location: signal.related_files.first().map(|file| EvidenceLocation {
+            path_bytes_sha256: sha256_digest_bytes(file.as_bytes()),
+            path_display: file.clone(),
+            old_path_display: None,
+            line: None,
+        }),
+        message: signal.message.clone(),
+        remediation: if signal.severity == Severity::Critical {
+            "Review dependency provenance or revert the coupled lockfile/workflow change."
+                .to_string()
+        } else {
+            "Review dependency provenance and rollback safety.".to_string()
+        },
+        tags: signal.tags.clone(),
+        fingerprint,
+    }
+}
+
+fn evaluate_decision(
+    report: &Report,
+    waivers: &[WaiverEntry],
+    runtime_errors: Vec<RuntimeDecisionError>,
+) -> Decision {
+    let runtime = RuntimeResult {
+        result: if runtime_errors.is_empty() {
+            RuntimeDecisionStatus::Ok
+        } else {
+            RuntimeDecisionStatus::Error
+        },
+        errors: runtime_errors,
+    };
+    let mut waiver_results = Vec::new();
+    let mut hard_gate_groups: BTreeMap<String, Vec<&Evidence>> = BTreeMap::new();
+    for evidence in &report.evidence {
+        if evidence_is_hard_gate_candidate(evidence) {
+            hard_gate_groups
+                .entry(gate_id_for_evidence(evidence).to_string())
+                .or_default()
+                .push(evidence);
+        }
+    }
+
+    let mut hard_gates = Vec::new();
+    for (gate_id, evidence_items) in hard_gate_groups {
+        let mut unwaived = Vec::new();
+        let mut evidence_ids = Vec::new();
+        for evidence in evidence_items {
+            evidence_ids.push(evidence.evidence_id.clone());
+            match valid_waiver_for_evidence(waivers, evidence, gate_id.as_str()) {
+                Some(waiver) => waiver_results.push(waiver),
+                None => unwaived.push(evidence.evidence_id.clone()),
+            }
+        }
+        hard_gates.push(HardGateResult {
+            gate_id,
+            result: if unwaived.is_empty() {
+                GateDecisionResult::Waived
+            } else {
+                GateDecisionResult::Fail
+            },
+            evidence_ids,
+        });
+    }
+
+    let score = ScoreResult {
+        value: report.score,
+        threshold: report.threshold,
+        band: report.review_priority,
+        failed: report.score < report.threshold,
+    };
+    let hard_gate_failed = hard_gates
+        .iter()
+        .any(|gate| gate.result == GateDecisionResult::Fail);
+    let runtime_failed = runtime.result == RuntimeDecisionStatus::Error
+        && (report.mode == "enforce" || runtime.errors.iter().any(|err| !err.classified));
+    let result = if runtime_failed {
+        DecisionResult::Error
+    } else if hard_gate_failed || score.failed {
+        if report.mode == "warn" {
+            DecisionResult::Warn
+        } else {
+            DecisionResult::Fail
+        }
+    } else {
+        DecisionResult::Pass
+    };
+
+    let mut decision = Decision {
+        schema_version: DECISION_SCHEMA_VERSION.to_string(),
+        decision_id: String::new(),
+        result,
+        mode: report.mode.clone(),
+        scope: report.scope.clone(),
+        policy_authority_digest: report.policy_authority.digest.clone(),
+        diff_digest: normalize_digest(report.fingerprint.as_str()),
+        hard_gates,
+        score,
+        waivers: waiver_results,
+        runtime,
+    };
+    decision.decision_id = decision_id(&decision);
+    decision
+}
+
+fn evidence_is_hard_gate_candidate(evidence: &Evidence) -> bool {
+    evidence.impact.hard_gate_candidate || evidence.severity == Severity::Critical
+}
+
+fn gate_id_for_evidence(evidence: &Evidence) -> &'static str {
+    if evidence.rule.category == CheckId::SupplyChain.as_str()
+        && evidence.severity == Severity::Critical
+    {
+        "critical-supply-chain"
+    } else if evidence.rule.category == CheckId::PolicyAuthority.as_str() {
+        "policy-authority"
+    } else if evidence.rule.category == CheckId::Runtime.as_str()
+        || evidence.producer.kind == EvidenceProducerKind::Runtime
+    {
+        "runtime-error"
+    } else {
+        "critical-evidence"
+    }
+}
+
+fn valid_waiver_for_evidence(
+    waivers: &[WaiverEntry],
+    evidence: &Evidence,
+    gate_id: &str,
+) -> Option<WaiverResult> {
+    waivers.iter().find_map(|entry| {
+        if !waiver_matches_evidence(entry, evidence, gate_id) || !waiver_entry_is_valid(entry) {
+            return None;
+        }
+        Some(WaiverResult {
+            waiver_id: waiver_id_for_entry(entry, evidence, gate_id),
+            evidence_id: evidence.evidence_id.clone(),
+            valid: true,
+            expires_at: entry.expires_at.clone(),
+            reason: entry.reason.clone(),
+            approver: entry.approver.clone(),
+            ticket: entry.ticket.clone(),
+        })
+    })
+}
+
+fn waiver_matches_evidence(entry: &WaiverEntry, evidence: &Evidence, gate_id: &str) -> bool {
+    if !entry.evidence_id.trim().is_empty() && entry.evidence_id != evidence.evidence_id {
+        return false;
+    }
+    if !entry.gate_id.trim().is_empty() && entry.gate_id != gate_id {
+        return false;
+    }
+    let check_id = entry.check_id.trim();
+    check_id == gate_id
+        || check_id == evidence.rule.category
+        || check_id == evidence.producer.name
+        || (check_id == "critical_supply_chain" && gate_id == "critical-supply-chain")
+        || (check_id == "critical-supply-chain" && gate_id == "critical-supply-chain")
+}
+
+fn waiver_entry_is_valid(entry: &WaiverEntry) -> bool {
+    if entry.reason.trim().is_empty() || entry.approver.trim().is_empty() {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(entry.expires_at.as_str())
+        .map(|expires| expires.with_timezone(&Utc) > Utc::now())
+        .unwrap_or(false)
+}
+
+fn waiver_id_for_entry(entry: &WaiverEntry, evidence: &Evidence, gate_id: &str) -> String {
+    if !entry.waiver_id.trim().is_empty() {
+        return entry.waiver_id.clone();
+    }
+    stable_prefixed_id(
+        "wv",
+        stable_fingerprint(&[
+            entry.check_id.as_str(),
+            entry.gate_id.as_str(),
+            entry.evidence_id.as_str(),
+            gate_id,
+            evidence.evidence_id.as_str(),
+            entry.expires_at.as_str(),
+            entry.approver.as_str(),
+        ])
+        .as_str(),
+    )
+}
+
+fn decision_id(decision: &Decision) -> String {
+    let mut material = vec![
+        decision.result.as_str().to_string(),
+        decision.mode.clone(),
+        decision.scope.clone(),
+        decision.policy_authority_digest.clone(),
+        decision.diff_digest.clone(),
+        decision.score.value.to_string(),
+        decision.score.threshold.to_string(),
+        decision.score.failed.to_string(),
+        format!("{:?}", decision.runtime.result),
+    ];
+    for gate in &decision.hard_gates {
+        material.push(gate.gate_id.clone());
+        material.push(format!("{:?}", gate.result));
+        material.extend(gate.evidence_ids.iter().cloned());
+    }
+    for waiver in &decision.waivers {
+        material.push(waiver.waiver_id.clone());
+        material.push(waiver.evidence_id.clone());
+        material.push(waiver.valid.to_string());
+        material.push(waiver.expires_at.clone());
+    }
+    stable_prefixed_id(
+        "dec",
+        stable_fingerprint(
+            material
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .as_str(),
+    )
+}
+
+fn normalize_digest(raw: &str) -> String {
+    if raw == "sha256:unresolved" {
+        raw.to_string()
+    } else if let Some(hex) = raw.strip_prefix("sha256:") {
+        if is_sha256_hex(hex) {
+            raw.to_string()
+        } else {
+            stable_fingerprint(&["diff", raw])
+        }
+    } else if is_sha256_hex(raw) {
+        format!("sha256:{raw}")
+    } else if raw.is_empty() {
+        "sha256:unresolved".to_string()
+    } else {
+        stable_fingerprint(&["diff", raw])
+    }
+}
+
+fn confidence_for_severity(severity: Severity) -> EvidenceConfidence {
+    match severity {
+        Severity::Critical | Severity::High => EvidenceConfidence::High,
+        Severity::Medium => EvidenceConfidence::Medium,
+        Severity::Low => EvidenceConfidence::Low,
+    }
+}
+
+fn remediation_for_finding(finding: &Finding) -> String {
+    if !finding.docs_url.is_empty() {
+        match finding.check {
+            CheckId::TestGap => "Add or update tests covering the changed package.".to_string(),
+            CheckId::DangerousChange => {
+                "Get the required owner review or split the high-risk change.".to_string()
+            }
+            CheckId::DependencyUpdate => {
+                "Review dependency provenance, lockfile integrity and rollback safety.".to_string()
+            }
+            CheckId::ExternalPlugin => {
+                "Fix the plugin finding or document the approved exception.".to_string()
+            }
+            CheckId::PolicyAuthority => {
+                "Restore trusted policy authority before running enforce mode.".to_string()
+            }
+            CheckId::SupplyChain => {
+                "Review dependency provenance and supply-chain control coverage.".to_string()
+            }
+            CheckId::Runtime => "Resolve the runtime error and replay the decision.".to_string(),
+        }
+    } else {
+        "Review the finding and document the mitigation.".to_string()
+    }
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn stable_prefixed_id(prefix: &str, material: &str) -> String {
+    let normalized =
+        if material.strip_prefix("sha256:").is_some_and(is_sha256_hex) || is_sha256_hex(material) {
+            material.to_string()
+        } else {
+            stable_fingerprint(&["id", material])
+        };
+    format!(
+        "{prefix}_{}",
+        &normalized.trim_start_matches("sha256:")[..16]
+    )
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn sha256_digest_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn stable_fingerprint(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn diagnostic_hints_from_score(score: u8, should_fail: bool) -> Vec<String> {
@@ -360,6 +1038,22 @@ mod tests {
             max_penalty,
             triggered: penalty > 0,
         }
+    }
+
+    fn sample_report(mode: &str, checks: Vec<CheckScore>) -> Report {
+        Report::new(
+            Vec::new(),
+            checks,
+            ReportMeta {
+                threshold: 80,
+                mode: mode.to_string(),
+                scope: "pr".to_string(),
+                fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        )
     }
 
     #[test]
@@ -468,6 +1162,8 @@ mod tests {
         );
         assert_eq!(report_below_threshold.score, 69);
         assert!(report_below_threshold.should_fail);
+        assert_eq!(report_below_threshold.decision.result, DecisionResult::Fail);
+        assert!(report_below_threshold.decision.score.failed);
     }
 
     #[test]
@@ -507,5 +1203,234 @@ mod tests {
             tags: vec![],
         };
         assert_eq!(finding.pr_template_hint(), "- [ ] `TG-001` Missing tests");
+    }
+
+    #[test]
+    fn evidence_location_uses_path_bytes_sha256() {
+        let report = Report::new(
+            vec![Finding {
+                id: "TG-001".to_string(),
+                rule_id: "TG-RULE".to_string(),
+                category: "test_gap".to_string(),
+                docs_url: String::new(),
+                check: CheckId::TestGap,
+                title: "Missing tests".to_string(),
+                message: "add tests".to_string(),
+                severity: Severity::Medium,
+                penalty: 10,
+                location: Some(Location {
+                    file: "src/lib.rs".to_string(),
+                    line: Some(7),
+                }),
+                tags: vec![],
+            }],
+            vec![sample_check(CheckId::TestGap, 10, 35)],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let location = report.evidence[0]
+            .location
+            .as_ref()
+            .expect("evidence location");
+        assert_eq!(
+            location.path_bytes_sha256,
+            sha256_digest_bytes(b"src/lib.rs")
+        );
+        assert_ne!(
+            location.path_bytes_sha256,
+            stable_fingerprint(&["path", "src/lib.rs"])
+        );
+    }
+
+    #[test]
+    fn normalize_digest_accepts_only_valid_sha256_values() {
+        let bare_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let prefixed_hex =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let invalid_prefixed = "sha256:not-a-real-digest";
+
+        assert_eq!(normalize_digest(bare_hex), format!("sha256:{bare_hex}"));
+        assert_eq!(normalize_digest(prefixed_hex), prefixed_hex);
+        assert_eq!(normalize_digest("sha256:unresolved"), "sha256:unresolved");
+        assert_eq!(
+            normalize_digest(invalid_prefixed),
+            stable_fingerprint(&["diff", invalid_prefixed])
+        );
+    }
+
+    #[test]
+    fn critical_supply_chain_hard_gate_beats_perfect_score() {
+        let mut report = sample_report(
+            "enforce",
+            vec![sample_check(CheckId::DependencyUpdate, 0, 30)],
+        );
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec![
+                ".github/workflows/ci.yml".to_string(),
+                "package-lock.json".to_string(),
+            ],
+            tags: vec!["supply-chain".to_string(), "workflow".to_string()],
+        });
+
+        report.refresh_decision(&[], Vec::new());
+
+        assert_eq!(report.score, 100);
+        assert!(!report.decision.score.failed);
+        assert!(report.decision.has_failed_hard_gate());
+        assert_eq!(report.decision.result, DecisionResult::Fail);
+        assert!(report.should_fail);
+    }
+
+    #[test]
+    fn valid_waiver_allows_critical_when_score_passes() {
+        let mut report = sample_report(
+            "enforce",
+            vec![sample_check(CheckId::DependencyUpdate, 0, 30)],
+        );
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec!["package-lock.json".to_string()],
+            tags: vec!["supply-chain".to_string()],
+        });
+        let waiver = WaiverEntry {
+            waiver_id: "wv_supply_chain_exception".to_string(),
+            check_id: "critical_supply_chain".to_string(),
+            gate_id: "critical-supply-chain".to_string(),
+            evidence_id: String::new(),
+            ticket: "SEC-1".to_string(),
+            reason: "Temporary AppSec-approved migration window".to_string(),
+            approver: "appsec".to_string(),
+            expires_at: "2999-01-01T00:00:00Z".to_string(),
+        };
+
+        report.refresh_decision(&[waiver], Vec::new());
+
+        assert_eq!(report.decision.result, DecisionResult::Pass);
+        assert_eq!(report.decision.waivers.len(), 1);
+        assert_eq!(
+            report.decision.hard_gates[0].result,
+            GateDecisionResult::Waived
+        );
+        assert!(!report.should_fail);
+    }
+
+    #[test]
+    fn expired_waiver_does_not_clear_hard_gate() {
+        let mut report = sample_report(
+            "enforce",
+            vec![sample_check(CheckId::DependencyUpdate, 0, 30)],
+        );
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec!["package-lock.json".to_string()],
+            tags: vec!["supply-chain".to_string()],
+        });
+        let waiver = WaiverEntry {
+            waiver_id: "wv_expired".to_string(),
+            check_id: "critical_supply_chain".to_string(),
+            gate_id: "critical-supply-chain".to_string(),
+            evidence_id: String::new(),
+            ticket: "SEC-2".to_string(),
+            reason: "Expired exception".to_string(),
+            approver: "appsec".to_string(),
+            expires_at: "2000-01-01T00:00:00Z".to_string(),
+        };
+
+        report.refresh_decision(&[waiver], Vec::new());
+
+        assert_eq!(report.decision.result, DecisionResult::Fail);
+        assert!(report.decision.waivers.is_empty());
+        assert_eq!(
+            report.decision.hard_gates[0].result,
+            GateDecisionResult::Fail
+        );
+    }
+
+    #[test]
+    fn runtime_error_in_enforce_is_error_decision() {
+        let mut report = sample_report("enforce", vec![sample_check(CheckId::TestGap, 0, 35)]);
+
+        report.refresh_decision(
+            &[],
+            vec![RuntimeDecisionError {
+                code: "PG-RUN-001".to_string(),
+                category: "runtime".to_string(),
+                message: "critical evaluator failed".to_string(),
+                classified: true,
+            }],
+        );
+
+        assert_eq!(report.decision.result, DecisionResult::Error);
+        assert_eq!(report.decision.runtime.result, RuntimeDecisionStatus::Error);
+        assert!(report.should_fail);
+    }
+
+    #[test]
+    fn decision_golden_snapshot_captures_hard_gate_layers() {
+        let mut report = sample_report(
+            "enforce",
+            vec![sample_check(CheckId::DependencyUpdate, 0, 30)],
+        );
+        report.supply_chain_signals.push(SupplyChainSignal {
+            id: "SCM-002".to_string(),
+            title: "Lockfile topology changed with workflow modifications".to_string(),
+            severity: Severity::Critical,
+            message: "Lockfile add/remove combined with CI/workflow edits can bypass dependency controls.".to_string(),
+            related_files: vec!["package-lock.json".to_string()],
+            tags: vec!["supply-chain".to_string()],
+        });
+
+        report.refresh_decision(&[], Vec::new());
+        let mut snapshot = serde_json::to_value(&report.decision).expect("decision json");
+        snapshot["decision_id"] = serde_json::json!("dec_<stable>");
+        snapshot["hard_gates"][0]["evidence_ids"][0] = serde_json::json!("ev_<stable>");
+
+        assert_eq!(
+            snapshot,
+            serde_json::json!({
+                "schema_version": "patchgate.decision.v1",
+                "decision_id": "dec_<stable>",
+                "result": "fail",
+                "mode": "enforce",
+                "scope": "pr",
+                "policy_authority_digest": "sha256:unresolved",
+                "diff_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hard_gates": [
+                    {
+                        "gate_id": "critical-supply-chain",
+                        "result": "fail",
+                        "evidence_ids": ["ev_<stable>"]
+                    }
+                ],
+                "score": {
+                    "value": 100,
+                    "threshold": 80,
+                    "band": "p3",
+                    "failed": false
+                },
+                "waivers": [],
+                "runtime": {
+                    "result": "ok",
+                    "errors": []
+                }
+            })
+        );
     }
 }
