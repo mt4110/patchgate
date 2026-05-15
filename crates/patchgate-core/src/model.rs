@@ -21,6 +21,7 @@ pub enum Severity {
 #[serde(rename_all = "snake_case")]
 pub enum CheckId {
     TestGap,
+    DiffCorrectness,
     DangerousChange,
     DependencyUpdate,
     SupplyChain,
@@ -33,6 +34,7 @@ impl CheckId {
     pub fn as_str(self) -> &'static str {
         match self {
             CheckId::TestGap => "test_gap",
+            CheckId::DiffCorrectness => "diff_correctness",
             CheckId::DangerousChange => "dangerous_change",
             CheckId::DependencyUpdate => "dependency_update",
             CheckId::SupplyChain => "supply_chain",
@@ -45,6 +47,7 @@ impl CheckId {
     pub fn label(self) -> &'static str {
         match self {
             CheckId::TestGap => "Test coverage gap",
+            CheckId::DiffCorrectness => "Diff correctness",
             CheckId::DangerousChange => "Dangerous file changes",
             CheckId::DependencyUpdate => "Dependency update risk",
             CheckId::SupplyChain => "Supply-chain hard gate",
@@ -487,6 +490,14 @@ impl PluginInputV2Shadow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginChangedFile {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub path_id: String,
+    #[serde(default)]
+    pub path_bytes_b64: String,
+    #[serde(default)]
+    pub file_kind: String,
     pub status: String,
     pub added: u32,
     pub deleted: u32,
@@ -631,7 +642,7 @@ fn evidence_from_finding(finding: &Finding, max_penalty: u8) -> Evidence {
             max_penalty,
         },
         location: finding.location.as_ref().map(|location| EvidenceLocation {
-            path_bytes_sha256: sha256_digest_bytes(location.file.as_bytes()),
+            path_bytes_sha256: finding_path_bytes_sha256(finding, location),
             path_display: location.file.clone(),
             old_path_display: None,
             line: location.line,
@@ -931,6 +942,9 @@ fn remediation_for_finding(finding: &Finding) -> String {
     if !finding.docs_url.is_empty() {
         match finding.check {
             CheckId::TestGap => "Add or update tests covering the changed package.".to_string(),
+            CheckId::DiffCorrectness => {
+                "Inspect the raw diff identity and replace unsafe paths or file kinds with reviewable changes.".to_string()
+            }
             CheckId::DangerousChange => {
                 "Get the required owner review or split the high-risk change.".to_string()
             }
@@ -959,6 +973,20 @@ fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     } else {
         value
     }
+}
+
+fn finding_path_bytes_sha256(finding: &Finding, location: &Location) -> String {
+    for prefix in ["evidence_path_sha256:", "path_sha256:"] {
+        if let Some(hex) = finding
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix(prefix))
+            .filter(|hex| is_sha256_hex(hex))
+        {
+            return format!("sha256:{hex}");
+        }
+    }
+    sha256_digest_bytes(location.file.as_bytes())
 }
 
 fn stable_prefixed_id(prefix: &str, material: &str) -> String {
@@ -1251,6 +1279,99 @@ mod tests {
             location.path_bytes_sha256,
             stable_fingerprint(&["path", "src/lib.rs"])
         );
+    }
+
+    #[test]
+    fn evidence_location_prefers_raw_path_identity_tag() {
+        let raw_digest = sha256_digest_bytes(b"src/bad\nname.rs");
+        let raw_tag = format!("path_sha256:{}", raw_digest.trim_start_matches("sha256:"));
+        let report = Report::new(
+            vec![Finding {
+                id: "DIFF-001".to_string(),
+                rule_id: "DIFF-001".to_string(),
+                category: "diff_correctness".to_string(),
+                docs_url: String::new(),
+                check: CheckId::DiffCorrectness,
+                title: "Path contains control characters".to_string(),
+                message: "raw path identity is required".to_string(),
+                severity: Severity::Critical,
+                penalty: 100,
+                location: Some(Location {
+                    file: "src/bad\\nname.rs".to_string(),
+                    line: None,
+                }),
+                tags: vec![raw_tag],
+            }],
+            vec![sample_check(CheckId::DiffCorrectness, 100, 100)],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let location = report.evidence[0]
+            .location
+            .as_ref()
+            .expect("evidence location");
+
+        assert_eq!(location.path_bytes_sha256, raw_digest);
+        assert_ne!(
+            location.path_bytes_sha256,
+            sha256_digest_bytes(b"src/bad\\nname.rs")
+        );
+    }
+
+    #[test]
+    fn evidence_location_prefers_explicit_evidence_path_identity_tag() {
+        let current_digest = sha256_digest_bytes(b"src/new.rs");
+        let old_digest = sha256_digest_bytes(b"src/old\nname.rs");
+        let current_tag = format!(
+            "path_sha256:{}",
+            current_digest.trim_start_matches("sha256:")
+        );
+        let evidence_tag = format!(
+            "evidence_path_sha256:{}",
+            old_digest.trim_start_matches("sha256:")
+        );
+        let report = Report::new(
+            vec![Finding {
+                id: "DIFF-001".to_string(),
+                rule_id: "DIFF-001".to_string(),
+                category: "diff_correctness".to_string(),
+                docs_url: String::new(),
+                check: CheckId::DiffCorrectness,
+                title: "Path contains control characters".to_string(),
+                message: "old path identity is required".to_string(),
+                severity: Severity::Critical,
+                penalty: 100,
+                location: Some(Location {
+                    file: "src/new.rs".to_string(),
+                    line: None,
+                }),
+                tags: vec![current_tag, evidence_tag],
+            }],
+            vec![sample_check(CheckId::DiffCorrectness, 100, 100)],
+            ReportMeta {
+                threshold: 70,
+                mode: "warn".to_string(),
+                scope: "staged".to_string(),
+                fingerprint: "fp".to_string(),
+                duration_ms: 1,
+                skipped_by_cache: false,
+            },
+        );
+
+        let location = report.evidence[0]
+            .location
+            .as_ref()
+            .expect("evidence location");
+
+        assert_eq!(location.path_bytes_sha256, old_digest);
+        assert_ne!(location.path_bytes_sha256, current_digest);
     }
 
     #[test]

@@ -11,4 +11,7 @@ pub use model::{
     RuntimeDecisionError, RuntimeDecisionStatus, RuntimeResult, ScoreResult, Severity,
     SupplyChainSignal, WaiverResult, DECISION_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION,
 };
-pub use runner::{ChangeStatus, ChangedFile, Context, DiffData, Runner, ScopeMode};
+pub use runner::{
+    ChangeStatus, ChangedFile, Context, DiffData, DiffFileMetadata, DiffOptions, FileKind,
+    PathSafetyFlag, Runner, ScopeMode,
+};

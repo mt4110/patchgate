@@ -34,7 +34,7 @@ use patchgate_config::{
     POLICY_VERSION_CURRENT,
 };
 use patchgate_core::{
-    failure_codes, CheckId, CheckScore, Context, Decision, DecisionResult, Finding,
+    failure_codes, CheckId, CheckScore, Context, Decision, DecisionResult, DiffOptions, Finding,
     GateDecisionResult, Report, ReportMeta, ReviewPriority, Runner, ScopeMode, Severity,
     DECISION_SCHEMA_VERSION,
 };
@@ -92,7 +92,7 @@ struct ScanArgs {
     #[arg(long)]
     format: Option<String>,
 
-    /// Scope: staged|worktree|repo
+    /// Scope: staged|worktree|repo|pr
     #[arg(long)]
     scope: Option<String>,
 
@@ -103,6 +103,10 @@ struct ScanArgs {
     /// Trusted base ref for enforce-mode policy authority
     #[arg(long)]
     base_ref: Option<String>,
+
+    /// Head ref for PR diff scope (default: HEAD)
+    #[arg(long)]
+    head_ref: Option<String>,
 
     /// Optional protected policy ref (for example refs/patchgate/policy/main)
     #[arg(long)]
@@ -5189,6 +5193,7 @@ fn execute_scan(
         scope,
         mode,
         base_ref,
+        head_ref,
         protected_policy_ref,
         org_policy_bundle,
         org_policy_bundle_signature,
@@ -5248,11 +5253,16 @@ fn execute_scan(
 
     let config_path = resolve_config_path(repo_root, config_override);
     let provisional_mode = mode.clone().unwrap_or_else(|| "warn".to_string());
+    let authority_base_ref = base_ref
+        .as_deref()
+        .map(|base_ref| resolve_git_ref_for_authority(repo_root, base_ref))
+        .transpose()
+        .map_err(policy_authority_resolution_scan_error)?;
     let mut authority_common = PolicyAuthorityCommonArgs {
         path: config_path.clone(),
         policy_preset: policy_preset.clone(),
         mode: provisional_mode,
-        base_ref,
+        base_ref: authority_base_ref,
         head_ref: None,
         protected_policy_ref,
         org_policy_bundle,
@@ -5308,6 +5318,22 @@ fn execute_scan(
     apply_changed_file_overrides(&mut cfg, max_changed_files, on_exceed.as_deref())?;
 
     let opts = resolve_scan_options(&cfg, format.as_deref(), scope.as_deref(), mode.as_deref())?;
+    if opts.mode == "enforce" {
+        if cfg.scope.on_exceed != "fail_closed" {
+            eprintln!(
+                "warning: enforce mode overrides [scope].on_exceed={} to fail_closed",
+                cfg.scope.on_exceed
+            );
+        }
+        cfg.scope.on_exceed = "fail_closed".to_string();
+    }
+    if matches!(opts.scope, ScopeMode::Pr) && base_ref.is_none() {
+        return Err(ScanError::with_code(
+            ScanErrorKind::Input,
+            FailureCode::InputInvalidOption,
+            anyhow!("--base-ref is required when --scope pr"),
+        ));
+    }
 
     let mut profile = ScanProfile {
         schema_version: 1,
@@ -5322,15 +5348,26 @@ fn execute_scan(
     };
 
     let runner = Runner::new(cfg.clone());
+    let diff_options = DiffOptions {
+        base_ref,
+        head_ref,
+        stop_after_raw_file_limit: if cfg.scope.on_exceed == "fail_closed" {
+            Some(cfg.scope.max_changed_files as usize)
+        } else {
+            None
+        },
+    };
     let diff_collect_start = Instant::now();
-    let diff = runner.collect_diff(&ctx).map_err(|err| {
-        ScanError::with_hint(
-            ScanErrorKind::Runtime,
-            FailureCode::GitDiffFailed,
-            "Verify the repository is a valid git worktree and retry with --scope worktree.",
-            err.context("failed to collect git diff"),
-        )
-    })?;
+    let diff = runner
+        .collect_diff_with_options(&ctx, &diff_options)
+        .map_err(|err| {
+            ScanError::with_hint(
+                ScanErrorKind::Runtime,
+                FailureCode::GitDiffFailed,
+                "Verify the repository is a valid git worktree and retry with --scope worktree.",
+                err.context("failed to collect git diff"),
+            )
+        })?;
     profile.diff_ms = diff_collect_start.elapsed().as_millis();
     profile.changed_files = diff.files.len();
     let diff_fingerprint = diff.fingerprint.clone();
@@ -5369,16 +5406,13 @@ fn execute_scan(
                     run_start.elapsed().as_millis(),
                 )
             }
-            "fail_closed" => {
-                return Err(ScanError::new(
-                    ScanErrorKind::Runtime,
-                    anyhow!(
-                        "changed file count ({}) exceeded configured max_changed_files ({}) with on_exceed=fail_closed",
-                        profile.changed_files,
-                        cfg.scope.max_changed_files
-                    ),
-                ));
-            }
+            "fail_closed" => changed_file_limit_fail_closed_report(
+                &cfg,
+                &opts,
+                &diff_fingerprint,
+                profile.changed_files,
+                run_start.elapsed().as_millis(),
+            ),
             other => {
                 return Err(ScanError::new(
                     ScanErrorKind::Config,
@@ -6478,6 +6512,58 @@ fn read_git_file_at_ref_candidates(
         ));
     }
     Ok(None)
+}
+
+fn resolve_git_ref_for_authority(repo_root: &Path, ref_name: &str) -> Result<String> {
+    if git_ref_exists(repo_root, ref_name)? {
+        return Ok(ref_name.to_string());
+    }
+    let fetched_ref = fetch_git_ref_for_authority(repo_root, ref_name)?;
+    if git_ref_exists(repo_root, ref_name)? {
+        return Ok(ref_name.to_string());
+    }
+    if let Some(fetched_ref) = fetched_ref {
+        if git_ref_exists(repo_root, fetched_ref.as_str())? {
+            return Ok(fetched_ref);
+        }
+    }
+    Err(anyhow!(
+        "git ref `{ref_name}` could not be resolved after fetch"
+    ))
+}
+
+fn fetch_git_ref_for_authority(repo_root: &Path, ref_name: &str) -> Result<Option<String>> {
+    let mut args = vec![
+        "fetch".to_string(),
+        "--no-tags".to_string(),
+        "origin".to_string(),
+    ];
+    let fetched_ref = if let Some(branch) = ref_name.strip_prefix("origin/") {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        args.push(format!("+refs/heads/{branch}:{remote_ref}"));
+        Some(remote_ref)
+    } else if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        args.push(format!("+refs/heads/{branch}:{remote_ref}"));
+        Some(remote_ref)
+    } else if let Some(remote_path) = ref_name.strip_prefix("refs/") {
+        let remote_ref = format!("refs/remotes/origin/{remote_path}");
+        args.push(format!("+{ref_name}:{remote_ref}"));
+        Some(remote_ref)
+    } else {
+        args.push(ref_name.to_string());
+        None
+    };
+    let output = ProcessCommand::new("git")
+        .args(args.iter().map(String::as_str))
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("run git {:?}", args))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!("git {:?} failed: {stderr}", args));
+    }
+    Ok(fetched_ref)
 }
 
 fn git_ref_exists(repo_root: &Path, ref_name: &str) -> Result<bool> {
@@ -7678,6 +7764,59 @@ fn changed_file_limit_fail_open_report(
     report
 }
 
+fn changed_file_limit_fail_closed_report(
+    cfg: &Config,
+    opts: &ResolvedScanOptions,
+    fingerprint: &str,
+    changed_files: usize,
+    duration_ms: u128,
+) -> Report {
+    let checks = vec![CheckScore {
+        check: CheckId::DiffCorrectness,
+        label: CheckId::DiffCorrectness.label().to_string(),
+        penalty: 100,
+        max_penalty: 100,
+        triggered: true,
+    }];
+    let findings = vec![Finding {
+        id: "DIFF-010".to_string(),
+        rule_id: "DIFF-010".to_string(),
+        category: "diff_correctness".to_string(),
+        docs_url:
+            "https://github.com/mt4110/patchgate/blob/main/docs/03_cli_reference.md#patchgate-scan"
+                .to_string(),
+        check: CheckId::DiffCorrectness,
+        title: "Changed file limit exceeded".to_string(),
+        message: format!(
+            "changed files ({changed_files}) exceeded max_changed_files ({}). fail-closed mode records this as a gate failure.",
+            cfg.scope.max_changed_files
+        ),
+        severity: Severity::Critical,
+        penalty: 100,
+        location: None,
+        tags: vec![
+            "diff-correctness".to_string(),
+            "scale".to_string(),
+            "file-limit".to_string(),
+            "fail-closed".to_string(),
+        ],
+    }];
+    let mut report = Report::new(
+        findings,
+        checks,
+        ReportMeta {
+            threshold: cfg.output.fail_threshold,
+            mode: opts.mode.clone(),
+            scope: opts.scope.as_str().to_string(),
+            fingerprint: fingerprint.to_string(),
+            duration_ms,
+            skipped_by_cache: false,
+        },
+    );
+    report.changed_files = changed_files;
+    report
+}
+
 fn write_scan_profile(path: &Path, profile: &ScanProfile) -> ScanResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -7756,10 +7895,11 @@ fn parse_scope(raw: &str, source: OptionSource) -> ScanResult<ScopeMode> {
         "staged" => Ok(ScopeMode::Staged),
         "worktree" => Ok(ScopeMode::Worktree),
         "repo" => Ok(ScopeMode::Repo),
+        "pr" => Ok(ScopeMode::Pr),
         _ => Err(invalid_scan_option(
             "scope",
             raw,
-            "staged|worktree|repo",
+            "staged|worktree|repo|pr",
             source,
         )),
     }
@@ -8550,7 +8690,8 @@ mod tests {
         append_dead_letter, append_scan_failure_records, apply_changed_file_overrides,
         apply_policy_autofixes, apply_threshold_override, assess_v1_readiness, build_cache_key,
         build_contract_diff_report, build_delivery_idempotency_key, build_history_summary,
-        build_history_trend, bundle_catalog_artifact_summary, changed_file_limit_fail_open_report,
+        build_history_trend, bundle_catalog_artifact_summary,
+        changed_file_limit_fail_closed_report, changed_file_limit_fail_open_report,
         ci_template_catalog, decision_from_replay_value, delivery_bridge_headers,
         delivery_bridge_metadata, detect_head_sha_from_env, detect_pr_number_from_env,
         detect_sandbox_capabilities, effective_policy_hash, exception_expired,
@@ -8664,6 +8805,7 @@ mod tests {
             scope: None,
             mode: None,
             base_ref: None,
+            head_ref: None,
             protected_policy_ref: None,
             org_policy_bundle: None,
             org_policy_bundle_signature: None,
@@ -9223,7 +9365,7 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         assert_eq!(
             err.render(),
-            "patchgate scan error [input:PG-IN-001]: invalid value for scan.scope from cli: `all` (expected: staged|worktree|repo)"
+            "patchgate scan error [input:PG-IN-001]: invalid value for scan.scope from cli: `all` (expected: staged|worktree|repo|pr)"
         );
     }
 
@@ -9797,6 +9939,22 @@ mod tests {
             .find(|c| c.check == CheckId::DangerousChange)
             .expect("dangerous_change check exists");
         assert!(dangerous.triggered);
+    }
+
+    #[test]
+    fn fail_closed_limit_report_is_gate_failure() {
+        let cfg = Config::default();
+        let opts = ResolvedScanOptions {
+            format: "json".to_string(),
+            mode: "enforce".to_string(),
+            scope: ScopeMode::Pr,
+        };
+        let report = changed_file_limit_fail_closed_report(&cfg, &opts, "fp", 12345, 7);
+        assert_eq!(report.score, 0);
+        assert!(report.should_fail);
+        assert_eq!(report.decision.result, DecisionResult::Fail);
+        assert_eq!(report.findings[0].id, "DIFF-010");
+        assert_eq!(report.findings[0].severity, Severity::Critical);
     }
 
     #[test]

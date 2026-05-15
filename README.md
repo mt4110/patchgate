@@ -52,7 +52,7 @@ printf '\n/policy.toml\n' >> /path/to/project_root/.gitignore
 
 ## CLI
 
-- `patchgate scan --mode warn|enforce --scope staged|worktree|repo --format text|json`
+- `patchgate scan --mode warn|enforce --scope staged|worktree|repo|pr --base-ref origin/main --head-ref HEAD --format text|json`
 - `patchgate doctor`
 
 ### Exit Code

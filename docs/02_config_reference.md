@@ -13,7 +13,7 @@
 ## Existing sections
 
 - `[output]`: `format`, `mode`, `fail_threshold`
-- `[scope]`: `mode`, `max_changed_files`, `on_exceed`
+- `[scope]`: `mode` (`staged|worktree|repo|pr`), `max_changed_files`, `on_exceed` (`enforce` scans fail closed)
 - `[cache]`: `enabled`, `db_path`
 - `[observability]`: metrics/audit path + schema version
   - `audit_v2_jsonl_path`
@@ -26,7 +26,7 @@
   - `org_bundle_signature_path`
   - `org_bundle_public_key_env`
   - `allow_untrusted_local_enforce`
-- `[exclude]`, `[generated_code]`, `[language_rules]`
+- `[exclude]`, `[generated_code]` (`mode = "decay"` by default), `[language_rules]`
 - `[weights]`
   - `test_gap_max_penalty`
   - `dangerous_change_max_penalty`

@@ -203,7 +203,7 @@ impl Default for GeneratedCodeConfig {
 }
 
 fn default_generated_mode() -> String {
-    "exclude".to_string()
+    "decay".to_string()
 }
 
 fn default_generated_globs() -> Vec<String> {

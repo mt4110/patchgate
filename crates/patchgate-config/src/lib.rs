@@ -369,7 +369,7 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
     validate_enum(
         "scope.mode",
         cfg.scope.mode.as_str(),
-        &["staged", "worktree", "repo"],
+        &["staged", "worktree", "repo", "pr"],
     )?;
     validate_enum(
         "scope.on_exceed",
@@ -1822,6 +1822,7 @@ secret_env = "   "
         let loaded = load_from(&example_path).expect("load policy example");
         assert_eq!(loaded, Config::default());
         assert_eq!(loaded.policy_version, POLICY_VERSION_CURRENT);
+        assert_eq!(loaded.generated_code.mode, "decay");
     }
 
     #[test]

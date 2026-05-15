@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use patchgate_config::Config;
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::model::{
     CheckId, CheckScore, Finding, Location, PluginChangedFile, PluginFinding, PluginInput,
@@ -26,12 +27,14 @@ use crate::model::{
 const MAX_STORED_LINE_SAMPLES: usize = 32;
 const MAX_STORED_LINE_CHARS: usize = 240;
 const PLUGIN_SHADOW_BRIDGE_MODE: &str = "shadow";
+const DIFF_SCHEMA_VERSION: &str = "patchgate.diff.v1";
 
 #[derive(Debug, Clone, Copy)]
 pub enum ScopeMode {
     Staged,
     Worktree,
     Repo,
+    Pr,
 }
 
 impl ScopeMode {
@@ -40,6 +43,7 @@ impl ScopeMode {
             ScopeMode::Staged => "staged",
             ScopeMode::Worktree => "worktree",
             ScopeMode::Repo => "repo",
+            ScopeMode::Pr => "pr",
         }
     }
 }
@@ -48,6 +52,17 @@ impl ScopeMode {
 pub struct Context {
     pub repo_root: PathBuf,
     pub scope: ScopeMode,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffOptions {
+    /// PR base ref used when scope is `pr`.
+    pub base_ref: Option<String>,
+    /// PR head ref used when scope is `pr`; defaults to `HEAD`.
+    pub head_ref: Option<String>,
+    /// Large-diff preflight limit. When exceeded after raw identity collection,
+    /// line stats and patch samples are intentionally skipped.
+    pub stop_after_raw_file_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +76,55 @@ pub enum ChangeStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileKind {
+    #[default]
+    Text,
+    Binary,
+    Symlink,
+    Submodule,
+    Lfs,
+    Unknown,
+}
+
+impl FileKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Text => "text",
+            FileKind::Binary => "binary",
+            FileKind::Symlink => "symlink",
+            FileKind::Submodule => "submodule",
+            FileKind::Lfs => "lfs",
+            FileKind::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathSafetyFlag {
+    ControlCharacter,
+    NonUtf8,
+    RejectedRepositoryPath,
+    CaseInsensitiveCollision,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffFileMetadata {
+    pub path_id: String,
+    pub path_bytes_b64: String,
+    pub old_path_id: Option<String>,
+    pub old_path_bytes_b64: Option<String>,
+    pub old_path_flags: Vec<PathSafetyFlag>,
+    pub file_kind: FileKind,
+    pub old_mode: Option<String>,
+    pub new_mode: Option<String>,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+    pub symlink_target: Option<String>,
+    pub symlink_target_escapes_repo: bool,
+    pub path_flags: Vec<PathSafetyFlag>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
     pub path: String,
@@ -70,12 +134,16 @@ pub struct ChangedFile {
     pub deleted: u32,
     pub added_lines: Vec<String>,
     pub removed_lines: Vec<String>,
+    pub metadata: DiffFileMetadata,
 }
 
 #[derive(Debug, Clone)]
 pub struct DiffData {
     pub files: Vec<ChangedFile>,
     pub fingerprint: String,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    pub merge_base: Option<String>,
 }
 
 impl DiffData {
@@ -94,7 +162,15 @@ impl Runner {
     }
 
     pub fn collect_diff(&self, ctx: &Context) -> Result<DiffData> {
-        collect_diff(ctx)
+        collect_diff(ctx, &DiffOptions::default())
+    }
+
+    pub fn collect_diff_with_options(
+        &self,
+        ctx: &Context,
+        options: &DiffOptions,
+    ) -> Result<DiffData> {
+        collect_diff(ctx, options)
     }
 
     pub fn evaluate(&self, ctx: &Context, diff: DiffData, mode: &str) -> Result<Report> {
@@ -106,10 +182,16 @@ impl Runner {
             .context("failed to compile generated_code.globs")?;
 
         let (
+            (diff_correctness, diff_correctness_ms),
             (test_gap, test_gap_ms),
             (dangerous_change, dangerous_change_ms),
             (dependency_update, dependency_update_ms),
         ) = std::thread::scope(|scope| {
+            let diff_correctness_handle = scope.spawn(|| {
+                let check_start = Instant::now();
+                let result = evaluate_diff_correctness(&diff);
+                (result, check_start.elapsed().as_millis())
+            });
             let test_gap_handle = scope.spawn(|| {
                 let check_start = Instant::now();
                 let result = evaluate_test_gap(&self.policy, &diff, &exclude_set, &generated_set);
@@ -128,6 +210,9 @@ impl Runner {
                 (result, check_start.elapsed().as_millis())
             });
 
+            let (diff_correctness_result, diff_correctness_ms) = diff_correctness_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("diff_correctness worker thread panicked"))?;
             let (test_gap_result, test_gap_ms) = test_gap_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("test_gap worker thread panicked"))?;
@@ -139,6 +224,7 @@ impl Runner {
                 .map_err(|_| anyhow::anyhow!("dependency_update worker thread panicked"))?;
 
             Ok::<_, anyhow::Error>((
+                (diff_correctness_result, diff_correctness_ms),
                 (test_gap_result?, test_gap_ms),
                 (dangerous_change_result?, dangerous_change_ms),
                 (dependency_update_result?, dependency_update_ms),
@@ -148,12 +234,14 @@ impl Runner {
         let plugin_outcome = evaluate_plugins(&self.policy, ctx, &diff, mode)?;
 
         let mut findings = Vec::new();
+        findings.extend(diff_correctness.findings);
         findings.extend(test_gap.findings);
         findings.extend(dangerous_change.findings);
         findings.extend(dependency_update.findings);
         findings.extend(plugin_outcome.findings);
 
         let mut checks = vec![
+            diff_correctness.score,
             test_gap.score,
             dangerous_change.score,
             dependency_update.score,
@@ -177,6 +265,10 @@ impl Runner {
             },
         );
         report.changed_files = changed_files;
+        report.check_durations_ms.insert(
+            CheckId::DiffCorrectness.as_str().to_string(),
+            diff_correctness_ms,
+        );
         report
             .check_durations_ms
             .insert(CheckId::TestGap.as_str().to_string(), test_gap_ms);
@@ -222,6 +314,225 @@ impl Runner {
 struct CheckEvaluation {
     score: CheckScore,
     findings: Vec<Finding>,
+}
+
+fn evaluate_diff_correctness(diff: &DiffData) -> CheckEvaluation {
+    let max_penalty = 100;
+    let mut findings = Vec::new();
+    let mut penalty = 0u8;
+
+    for file in &diff.files {
+        for flag in &file.metadata.path_flags {
+            let (rule_id, title, message, severity) = match flag {
+                PathSafetyFlag::ControlCharacter => (
+                    "DIFF-001",
+                    "Path contains control characters",
+                    format!(
+                        "{} has a current or previous path containing a tab, newline, or other control character. Review it by raw path identity: {}.",
+                        path_context(file), file.metadata.path_id
+                    ),
+                    Severity::Critical,
+                ),
+                PathSafetyFlag::NonUtf8 => (
+                    "DIFF-002",
+                    "Path is not valid UTF-8",
+                    format!(
+                        "{} has a current or previous path that cannot be represented losslessly as UTF-8. Review it by raw path identity: {}.",
+                        path_context(file), file.metadata.path_id
+                    ),
+                    Severity::Critical,
+                ),
+                PathSafetyFlag::RejectedRepositoryPath => (
+                    "DIFF-003",
+                    "Path is not a safe repository-relative path",
+                    format!(
+                        "{} has a current or previous path that is absolute, escapes the repository, or uses an unsafe separator.",
+                        path_context(file)
+                    ),
+                    Severity::Critical,
+                ),
+                PathSafetyFlag::CaseInsensitiveCollision => (
+                    "DIFF-007",
+                    "Case-insensitive path collision",
+                    format!(
+                        "{} collides with another changed path on case-insensitive filesystems.",
+                        file.path
+                    ),
+                    Severity::Critical,
+                ),
+            };
+            let finding_penalty = 100;
+            penalty = penalty.saturating_add(finding_penalty);
+            let mut tags = vec!["diff-correctness".to_string(), "path-safety".to_string()];
+            if file.metadata.old_path_flags.contains(flag) {
+                if let Some(old_path_id) = &file.metadata.old_path_id {
+                    if let Some(tag) = evidence_path_tag(old_path_id) {
+                        tags.push(tag);
+                    }
+                }
+            }
+            findings.push(diff_correctness_finding(
+                rule_id,
+                title,
+                message,
+                severity,
+                finding_penalty,
+                file,
+                tags,
+            ));
+        }
+
+        match file.metadata.file_kind {
+            FileKind::Binary => {
+                penalty = penalty.saturating_add(100);
+                findings.push(diff_correctness_finding(
+                    "DIFF-004",
+                    "Binary diff requires explicit review",
+                    format!(
+                        "{} changed as binary content. Text-only patch parsing cannot prove this is safe.",
+                        file.path
+                    ),
+                    Severity::Critical,
+                    100,
+                    file,
+                    vec!["diff-correctness".to_string(), "binary".to_string()],
+                ));
+            }
+            FileKind::Submodule => {
+                penalty = penalty.saturating_add(100);
+                findings.push(diff_correctness_finding(
+                    "DIFF-005",
+                    "Submodule pointer changed",
+                    format!(
+                        "{} changed a gitlink from {} to {}.",
+                        file.path,
+                        file.metadata.old_oid.as_deref().unwrap_or("unknown"),
+                        file.metadata.new_oid.as_deref().unwrap_or("unknown")
+                    ),
+                    Severity::Critical,
+                    100,
+                    file,
+                    vec!["diff-correctness".to_string(), "submodule".to_string()],
+                ));
+            }
+            FileKind::Symlink if file.metadata.symlink_target_escapes_repo => {
+                penalty = penalty.saturating_add(100);
+                findings.push(diff_correctness_finding(
+                    "DIFF-006",
+                    "Symlink target escapes repository",
+                    format!(
+                        "{} points outside the repository boundary (target: {}).",
+                        file.path,
+                        file.metadata
+                            .symlink_target
+                            .as_deref()
+                            .unwrap_or("unresolved")
+                    ),
+                    Severity::Critical,
+                    100,
+                    file,
+                    vec!["diff-correctness".to_string(), "symlink".to_string()],
+                ));
+            }
+            FileKind::Symlink => {
+                let finding_penalty = 12;
+                penalty = penalty.saturating_add(finding_penalty);
+                findings.push(diff_correctness_finding(
+                    "DIFF-008",
+                    "Symlink changed",
+                    format!(
+                        "{} changed a symlink target (target: {}).",
+                        file.path,
+                        file.metadata
+                            .symlink_target
+                            .as_deref()
+                            .unwrap_or("unresolved")
+                    ),
+                    Severity::High,
+                    finding_penalty,
+                    file,
+                    vec!["diff-correctness".to_string(), "symlink".to_string()],
+                ));
+            }
+            FileKind::Lfs => {
+                let finding_penalty = 8;
+                penalty = penalty.saturating_add(finding_penalty);
+                findings.push(diff_correctness_finding(
+                    "DIFF-009",
+                    "Git LFS pointer changed",
+                    format!("{} changed as a Git LFS pointer.", file.path),
+                    Severity::Medium,
+                    finding_penalty,
+                    file,
+                    vec!["diff-correctness".to_string(), "lfs".to_string()],
+                ));
+            }
+            FileKind::Text | FileKind::Unknown => {}
+        }
+    }
+
+    let penalty = penalty.min(max_penalty);
+    CheckEvaluation {
+        score: CheckScore {
+            check: CheckId::DiffCorrectness,
+            label: CheckId::DiffCorrectness.label().to_string(),
+            penalty,
+            max_penalty,
+            triggered: penalty > 0,
+        },
+        findings,
+    }
+}
+
+fn diff_correctness_finding(
+    rule_id: &str,
+    title: &str,
+    message: String,
+    severity: Severity,
+    penalty: u8,
+    file: &ChangedFile,
+    mut tags: Vec<String>,
+) -> Finding {
+    tags.push(file.metadata.file_kind.as_str().to_string());
+    tags.push(file.metadata.path_id.clone());
+    if let Some(old_path_id) = &file.metadata.old_path_id {
+        if let Some(hex) = old_path_id.strip_prefix("path_sha256:") {
+            tags.push(format!("old_path_sha256:{hex}"));
+        } else {
+            tags.push(format!("old_path_id:{old_path_id}"));
+        }
+    }
+    Finding {
+        id: rule_id.to_string(),
+        rule_id: rule_id.to_string(),
+        category: "diff_correctness".to_string(),
+        docs_url:
+            "https://github.com/mt4110/patchgate/blob/main/docs/03_cli_reference.md#patchgate-scan"
+                .to_string(),
+        check: CheckId::DiffCorrectness,
+        title: title.to_string(),
+        message,
+        severity,
+        penalty,
+        location: Some(Location {
+            file: file.path.clone(),
+            line: None,
+        }),
+        tags,
+    }
+}
+
+fn evidence_path_tag(path_id: &str) -> Option<String> {
+    path_id
+        .strip_prefix("path_sha256:")
+        .map(|hex| format!("evidence_path_sha256:{hex}"))
+}
+
+fn path_context(file: &ChangedFile) -> String {
+    file.old_path
+        .as_ref()
+        .map(|old_path| format!("{} (previously {})", file.path, old_path))
+        .unwrap_or_else(|| file.path.clone())
 }
 
 #[derive(Debug, Default)]
@@ -579,6 +890,10 @@ fn build_plugin_input(
             .iter()
             .map(|f| PluginChangedFile {
                 path: f.path.clone(),
+                old_path: f.old_path.clone(),
+                path_id: f.metadata.path_id.clone(),
+                path_bytes_b64: f.metadata.path_bytes_b64.clone(),
+                file_kind: f.metadata.file_kind.as_str().to_string(),
                 status: change_status_as_str(f.status).to_string(),
                 added: f.added,
                 deleted: f.deleted,
@@ -1903,51 +2218,230 @@ fn ecosystem_penalty_config(
     }
 }
 
-fn collect_diff(ctx: &Context) -> Result<DiffData> {
-    let args = diff_args(ctx.scope);
-    let output =
-        run_git(&ctx.repo_root, &args).with_context(|| format!("git {:?} failed", args))?;
+#[derive(Debug)]
+struct DiffCommandPlan {
+    raw_args: Vec<String>,
+    numstat_args: Vec<String>,
+    patch_args: Vec<String>,
+    base_ref: Option<String>,
+    head_ref: Option<String>,
+    merge_base: Option<String>,
+}
 
-    let mut files = parse_raw_status(&output);
-    apply_patch_stats(&mut files, &output);
+fn collect_diff(ctx: &Context, options: &DiffOptions) -> Result<DiffData> {
+    let plan = diff_command_plan(ctx, options)?;
+    let raw_output = run_git_bytes(&ctx.repo_root, &plan.raw_args)
+        .with_context(|| format!("git {:?} failed", plan.raw_args))?;
+    let mut files = parse_raw_status_z(raw_output.as_slice());
+    if options
+        .stop_after_raw_file_limit
+        .is_some_and(|limit| files.len() > limit)
+    {
+        let fingerprint = diff_fingerprint(&plan, raw_output.as_slice(), &[], &[]);
+        return Ok(DiffData {
+            files: files.into_values().collect(),
+            fingerprint,
+            base_ref: plan.base_ref,
+            head_ref: plan.head_ref,
+            merge_base: plan.merge_base,
+        });
+    }
 
-    let fingerprint = format!("{:x}", Sha256::digest(output.as_bytes()));
+    let numstat_output = run_git_bytes(&ctx.repo_root, &plan.numstat_args)
+        .with_context(|| format!("git {:?} failed", plan.numstat_args))?;
+    let patch_output = run_git_bytes(&ctx.repo_root, &plan.patch_args)
+        .with_context(|| format!("git {:?} failed", plan.patch_args))?;
+
+    apply_numstat_z(&mut files, numstat_output.as_slice());
+    apply_patch_line_samples(&mut files, patch_output.as_slice());
+    classify_symlink_targets(&ctx.repo_root, &mut files)?;
+    classify_lfs_pointers(&ctx.repo_root, &mut files)?;
+    mark_case_insensitive_collisions(&mut files);
+
+    let fingerprint = diff_fingerprint(
+        &plan,
+        raw_output.as_slice(),
+        numstat_output.as_slice(),
+        patch_output.as_slice(),
+    );
 
     Ok(DiffData {
         files: files.into_values().collect(),
         fingerprint,
+        base_ref: plan.base_ref,
+        head_ref: plan.head_ref,
+        merge_base: plan.merge_base,
     })
 }
 
-fn diff_args(scope: ScopeMode) -> Vec<String> {
-    match scope {
-        ScopeMode::Staged => vec![
-            "diff".to_string(),
-            "--cached".to_string(),
-            "--find-renames".to_string(),
-            "--no-color".to_string(),
-            "--patch-with-raw".to_string(),
-            "--unified=0".to_string(),
-        ],
-        ScopeMode::Worktree => vec![
-            "diff".to_string(),
-            "--find-renames".to_string(),
-            "--no-color".to_string(),
-            "--patch-with-raw".to_string(),
-            "--unified=0".to_string(),
-        ],
-        ScopeMode::Repo => vec![
-            "diff".to_string(),
-            "HEAD".to_string(),
-            "--find-renames".to_string(),
-            "--no-color".to_string(),
-            "--patch-with-raw".to_string(),
-            "--unified=0".to_string(),
-        ],
+fn diff_command_plan(ctx: &Context, options: &DiffOptions) -> Result<DiffCommandPlan> {
+    let common_raw = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--raw",
+        "-z",
+        "--find-renames",
+        "--find-copies",
+    ];
+    let common_numstat = ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z"];
+    let common_patch = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--patch",
+        "--binary",
+        "--no-color",
+        "--unified=0",
+    ];
+
+    let build = |extra: &[String],
+                 base_ref: Option<String>,
+                 head_ref: Option<String>,
+                 merge_base: Option<String>| {
+        DiffCommandPlan {
+            raw_args: git_args(&common_raw, extra),
+            numstat_args: git_args(&common_numstat, extra),
+            patch_args: git_args(&common_patch, extra),
+            base_ref,
+            head_ref,
+            merge_base,
+        }
+    };
+
+    match ctx.scope {
+        ScopeMode::Staged => Ok(build(&["--cached".to_string()], None, None, None)),
+        ScopeMode::Worktree => Ok(build(&[], None, None, None)),
+        ScopeMode::Repo => Ok(build(&["HEAD".to_string()], None, None, None)),
+        ScopeMode::Pr => {
+            let base_ref = options
+                .base_ref
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--base-ref is required when --scope pr"))?;
+            let head_ref = options
+                .head_ref
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string());
+            let resolved_base_ref = ensure_ref_resolvable(&ctx.repo_root, base_ref.as_str())
+                .with_context(|| format!("resolve PR base ref `{base_ref}`"))?;
+            let resolved_head_ref = ensure_ref_resolvable(&ctx.repo_root, head_ref.as_str())
+                .with_context(|| format!("resolve PR head ref `{head_ref}`"))?;
+            let merge_base = run_git_string(
+                &ctx.repo_root,
+                &[
+                    "merge-base".to_string(),
+                    resolved_base_ref,
+                    resolved_head_ref.clone(),
+                ],
+            )
+            .context("resolve PR merge-base")?
+            .trim()
+            .to_string();
+            if merge_base.is_empty() {
+                anyhow::bail!("git merge-base returned an empty SHA");
+            }
+            Ok(build(
+                &[merge_base.clone(), resolved_head_ref],
+                Some(base_ref),
+                Some(head_ref),
+                Some(merge_base),
+            ))
+        }
     }
 }
 
-fn run_git(repo_root: &PathBuf, args: &[String]) -> Result<String> {
+fn git_args(prefix: &[&str], extra: &[String]) -> Vec<String> {
+    prefix
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .chain(extra.iter().cloned())
+        .collect()
+}
+
+fn ensure_ref_resolvable(repo_root: &Path, reference: &str) -> Result<String> {
+    if git_ref_resolves(repo_root, reference) {
+        return Ok(reference.to_string());
+    }
+    let fetched_ref = fetch_ref(repo_root, reference)?;
+    if git_ref_resolves(repo_root, reference) {
+        return Ok(reference.to_string());
+    }
+    if let Some(fetched_ref) = fetched_ref {
+        if git_ref_resolves(repo_root, fetched_ref.as_str()) {
+            return Ok(fetched_ref);
+        }
+    }
+    anyhow::bail!("git ref `{reference}` could not be resolved after fetch")
+}
+
+fn git_ref_resolves(repo_root: &Path, reference: &str) -> bool {
+    let verify_ref = format!("{reference}^{{commit}}");
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", verify_ref.as_str()])
+        .current_dir(repo_root)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn fetch_ref(repo_root: &Path, reference: &str) -> Result<Option<String>> {
+    let mut args = vec![
+        "fetch".to_string(),
+        "--no-tags".to_string(),
+        "origin".to_string(),
+    ];
+    let fetched_ref = if let Some(branch) = reference.strip_prefix("origin/") {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        args.push(format!("+refs/heads/{branch}:{remote_ref}"));
+        Some(remote_ref)
+    } else if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        args.push(format!("+refs/heads/{branch}:{remote_ref}"));
+        Some(remote_ref)
+    } else if let Some(remote_path) = reference.strip_prefix("refs/") {
+        let remote_ref = format!("refs/remotes/origin/{remote_path}");
+        args.push(format!("+{reference}:{remote_ref}"));
+        Some(remote_ref)
+    } else {
+        args.push(reference.to_string());
+        None
+    };
+    run_git_bytes(repo_root, &args).with_context(|| format!("git {:?} failed", args))?;
+    Ok(fetched_ref)
+}
+
+fn diff_fingerprint(
+    plan: &DiffCommandPlan,
+    raw_output: &[u8],
+    numstat_output: &[u8],
+    patch_output: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    update_fingerprint_chunk(&mut hasher, DIFF_SCHEMA_VERSION.as_bytes());
+    update_fingerprint_chunk(
+        &mut hasher,
+        plan.base_ref.as_deref().unwrap_or("").as_bytes(),
+    );
+    update_fingerprint_chunk(
+        &mut hasher,
+        plan.head_ref.as_deref().unwrap_or("").as_bytes(),
+    );
+    update_fingerprint_chunk(
+        &mut hasher,
+        plan.merge_base.as_deref().unwrap_or("").as_bytes(),
+    );
+    update_fingerprint_chunk(&mut hasher, raw_output);
+    update_fingerprint_chunk(&mut hasher, numstat_output);
+    update_fingerprint_chunk(&mut hasher, patch_output);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn update_fingerprint_chunk(hasher: &mut Sha256, chunk: &[u8]) {
+    hasher.update((chunk.len() as u64).to_be_bytes());
+    hasher.update(chunk);
+}
+
+fn run_git_bytes(repo_root: &Path, args: &[String]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo_root)
@@ -1958,12 +2452,21 @@ fn run_git(repo_root: &PathBuf, args: &[String]) -> Result<String> {
         anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
-    String::from_utf8(output.stdout).context("git output was not utf8")
+    Ok(output.stdout)
 }
 
-fn parse_raw_status(input: &str) -> BTreeMap<String, ChangedFile> {
-    let mut files = BTreeMap::new();
+fn run_git_string(repo_root: &Path, args: &[String]) -> Result<String> {
+    let output = run_git_bytes(repo_root, args)?;
+    String::from_utf8(output).context("git output was not utf8")
+}
 
+#[cfg(test)]
+fn parse_raw_status(input: &str) -> BTreeMap<String, ChangedFile> {
+    if input.as_bytes().contains(&0) {
+        return parse_raw_status_z(input.as_bytes());
+    }
+
+    let mut files = BTreeMap::new();
     for line in input.lines() {
         if !line.starts_with(':') {
             continue;
@@ -1976,35 +2479,223 @@ fn parse_raw_status(input: &str) -> BTreeMap<String, ChangedFile> {
             continue;
         };
         let second_path = parts.next();
-
-        let status_token = prefix.split_whitespace().last().unwrap_or_default();
-        let status = parse_status(status_token);
-
+        let prefix_parts: Vec<&str> = prefix.split_whitespace().collect();
+        if prefix_parts.len() < 5 {
+            continue;
+        }
+        let status = parse_status(prefix_parts[4]);
         let (old_path, path) = match status {
             ChangeStatus::Renamed | ChangeStatus::Copied => {
                 let Some(new_path) = second_path else {
                     continue;
                 };
-                (Some(first_path.to_string()), new_path.to_string())
+                (Some(first_path.as_bytes()), new_path.as_bytes())
             }
-            _ => (None, first_path.to_string()),
+            _ => (None, first_path.as_bytes()),
+        };
+        let file = changed_file_from_raw(
+            path,
+            old_path,
+            status,
+            prefix_parts[0].trim_start_matches(':').to_string(),
+            prefix_parts[1].to_string(),
+            prefix_parts[2].to_string(),
+            prefix_parts[3].to_string(),
+        );
+        insert_changed_file(&mut files, file);
+    }
+    files
+}
+
+fn parse_raw_status_z(input: &[u8]) -> BTreeMap<String, ChangedFile> {
+    let mut files = BTreeMap::new();
+
+    let mut parts = input.split(|byte| *byte == 0);
+    while let Some(prefix_bytes) = parts.next() {
+        if prefix_bytes.is_empty() || !prefix_bytes.starts_with(b":") {
+            continue;
+        }
+        let Some(first_path) = parts.next() else {
+            continue;
+        };
+        let prefix = String::from_utf8_lossy(prefix_bytes);
+        let prefix_parts: Vec<&str> = prefix.split_whitespace().collect();
+        if prefix_parts.len() < 5 {
+            continue;
+        }
+        let old_mode = prefix_parts[0].trim_start_matches(':').to_string();
+        let new_mode = prefix_parts[1].to_string();
+        let old_oid = prefix_parts[2].to_string();
+        let new_oid = prefix_parts[3].to_string();
+        let status_token = prefix_parts[4];
+        let status = parse_status(status_token);
+
+        let (old_path, path) = match status {
+            ChangeStatus::Renamed | ChangeStatus::Copied => {
+                let Some(new_path) = parts.next() else {
+                    continue;
+                };
+                (Some(first_path), new_path)
+            }
+            _ => (None, first_path),
         };
 
-        files.insert(
-            path.clone(),
-            ChangedFile {
-                path,
-                status,
-                old_path,
-                added: 0,
-                deleted: 0,
-                added_lines: Vec::new(),
-                removed_lines: Vec::new(),
-            },
-        );
+        let file =
+            changed_file_from_raw(path, old_path, status, old_mode, new_mode, old_oid, new_oid);
+        insert_changed_file(&mut files, file);
     }
 
     files
+}
+
+fn insert_changed_file(files: &mut BTreeMap<String, ChangedFile>, file: ChangedFile) -> String {
+    let key = unique_file_key(files, file.path.as_str(), file.metadata.path_id.as_str());
+    files.insert(key.clone(), file);
+    key
+}
+
+fn unique_file_key(
+    files: &BTreeMap<String, ChangedFile>,
+    display_path: &str,
+    path_id: &str,
+) -> String {
+    match files.get(display_path) {
+        None => display_path.to_string(),
+        Some(existing) if existing.metadata.path_id == path_id => display_path.to_string(),
+        Some(_) => format!("{display_path}#{path_id}"),
+    }
+}
+
+fn changed_file_from_raw(
+    path_bytes: &[u8],
+    old_path_bytes: Option<&[u8]>,
+    status: ChangeStatus,
+    old_mode: String,
+    new_mode: String,
+    old_oid: String,
+    new_oid: String,
+) -> ChangedFile {
+    let path = display_path(path_bytes);
+    let old_path = old_path_bytes.map(display_path);
+    let mut metadata = metadata_for_path(path_bytes);
+    if let Some(old_path_bytes) = old_path_bytes {
+        let old_metadata = metadata_for_path(old_path_bytes);
+        metadata.old_path_id = Some(old_metadata.path_id.clone());
+        metadata.old_path_bytes_b64 = Some(old_metadata.path_bytes_b64.clone());
+        metadata.old_path_flags = old_metadata.path_flags.clone();
+        merge_path_flags(&mut metadata.path_flags, old_metadata.path_flags);
+    }
+    metadata.old_mode = Some(old_mode.clone());
+    metadata.new_mode = Some(new_mode.clone());
+    metadata.old_oid = Some(old_oid);
+    metadata.new_oid = Some(new_oid);
+    metadata.file_kind = classify_file_kind_from_modes(old_mode.as_str(), new_mode.as_str());
+
+    ChangedFile {
+        path,
+        status,
+        old_path,
+        added: 0,
+        deleted: 0,
+        added_lines: Vec::new(),
+        removed_lines: Vec::new(),
+        metadata,
+    }
+}
+
+fn merge_path_flags(target: &mut Vec<PathSafetyFlag>, source: Vec<PathSafetyFlag>) {
+    for flag in source {
+        if !target.contains(&flag) {
+            target.push(flag);
+        }
+    }
+}
+
+fn metadata_for_path(path_bytes: &[u8]) -> DiffFileMetadata {
+    let mut path_flags = Vec::new();
+    if std::str::from_utf8(path_bytes).is_err() {
+        path_flags.push(PathSafetyFlag::NonUtf8);
+    }
+    if path_bytes
+        .iter()
+        .any(|byte| matches!(*byte, b'\n' | b'\r' | b'\t') || *byte < 0x20)
+    {
+        path_flags.push(PathSafetyFlag::ControlCharacter);
+    }
+    if !is_repository_relative_path(path_bytes) {
+        path_flags.push(PathSafetyFlag::RejectedRepositoryPath);
+    }
+    DiffFileMetadata {
+        path_id: path_id(path_bytes),
+        path_bytes_b64: path_bytes_b64(path_bytes),
+        old_path_id: None,
+        old_path_bytes_b64: None,
+        old_path_flags: Vec::new(),
+        file_kind: FileKind::Text,
+        old_mode: None,
+        new_mode: None,
+        old_oid: None,
+        new_oid: None,
+        symlink_target: None,
+        symlink_target_escapes_repo: false,
+        path_flags,
+    }
+}
+
+fn classify_file_kind_from_modes(old_mode: &str, new_mode: &str) -> FileKind {
+    if old_mode == "160000" || new_mode == "160000" {
+        FileKind::Submodule
+    } else if old_mode == "120000" || new_mode == "120000" {
+        FileKind::Symlink
+    } else if new_mode == "000000" && old_mode == "000000" {
+        FileKind::Unknown
+    } else {
+        FileKind::Text
+    }
+}
+
+fn display_path(path_bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(path_bytes);
+    let mut display = String::new();
+    for ch in lossy.chars() {
+        match ch {
+            '\n' => display.push_str("\\n"),
+            '\r' => display.push_str("\\r"),
+            '\t' => display.push_str("\\t"),
+            '\0' => display.push_str("\\0"),
+            ch if ch.is_control() => {
+                for escaped in ch.escape_default() {
+                    display.push(escaped);
+                }
+            }
+            ch => display.push(ch),
+        }
+    }
+    display
+}
+
+fn path_id(path_bytes: &[u8]) -> String {
+    format!("path_sha256:{:x}", Sha256::digest(path_bytes))
+}
+
+fn path_bytes_b64(path_bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(path_bytes)
+}
+
+fn is_repository_relative_path(path_bytes: &[u8]) -> bool {
+    if path_bytes.is_empty()
+        || path_bytes.starts_with(b"/")
+        || path_bytes.starts_with(b"\\")
+        || path_bytes.contains(&b'\\')
+    {
+        return false;
+    }
+    if path_bytes.len() >= 2 && path_bytes[1] == b':' && path_bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    path_bytes
+        .split(|byte| *byte == b'/')
+        .all(|part| !part.is_empty() && part != b"." && part != b"..")
 }
 
 #[cfg(test)]
@@ -2034,6 +2725,7 @@ fn parse_name_status(input: &str) -> BTreeMap<String, ChangedFile> {
         files.insert(
             path.clone(),
             ChangedFile {
+                metadata: DiffFileMetadata::default(),
                 path,
                 status,
                 old_path,
@@ -2060,6 +2752,352 @@ fn parse_status(status_raw: &str) -> ChangeStatus {
     }
 }
 
+fn apply_numstat_z(files: &mut BTreeMap<String, ChangedFile>, input: &[u8]) {
+    let mut path_id_to_key: BTreeMap<String, String> = files
+        .iter()
+        .map(|(key, file)| (file.metadata.path_id.clone(), key.clone()))
+        .collect();
+    let mut parts = input.split(|byte| *byte == 0);
+    while let Some(header) = parts.next() {
+        if header.is_empty() {
+            continue;
+        }
+        let Some((added_raw, deleted_raw, path_field)) = split_numstat_header(header) else {
+            continue;
+        };
+        let path_bytes = if path_field.is_empty() {
+            let _old_path = parts.next();
+            let Some(new_path) = parts.next() else {
+                continue;
+            };
+            new_path
+        } else {
+            path_field
+        };
+        let path = display_path(path_bytes);
+        let path_metadata = metadata_for_path(path_bytes);
+        let key = if let Some(key) = path_id_to_key.get(path_metadata.path_id.as_str()).cloned() {
+            key
+        } else {
+            let file = ChangedFile {
+                path: path.clone(),
+                status: ChangeStatus::Unknown,
+                old_path: None,
+                added: 0,
+                deleted: 0,
+                added_lines: Vec::new(),
+                removed_lines: Vec::new(),
+                metadata: path_metadata.clone(),
+            };
+            let key = insert_changed_file(files, file);
+            path_id_to_key.insert(path_metadata.path_id.clone(), key.clone());
+            key
+        };
+        let Some(file) = files.get_mut(key.as_str()) else {
+            continue;
+        };
+
+        match (
+            parse_numstat_count(added_raw),
+            parse_numstat_count(deleted_raw),
+        ) {
+            (Some(added), Some(deleted)) => {
+                file.added = added;
+                file.deleted = deleted;
+            }
+            _ => {
+                if !matches!(
+                    file.metadata.file_kind,
+                    FileKind::Symlink | FileKind::Submodule
+                ) {
+                    file.metadata.file_kind = FileKind::Binary;
+                }
+            }
+        }
+    }
+}
+
+fn split_numstat_header(header: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let first_tab = header.iter().position(|byte| *byte == b'\t')?;
+    let second_tab = header[first_tab + 1..]
+        .iter()
+        .position(|byte| *byte == b'\t')?
+        + first_tab
+        + 1;
+    Some((
+        &header[..first_tab],
+        &header[first_tab + 1..second_tab],
+        &header[second_tab + 1..],
+    ))
+}
+
+fn parse_numstat_count(raw: &[u8]) -> Option<u32> {
+    if raw == b"-" {
+        return None;
+    }
+    let text = std::str::from_utf8(raw).ok()?;
+    text.parse::<u32>().ok()
+}
+
+fn apply_patch_line_samples(files: &mut BTreeMap<String, ChangedFile>, patch: &[u8]) {
+    let display_path_keys = unambiguous_display_path_keys(files);
+    let mut current_key: Option<String> = None;
+    let mut in_hunk = false;
+
+    for line in patch.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = String::from_utf8_lossy(line);
+        if line.starts_with("diff --git ") {
+            current_key = None;
+            in_hunk = false;
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            in_hunk = true;
+            continue;
+        }
+
+        if !in_hunk {
+            if let Some(path) = parse_patch_file_header_path(&line, "+++ b/") {
+                current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
+                continue;
+            }
+
+            if let Some(path) = parse_patch_file_header_path(&line, "--- a/") {
+                current_key = display_path_keys.get(path.as_str()).and_then(Clone::clone);
+                continue;
+            }
+
+            if line.starts_with("+++ /dev/null") || line.starts_with("--- /dev/null") {
+                continue;
+            }
+
+            continue;
+        }
+
+        let Some(key) = &current_key else {
+            continue;
+        };
+        let Some(file) = files.get_mut(key.as_str()) else {
+            continue;
+        };
+
+        if let Some(stripped) = line.strip_prefix('+') {
+            if file.added_lines.len() < MAX_STORED_LINE_SAMPLES {
+                file.added_lines.push(truncate_line_sample(stripped));
+            }
+        } else if let Some(stripped) = line.strip_prefix('-') {
+            if file.removed_lines.len() < MAX_STORED_LINE_SAMPLES {
+                file.removed_lines.push(truncate_line_sample(stripped));
+            }
+        }
+    }
+}
+
+fn unambiguous_display_path_keys(
+    files: &BTreeMap<String, ChangedFile>,
+) -> BTreeMap<String, Option<String>> {
+    let mut display_path_keys = BTreeMap::new();
+    for (key, file) in files {
+        display_path_keys
+            .entry(file.path.clone())
+            .and_modify(|entry| *entry = None)
+            .or_insert_with(|| Some(key.clone()));
+    }
+    display_path_keys
+}
+
+fn classify_symlink_targets(
+    repo_root: &Path,
+    files: &mut BTreeMap<String, ChangedFile>,
+) -> Result<()> {
+    for file in files.values_mut() {
+        if file.metadata.file_kind != FileKind::Symlink {
+            continue;
+        }
+        let oid = if file.status == ChangeStatus::Deleted {
+            file.metadata.old_oid.as_deref()
+        } else {
+            file.metadata.new_oid.as_deref()
+        };
+        let target = if let Some(oid) = oid.filter(|oid| !oid.chars().all(|ch| ch == '0')) {
+            run_git_bytes(
+                repo_root,
+                &["cat-file".to_string(), "-p".to_string(), oid.to_string()],
+            )
+            .with_context(|| format!("read symlink target for {}", file.path))?
+        } else if file.status != ChangeStatus::Deleted {
+            let Some(target) = read_worktree_symlink_target(repo_root, file) else {
+                file.metadata.symlink_target_escapes_repo = true;
+                continue;
+            };
+            target
+        } else {
+            file.metadata.symlink_target_escapes_repo = true;
+            continue;
+        };
+        let target_display = display_path(target.as_slice());
+        file.metadata.symlink_target = Some(target_display);
+        file.metadata.symlink_target_escapes_repo =
+            !symlink_target_stays_in_repo(file.path.as_str(), target.as_slice());
+    }
+    Ok(())
+}
+
+fn read_worktree_symlink_target(repo_root: &Path, file: &ChangedFile) -> Option<Vec<u8>> {
+    if !file.metadata.path_flags.is_empty() {
+        return None;
+    }
+    let target = fs::read_link(repo_root.join(file.path.as_str())).ok()?;
+    target.to_str().map(|target| target.as_bytes().to_vec())
+}
+
+fn classify_lfs_pointers(
+    repo_root: &Path,
+    files: &mut BTreeMap<String, ChangedFile>,
+) -> Result<()> {
+    for file in files.values_mut() {
+        if file.metadata.file_kind != FileKind::Text || file.status == ChangeStatus::Deleted {
+            continue;
+        }
+        let blob = if let Some(oid) = file
+            .metadata
+            .new_oid
+            .as_deref()
+            .filter(|oid| !oid.chars().all(|ch| ch == '0'))
+        {
+            let size = run_git_string(
+                repo_root,
+                &["cat-file".to_string(), "-s".to_string(), oid.to_string()],
+            )
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+            if size > 1024 {
+                continue;
+            }
+            run_git_bytes(
+                repo_root,
+                &["cat-file".to_string(), "-p".to_string(), oid.to_string()],
+            )
+            .with_context(|| format!("read blob for {}", file.path))?
+        } else {
+            let Some(blob) = read_small_worktree_file(repo_root, file, 1024) else {
+                continue;
+            };
+            blob
+        };
+        if is_lfs_pointer(blob.as_slice()) {
+            file.metadata.file_kind = FileKind::Lfs;
+        }
+    }
+    Ok(())
+}
+
+fn read_small_worktree_file(
+    repo_root: &Path,
+    file: &ChangedFile,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
+    if !file.metadata.path_flags.is_empty() {
+        return None;
+    }
+    let path = repo_root.join(file.path.as_str());
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
+fn is_lfs_pointer(blob: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(blob) else {
+        return false;
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.lines();
+    matches!(
+        lines.next(),
+        Some("version https://git-lfs.github.com/spec/v1")
+    ) && text.lines().any(|line| line.starts_with("oid sha256:"))
+        && text.lines().any(|line| line.starts_with("size "))
+}
+
+fn symlink_target_stays_in_repo(link_path: &str, target: &[u8]) -> bool {
+    if !is_repository_relative_symlink_target(target) {
+        return false;
+    }
+    let Ok(target) = std::str::from_utf8(target) else {
+        return false;
+    };
+    let mut stack: Vec<&str> = link_path.rsplit_once('/').map_or(Vec::new(), |(dir, _)| {
+        dir.split('/').filter(|part| !part.is_empty()).collect()
+    });
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return false;
+                }
+            }
+            part => stack.push(part),
+        }
+    }
+    true
+}
+
+fn is_repository_relative_symlink_target(target: &[u8]) -> bool {
+    if target.is_empty()
+        || target.starts_with(b"/")
+        || target.starts_with(b"\\")
+        || target.contains(&b'\\')
+        || std::str::from_utf8(target).is_err()
+    {
+        return false;
+    }
+    !(target.len() >= 2 && target[1] == b':' && target[0].is_ascii_alphabetic())
+}
+
+fn mark_case_insensitive_collisions(files: &mut BTreeMap<String, ChangedFile>) {
+    let mut by_folded_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, file) in files.iter() {
+        by_folded_path
+            .entry(normalized_case_collision_key(file.path.as_str()))
+            .or_default()
+            .push(key.clone());
+    }
+    for keys in by_folded_path.into_values().filter(|keys| keys.len() > 1) {
+        let path_ids: BTreeSet<String> = keys
+            .iter()
+            .filter_map(|key| files.get(key))
+            .map(|file| file.metadata.path_id.clone())
+            .collect();
+        if path_ids.len() <= 1 {
+            continue;
+        }
+        for key in keys {
+            if let Some(file) = files.get_mut(&key) {
+                if !file
+                    .metadata
+                    .path_flags
+                    .contains(&PathSafetyFlag::CaseInsensitiveCollision)
+                {
+                    file.metadata
+                        .path_flags
+                        .push(PathSafetyFlag::CaseInsensitiveCollision);
+                }
+            }
+        }
+    }
+}
+
+fn normalized_case_collision_key(path: &str) -> String {
+    path.nfc().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
+#[cfg(test)]
 fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
     let mut current_path: Option<String> = None;
 
@@ -2072,6 +3110,7 @@ fn apply_patch_stats(files: &mut BTreeMap<String, ChangedFile>, patch: &str) {
         if let Some(path) = parse_patch_file_header_path(line, "+++ b/") {
             current_path = Some(path.clone());
             files.entry(path.clone()).or_insert_with(|| ChangedFile {
+                metadata: DiffFileMetadata::default(),
                 path,
                 status: ChangeStatus::Unknown,
                 old_path: None,
@@ -2353,6 +3392,254 @@ mod tests {
     }
 
     #[test]
+    fn nul_raw_parser_preserves_special_path_identity() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b":100644 100644 abcdef1 abcdef2 M\0");
+        raw.extend_from_slice(b"dir\twith\nnewline-\xff.rs\0");
+
+        let parsed = parse_raw_status_z(raw.as_slice());
+        let file = parsed.values().next().expect("file");
+
+        assert!(file.path.contains("\\t"));
+        assert!(file.path.contains("\\n"));
+        assert!(file
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::ControlCharacter));
+        assert!(file.metadata.path_flags.contains(&PathSafetyFlag::NonUtf8));
+        assert!(file.metadata.path_id.starts_with("path_sha256:"));
+        assert!(!file.metadata.path_bytes_b64.is_empty());
+    }
+
+    #[test]
+    fn raw_display_collision_preserves_both_path_identities() {
+        let raw = b":100644 100644 abcdef1 abcdef2 A\0dir/a\nb.rs\0:100644 100644 abcdef1 abcdef2 A\0dir/a\\nb.rs\0";
+
+        let parsed = parse_raw_status_z(raw);
+        let path_ids: BTreeSet<String> = parsed
+            .values()
+            .map(|file| file.metadata.path_id.clone())
+            .collect();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(path_ids.len(), 2);
+        assert!(parsed.contains_key("dir/a\\nb.rs"));
+        assert!(parsed.keys().any(|key| key.starts_with("dir/a\\nb.rs#")));
+    }
+
+    #[test]
+    fn raw_rename_old_path_safety_flags_are_preserved() {
+        let raw = b":100644 100644 abcdef1 abcdef2 R100\0dir/old\tname.rs\0dir/new-name.rs\0";
+        let parsed = parse_raw_status_z(raw);
+        let file = parsed.get("dir/new-name.rs").expect("renamed file");
+
+        assert_eq!(file.old_path.as_deref(), Some("dir/old\\tname.rs"));
+        assert!(file
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::ControlCharacter));
+        assert!(file
+            .metadata
+            .old_path_flags
+            .contains(&PathSafetyFlag::ControlCharacter));
+
+        let eval = evaluate_diff_correctness(&DiffData {
+            files: parsed.into_values().collect(),
+            fingerprint: "fixture".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
+        });
+        let finding = eval
+            .findings
+            .iter()
+            .find(|finding| finding.id == "DIFF-001")
+            .expect("DIFF-001 finding");
+        assert!(finding
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("old_path_sha256:")));
+        assert!(finding
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with("evidence_path_sha256:")));
+    }
+
+    #[test]
+    fn numstat_z_classifies_binary_without_tab_splitting_path() {
+        let raw = b":100644 100644 abcdef1 abcdef2 M\0assets/a\tb.png\0";
+        let mut parsed = parse_raw_status_z(raw);
+        apply_numstat_z(&mut parsed, b"-\t-\tassets/a\tb.png\0");
+
+        let file = parsed.get("assets/a\\tb.png").expect("binary file");
+        assert_eq!(file.metadata.file_kind, FileKind::Binary);
+    }
+
+    #[test]
+    fn patch_line_sampling_survives_non_utf8_lines() {
+        let mut files = parse_name_status("M\tbin.dat\nM\tsrc/lib.rs\n");
+        let patch = b"diff --git a/bin.dat b/bin.dat\n--- a/bin.dat\n+++ b/bin.dat\n@@ -1,1 +1,1 @@\n-old\n+\xff\n\
+diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+safe\n";
+
+        apply_patch_line_samples(&mut files, patch);
+
+        let file = files.get("src/lib.rs").expect("src file");
+        assert_eq!(file.added_lines.first().map(String::as_str), Some("safe"));
+    }
+
+    #[test]
+    fn patch_line_sampling_keeps_header_like_lines_inside_hunks() {
+        let mut files = parse_name_status("M\tnot-header\nM\tsrc/lib.rs\n");
+        let patch = b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,2 @@\n+++ b/not-header\n+kept\n";
+
+        apply_patch_line_samples(&mut files, patch);
+
+        let file = files.get("src/lib.rs").expect("src file");
+        assert_eq!(
+            file.added_lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["++ b/not-header", "kept"]
+        );
+        let decoy = files.get("not-header").expect("decoy file");
+        assert!(
+            decoy.added_lines.is_empty(),
+            "header-like hunk content must not switch files"
+        );
+    }
+
+    #[test]
+    fn lfs_pointer_allows_utf8_bom() {
+        let pointer = b"\xef\xbb\xbfversion https://git-lfs.github.com/spec/v1\r\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nsize 123\r\n";
+
+        assert!(is_lfs_pointer(pointer));
+    }
+
+    #[test]
+    fn diff_correctness_blocks_binary_submodule_and_special_paths() {
+        let mut binary = ChangedFile {
+            path: "assets/logo.png".to_string(),
+            status: ChangeStatus::Modified,
+            old_path: None,
+            added: 0,
+            deleted: 0,
+            added_lines: vec![],
+            removed_lines: vec![],
+            metadata: DiffFileMetadata::default(),
+        };
+        binary.metadata.file_kind = FileKind::Binary;
+
+        let mut submodule = ChangedFile {
+            path: "vendor/lib".to_string(),
+            status: ChangeStatus::Modified,
+            old_path: None,
+            added: 0,
+            deleted: 0,
+            added_lines: vec![],
+            removed_lines: vec![],
+            metadata: DiffFileMetadata::default(),
+        };
+        submodule.metadata.file_kind = FileKind::Submodule;
+        submodule.metadata.old_oid = Some("1111111111111111111111111111111111111111".to_string());
+        submodule.metadata.new_oid = Some("2222222222222222222222222222222222222222".to_string());
+
+        let mut special = ChangedFile {
+            path: "src/bad\\nname.rs".to_string(),
+            status: ChangeStatus::Added,
+            old_path: None,
+            added: 1,
+            deleted: 0,
+            added_lines: vec![],
+            removed_lines: vec![],
+            metadata: DiffFileMetadata::default(),
+        };
+        special
+            .metadata
+            .path_flags
+            .push(PathSafetyFlag::ControlCharacter);
+
+        let diff = DiffData {
+            files: vec![binary, submodule, special],
+            fingerprint: "fixture".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
+        };
+        let eval = evaluate_diff_correctness(&diff);
+        let ids: BTreeSet<String> = eval.findings.iter().map(|f| f.id.clone()).collect();
+
+        assert_eq!(eval.score.penalty, 100);
+        assert!(ids.contains("DIFF-001"));
+        assert!(ids.contains("DIFF-004"));
+        assert!(ids.contains("DIFF-005"));
+        assert!(eval
+            .findings
+            .iter()
+            .all(|finding| finding.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn symlink_containment_rejects_repo_escape() {
+        assert!(symlink_target_stays_in_repo("docs/link", b"guide.md"));
+        assert!(symlink_target_stays_in_repo(
+            "docs/nested/link",
+            b"../guide.md"
+        ));
+        assert!(!symlink_target_stays_in_repo("docs/link", b"../../secret"));
+        assert!(!symlink_target_stays_in_repo("docs/link", b"/etc/passwd"));
+    }
+
+    #[test]
+    fn case_insensitive_collision_marks_both_paths() {
+        let raw = b":100644 100644 abcdef1 abcdef2 A\0Src/Foo.rs\0:100644 100644 abcdef1 abcdef2 A\0src/foo.rs\0";
+        let mut parsed = parse_raw_status_z(raw);
+        mark_case_insensitive_collisions(&mut parsed);
+
+        assert!(parsed
+            .get("Src/Foo.rs")
+            .expect("upper path")
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::CaseInsensitiveCollision));
+        assert!(parsed
+            .get("src/foo.rs")
+            .expect("lower path")
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::CaseInsensitiveCollision));
+    }
+
+    #[test]
+    fn unicode_normalization_collision_marks_both_paths() {
+        let composed = "src/caf\u{00e9}.rs";
+        let decomposed = "src/cafe\u{0301}.rs";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b":100644 100644 abcdef1 abcdef2 A\0");
+        raw.extend_from_slice(composed.as_bytes());
+        raw.push(0);
+        raw.extend_from_slice(b":100644 100644 abcdef1 abcdef2 A\0");
+        raw.extend_from_slice(decomposed.as_bytes());
+        raw.push(0);
+
+        let mut parsed = parse_raw_status_z(raw.as_slice());
+        mark_case_insensitive_collisions(&mut parsed);
+
+        assert!(parsed
+            .get(composed)
+            .expect("composed path")
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::CaseInsensitiveCollision));
+        assert!(parsed
+            .get(decomposed)
+            .expect("decomposed path")
+            .metadata
+            .path_flags
+            .contains(&PathSafetyFlag::CaseInsensitiveCollision));
+    }
+
+    #[test]
     fn apply_patch_stats_counts_lines() {
         let mut files = parse_name_status("M\tsrc/lib.rs\n");
         let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n";
@@ -2412,8 +3699,12 @@ mod tests {
                 deleted: 2,
                 added_lines: vec!["new".to_string()],
                 removed_lines: vec!["old".to_string()],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2440,6 +3731,7 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["new".to_string()],
                     removed_lines: vec!["old".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "tests/lib_test.rs".to_string(),
@@ -2449,9 +3741,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["assert".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2476,8 +3772,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec![],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2504,6 +3804,7 @@ mod tests {
                     deleted: 3,
                     added_lines: vec!["new".to_string()],
                     removed_lines: vec!["old".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "tests/new_name.rs".to_string(),
@@ -2513,9 +3814,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec![],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2542,8 +3847,12 @@ mod tests {
                 deleted: 20,
                 added_lines: vec!["new".to_string()],
                 removed_lines: vec!["old".to_string()],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let eval =
@@ -2573,6 +3882,7 @@ mod tests {
                     deleted: 260,
                     added_lines,
                     removed_lines,
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "packages/b/tests/b_test.rs".to_string(),
@@ -2582,6 +3892,7 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["assert".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "packages/c/tests/c_test.rs".to_string(),
@@ -2591,9 +3902,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["assert".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let eval =
@@ -2619,6 +3934,7 @@ mod tests {
                     deleted: 10,
                     added_lines: vec!["line".to_string()],
                     removed_lines: vec!["line".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "packages/a/tests/service_test.rs".to_string(),
@@ -2628,9 +3944,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["assert".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let eval =
             evaluate_test_gap(&policy, &diff, &exclude_set, &generated_set).expect("evaluate");
@@ -2659,6 +3979,7 @@ mod tests {
                     deleted: 10,
                     added_lines: vec!["line".to_string()],
                     removed_lines: vec!["line".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "packages/b/src/service.rs".to_string(),
@@ -2668,6 +3989,7 @@ mod tests {
                     deleted: 10,
                     added_lines: vec!["line".to_string()],
                     removed_lines: vec!["line".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "tests/global_test.rs".to_string(),
@@ -2677,9 +3999,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["assert".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let eval =
@@ -2710,8 +4036,12 @@ mod tests {
                 deleted: 1,
                 added_lines: vec!["new".to_string()],
                 removed_lines: vec!["old".to_string()],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2740,8 +4070,12 @@ mod tests {
                 deleted: 2,
                 added_lines: vec!["new".to_string()],
                 removed_lines: vec!["old".to_string()],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2774,8 +4108,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec![],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2804,6 +4142,7 @@ mod tests {
             deleted: 1,
             added_lines: vec!["line".to_string()],
             removed_lines: vec!["line".to_string()],
+            metadata: DiffFileMetadata::default(),
         };
         assert!(
             !is_test_related_file(&policy, &contest, &test_set),
@@ -2818,6 +4157,7 @@ mod tests {
             deleted: 0,
             added_lines: vec!["line".to_string()],
             removed_lines: vec![],
+            metadata: DiffFileMetadata::default(),
         };
         assert!(is_test_related_file(&policy, &test_file, &test_set));
     }
@@ -2836,6 +4176,7 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["dep = \"1\"".to_string()],
                     removed_lines: vec!["dep = \"0\"".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "Cargo.lock".to_string(),
@@ -2845,9 +4186,13 @@ mod tests {
                     deleted: 10,
                     added_lines: vec!["pkg".to_string()],
                     removed_lines: vec!["old".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2873,6 +4218,7 @@ mod tests {
                     deleted: 0,
                     added_lines: vec![],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "Cargo.lock".to_string(),
@@ -2882,9 +4228,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec![],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let generated_set = compile_globs(&policy.generated_code.globs).expect("generated");
@@ -2912,6 +4262,7 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["dep = \"1\"".to_string()],
                     removed_lines: vec!["dep = \"0\"".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: ".github/workflows/ci.yml".to_string(),
@@ -2921,9 +4272,13 @@ mod tests {
                     deleted: 2,
                     added_lines: vec!["permissions: write-all".to_string()],
                     removed_lines: vec!["permissions: read-all".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -2954,6 +4309,7 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["[[package]]".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: ".github/workflows/release.yml".to_string(),
@@ -2963,9 +4319,13 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["run: cargo test".to_string()],
                     removed_lines: vec!["run: cargo check".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "enforce").expect("evaluate");
@@ -3004,6 +4364,7 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["implementation(\"org.example:lib:1.0\")".to_string()],
                     removed_lines: vec!["implementation(\"org.example:lib:0.9\")".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: ".github/workflows/release.yml".to_string(),
@@ -3013,9 +4374,13 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["permissions: write-all".to_string()],
                     removed_lines: vec!["permissions: read-all".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3043,6 +4408,7 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["gem \"rails\", \"7.2.0\"".to_string()],
                     removed_lines: vec!["gem \"rails\", \"7.1.5\"".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: "infra/main.tf".to_string(),
@@ -3052,9 +4418,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["resource \"aws_s3_bucket\" \"logs\" {}".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3083,6 +4453,7 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["[[package]]".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: ".github/workflows/release.yml".to_string(),
@@ -3092,9 +4463,13 @@ mod tests {
                     deleted: 1,
                     added_lines: vec!["permissions: write-all".to_string()],
                     removed_lines: vec!["permissions: read-all".to_string()],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3125,6 +4500,7 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["GEM".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
                 ChangedFile {
                     path: ".github/workflows/release.yml".to_string(),
@@ -3134,9 +4510,13 @@ mod tests {
                     deleted: 0,
                     added_lines: vec!["run: bundle install".to_string()],
                     removed_lines: vec![],
+                    metadata: DiffFileMetadata::default(),
                 },
             ],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3201,6 +4581,10 @@ mod tests {
             scope: "worktree".to_string(),
             changed_files: vec![PluginChangedFile {
                 path: "src/lib.rs".to_string(),
+                old_path: None,
+                path_id: "path_sha256:test".to_string(),
+                path_bytes_b64: "c3JjL2xpYi5ycw==".to_string(),
+                file_kind: "text".to_string(),
                 status: "modified".to_string(),
                 added: 2,
                 deleted: 1,
@@ -3317,9 +4701,13 @@ mod tests {
                     deleted: 0,
                     added_lines: Vec::new(),
                     removed_lines: Vec::new(),
+                    metadata: DiffFileMetadata::default(),
                 })
                 .collect(),
             fingerprint: "large-plugin-input".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
 
         let start = Instant::now();
@@ -3344,6 +4732,9 @@ mod tests {
         let diff = DiffData {
             files: vec![],
             fingerprint: "dummy".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let outcome = evaluate_plugins(&policy, &ctx, &diff, "warn").expect("evaluate");
         assert!(outcome.score.is_none());
@@ -3414,8 +4805,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec!["let x = 1;".to_string()],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "contract-fp".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let runner = Runner::new(policy);
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3495,8 +4890,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec!["let z = 1;".to_string()],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "interpreter-signature".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let runner = Runner::new(policy);
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3642,8 +5041,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec!["let q = 1;".to_string()],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "absolute-command-signature".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let runner = Runner::new(policy);
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3724,8 +5127,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec!["let w = 1;".to_string()],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "absolute-interpreter-signature".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let runner = Runner::new(policy);
         let report = runner.evaluate(&ctx, diff, "warn").expect("evaluate");
@@ -3878,8 +5285,12 @@ mod tests {
                 deleted: 0,
                 added_lines: vec!["let y = 1;".to_string()],
                 removed_lines: vec![],
+                metadata: DiffFileMetadata::default(),
             }],
             fingerprint: "bad-signature".to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
         };
         let runner = Runner::new(policy);
         let err = runner

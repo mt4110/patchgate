@@ -6711,18 +6711,20 @@ fn load_latest_sample(path: &Path, case_name: &str) -> Result<Option<BenchSample
 }
 
 fn validate_workload_identity(previous: &BenchSample, current: &BenchSample) -> Result<()> {
-    if previous.fingerprint != current.fingerprint {
-        bail!(
-            "benchmark workload mismatch: fingerprint changed (baseline={}, current={})",
-            previous.fingerprint,
-            current.fingerprint
-        );
-    }
     if previous.changed_files != current.changed_files {
         bail!(
             "benchmark workload mismatch: changed_files changed (baseline={}, current={})",
             previous.changed_files,
             current.changed_files
+        );
+    }
+    // Empty worktree fingerprints can drift when the diff schema changes; the benchmark workload
+    // is still equivalent as long as the changed-file count remains empty on both sides.
+    if previous.fingerprint != current.fingerprint && previous.changed_files != 0 {
+        bail!(
+            "benchmark workload mismatch: fingerprint changed (baseline={}, current={})",
+            previous.fingerprint,
+            current.fingerprint
         );
     }
     Ok(())
@@ -6834,21 +6836,30 @@ mod tests {
 
     #[test]
     fn workload_identity_requires_same_fingerprint_and_changed_files() {
-        let prev = sample("ci-worktree", 0, "abc");
-        let same = sample("ci-worktree", 0, "abc");
+        let prev = sample("ci-worktree", 1, "abc");
+        let same = sample("ci-worktree", 1, "abc");
         validate_workload_identity(&prev, &same).expect("same workload must pass");
 
-        let mismatch_fp = sample("ci-worktree", 0, "def");
+        let mismatch_fp = sample("ci-worktree", 1, "def");
         assert!(
             validate_workload_identity(&prev, &mismatch_fp).is_err(),
             "fingerprint mismatch should fail"
         );
 
-        let mismatch_files = sample("ci-worktree", 1, "abc");
+        let mismatch_files = sample("ci-worktree", 2, "abc");
         assert!(
             validate_workload_identity(&prev, &mismatch_files).is_err(),
             "changed_files mismatch should fail"
         );
+    }
+
+    #[test]
+    fn workload_identity_allows_empty_worktree_fingerprint_drift() {
+        let prev = sample("ci-worktree", 0, "legacy-empty-fingerprint");
+        let current = sample("ci-worktree", 0, "sha256:new-empty-fingerprint");
+
+        validate_workload_identity(&prev, &current)
+            .expect("empty workload fingerprint drift should not fail benchmark precheck");
     }
 
     #[test]

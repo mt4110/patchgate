@@ -91,7 +91,7 @@ fn runner_scan_path_returns_report_for_worktree_changes() -> TestResult<()> {
 
     assert_eq!(report.mode, "warn");
     assert_eq!(report.scope, "worktree");
-    assert_eq!(report.checks.len(), 3);
+    assert_eq!(report.checks.len(), 4);
     assert!(report.duration_ms > 0);
     assert!(!report.fingerprint.is_empty());
     Ok(())
