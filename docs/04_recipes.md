@@ -13,7 +13,7 @@ patchgate scan \
 ```
 
 `policy.toml` 側で `plugins.enabled = true` と `plugins.entries[]` を設定します。
-署名検証を有効にする場合は `[plugins.signature] required = true` と `entries[].signature_path` を設定します。
+署名検証を有効にする場合は `[plugins.signature] required = true` と `entries[].signature_path` を設定します。enforce mode で plugin を実行する場合は `entries[].manifest_path` と `plugins.lockfile_path`（default: `patchgate-plugin.lock`）も設定し、manifest 検証用に `public_key_env` または `trusted_key_envs` を用意します。
 鍵rotation中は `plugins.signature.trusted_key_envs` に新鍵envを追加し、失効時は `plugins.signature.revoked_key_sha256` に公開鍵fingerprintを追加します。
 
 ### Pluginテンプレートを生成

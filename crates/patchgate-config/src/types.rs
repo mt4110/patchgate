@@ -664,6 +664,8 @@ fn default_duration_increase_pct() -> u8 {
 pub struct PluginConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
+    #[serde(default = "default_plugin_lockfile_path")]
+    pub lockfile_path: String,
     #[serde(default)]
     pub entries: Vec<PluginEntry>,
     #[serde(default)]
@@ -676,11 +678,16 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             enabled: default_false(),
+            lockfile_path: default_plugin_lockfile_path(),
             entries: Vec::new(),
             sandbox: PluginSandboxConfig::default(),
             signature: PluginSignatureConfig::default(),
         }
     }
+}
+
+fn default_plugin_lockfile_path() -> String {
+    "patchgate-plugin.lock".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -695,6 +702,8 @@ pub struct PluginEntry {
     pub fail_mode: String, // "fail_open" | "fail_closed"
     #[serde(default)]
     pub signature_path: String,
+    #[serde(default)]
+    pub manifest_path: String,
 }
 
 fn default_plugin_timeout_ms() -> u64 {

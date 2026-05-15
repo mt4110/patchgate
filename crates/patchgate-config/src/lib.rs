@@ -691,14 +691,29 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty or trusted_key_envs must contain at least one env when `plugins.signature.required = true`",
         ));
     }
+    if cfg.plugins.enabled && cfg.plugins.lockfile_path.trim().is_empty() {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "plugins.lockfile_path",
+            "must be non-empty when plugins are enabled",
+        ));
+    }
     validate_plugin_signature_rotation(&cfg.plugins.signature)?;
 
+    let mut plugin_ids = BTreeSet::new();
     for (idx, plugin) in cfg.plugins.entries.iter().enumerate() {
         if plugin.id.trim().is_empty() {
             return Err(validation_error(
                 ValidationCategory::Dependency,
                 "plugins.entries",
                 format!("entry[{idx}] id must be non-empty"),
+            ));
+        }
+        if !plugin_ids.insert(plugin.id.trim().to_string()) {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.entries",
+                format!("entry[{idx}] id duplicates another plugin entry"),
             ));
         }
         if plugin.command.trim().is_empty() {
@@ -723,12 +738,26 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             100,
             600_000,
         )?;
-        if cfg.plugins.signature.required && plugin.signature_path.trim().is_empty() {
+        if cfg.plugins.signature.required
+            && plugin.signature_path.trim().is_empty()
+            && plugin.manifest_path.trim().is_empty()
+        {
             return Err(validation_error(
                 ValidationCategory::Dependency,
                 "plugins.entries",
                 format!(
-                    "entry[{idx}] signature_path must be non-empty when plugins.signature.required=true"
+                    "entry[{idx}] signature_path or manifest_path must be non-empty when plugins.signature.required=true"
+                ),
+            ));
+        }
+        if !plugin.manifest_path.trim().is_empty()
+            && !plugin_signature_has_any_key_env(&cfg.plugins.signature)
+        {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.signature",
+                format!(
+                    "entry[{idx}] manifest_path requires public_key_env or trusted_key_envs for manifest verification"
                 ),
             ));
         }
@@ -1617,6 +1646,52 @@ public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
             ConfigError::Validation { field, message, .. } => {
                 assert_eq!(field, "plugins.entries");
                 assert!(message.contains("signature_path"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_allows_plugin_manifest_path_when_signature_required() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins]
+enabled = true
+entries = [{ id = "sample", command = "plugin.sh", args = [], timeout_ms = 1000, fail_mode = "fail_open", manifest_path = "patchgate-plugin.toml" }]
+[plugins.signature]
+required = true
+public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
+"#,
+        );
+        let loaded = load_from_typed(&path).expect("manifest_path satisfies signature material");
+        assert_eq!(
+            loaded.plugins.entries[0].manifest_path,
+            "patchgate-plugin.toml"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_manifest_path_without_signature_key_env() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins]
+enabled = true
+entries = [{ id = "sample", command = "plugin.sh", args = [], timeout_ms = 1000, fail_mode = "fail_open", manifest_path = "patchgate-plugin.toml" }]
+[plugins.signature]
+required = false
+public_key_env = "   "
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("manifest_path requires verifying key env");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, message, .. } => {
+                assert_eq!(field, "plugins.signature");
+                assert!(message.contains("manifest_path"));
             }
             other => panic!("unexpected error: {other}"),
         }

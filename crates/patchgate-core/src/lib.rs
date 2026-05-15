@@ -7,9 +7,10 @@ pub use model::{
     EvidenceLocation, EvidenceProducer, EvidenceProducerKind, EvidenceRule, Finding,
     GateDecisionResult, HardGateResult, PluginChangedFile, PluginFinding, PluginInput,
     PluginInputV2Shadow, PluginInvocation, PluginInvocationStatus, PluginOutput,
-    PluginShadowContract, PluginShadowMetadata, Report, ReportMeta, ReviewPriority,
-    RuntimeDecisionError, RuntimeDecisionStatus, RuntimeResult, ScoreResult, Severity,
-    SupplyChainSignal, WaiverResult, DECISION_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION,
+    PluginSandboxCapabilityArtifact, PluginShadowContract, PluginShadowMetadata, PluginTrustReport,
+    Report, ReportMeta, ReviewPriority, RuntimeDecisionError, RuntimeDecisionStatus, RuntimeResult,
+    ScoreResult, Severity, SupplyChainSignal, WaiverResult, DECISION_SCHEMA_VERSION,
+    EVIDENCE_SCHEMA_VERSION,
 };
 pub use runner::{
     ChangeStatus, ChangedFile, Context, DiffData, DiffFileMetadata, DiffOptions, FileKind,

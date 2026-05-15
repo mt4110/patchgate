@@ -23,6 +23,9 @@ Templates:
 - stderr: 任意診断
 - timeout: `plugins.entries[].timeout_ms`
 - sandbox: `plugins.sandbox.*`
+- enforce trust: `plugins.entries[].manifest_path` + `plugins.lockfile_path`
+
+`enforce` mode では signed manifest と plugin lockfile がない plugin は実行前に拒否されます。local 開発中は `warn` mode で template を動かし、配布前に manifest の artifact digest と signing key fingerprint を lockfile に固定してください。
 
 ## V2 shadow preview
 

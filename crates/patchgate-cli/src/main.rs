@@ -1252,7 +1252,7 @@ struct HistoryTrendRow {
 }
 
 type ScanResult<T> = std::result::Result<T, ScanError>;
-const CACHE_KEY_SCHEMA_VERSION: &str = "v1";
+const CACHE_KEY_SCHEMA_VERSION: &str = "v2";
 const DEFAULT_GITHUB_CHECK_NAME: &str = "patchgate";
 const POLICY_FILE_CANDIDATES: [&str; 4] =
     ["policy.toml", "patchgate.toml", "veto.toml", "veri.toml"];
@@ -5428,6 +5428,13 @@ fn execute_scan(
                     err.context("failed to hash effective config"),
                 )
             })?;
+        let plugin_trust_hash =
+            plugin_cache_trust_material_hash(repo_root, &cfg).map_err(|err| {
+                ScanError::new(
+                    ScanErrorKind::Runtime,
+                    err.context("failed to hash plugin trust material for cache key"),
+                )
+            })?;
         let mut cache_conn = match open_cache_connection(repo_root, &cfg.cache.db_path) {
             Ok(conn) => Some(conn),
             Err(err) => {
@@ -5441,6 +5448,7 @@ fn execute_scan(
                 conn,
                 &diff_fingerprint,
                 &policy_hash,
+                &plugin_trust_hash,
                 &opts.mode,
                 opts.scope.as_str(),
             );
@@ -5458,7 +5466,9 @@ fn execute_scan(
                     profile.evaluate_ms = evaluated.duration_ms;
                     if let Some(conn) = cache_conn.as_ref() {
                         let cache_write_start = Instant::now();
-                        if let Err(err) = store_cache_to_conn(conn, &evaluated, &policy_hash) {
+                        if let Err(err) =
+                            store_cache_to_conn(conn, &evaluated, &policy_hash, &plugin_trust_hash)
+                        {
                             handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
                         }
                         profile.cache_write_ms = cache_write_start.elapsed().as_millis();
@@ -5472,7 +5482,9 @@ fn execute_scan(
                     profile.evaluate_ms = evaluated.duration_ms;
                     if let Some(conn) = cache_conn.as_ref() {
                         let cache_write_start = Instant::now();
-                        if let Err(err) = store_cache_to_conn(conn, &evaluated, &policy_hash) {
+                        if let Err(err) =
+                            store_cache_to_conn(conn, &evaluated, &policy_hash, &plugin_trust_hash)
+                        {
                             handle_cache_fault(repo_root, &cfg.cache.db_path, "write", &err);
                         }
                         profile.cache_write_ms = cache_write_start.elapsed().as_millis();
@@ -8020,13 +8032,135 @@ fn attach_policy_authority(
     report.should_fail = true;
 }
 
-fn build_cache_key(diff_fingerprint: &str, policy_hash: &str, mode: &str, scope: &str) -> String {
+fn plugin_cache_trust_material_hash(repo_root: &Path, cfg: &Config) -> Result<String> {
+    #[derive(Serialize)]
+    struct PluginCacheTrustMaterial<'a> {
+        enabled: bool,
+        lockfile_path: &'a str,
+        lockfile_digest: String,
+        sandbox_profile: &'a str,
+        allow_network: bool,
+        env_allowlist: &'a [String],
+        max_stdout_kib: u32,
+        entries: Vec<PluginCacheEntryMaterial<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct PluginCacheEntryMaterial<'a> {
+        id: &'a str,
+        command: &'a str,
+        args: &'a [String],
+        timeout_ms: u64,
+        fail_mode: &'a str,
+        signature_path: &'a str,
+        signature_digest: String,
+        manifest_path: &'a str,
+        manifest_digest: String,
+        command_digest: String,
+        arg_file_digests: Vec<(String, String)>,
+    }
+
+    let lockfile_digest = if cfg.plugins.enabled {
+        cache_file_digest(repo_root, cfg.plugins.lockfile_path.as_str())?
+    } else {
+        "disabled".to_string()
+    };
+    let entries = if cfg.plugins.enabled {
+        cfg.plugins
+            .entries
+            .iter()
+            .map(|plugin| {
+                let mut arg_file_digests = Vec::new();
+                for arg in &plugin.args {
+                    if let Some(digest) = cache_existing_file_digest(repo_root, arg)? {
+                        arg_file_digests.push((arg.clone(), digest));
+                    }
+                }
+                Ok(PluginCacheEntryMaterial {
+                    id: plugin.id.as_str(),
+                    command: plugin.command.as_str(),
+                    args: plugin.args.as_slice(),
+                    timeout_ms: plugin.timeout_ms,
+                    fail_mode: plugin.fail_mode.as_str(),
+                    signature_path: plugin.signature_path.as_str(),
+                    signature_digest: cache_file_digest(repo_root, plugin.signature_path.as_str())?,
+                    manifest_path: plugin.manifest_path.as_str(),
+                    manifest_digest: cache_file_digest(repo_root, plugin.manifest_path.as_str())?,
+                    command_digest: cache_file_digest(repo_root, plugin.command.as_str())?,
+                    arg_file_digests,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    let material = PluginCacheTrustMaterial {
+        enabled: cfg.plugins.enabled,
+        lockfile_path: cfg.plugins.lockfile_path.as_str(),
+        lockfile_digest,
+        sandbox_profile: cfg.plugins.sandbox.profile.as_str(),
+        allow_network: cfg.plugins.sandbox.allow_network,
+        env_allowlist: cfg.plugins.sandbox.env_allowlist.as_slice(),
+        max_stdout_kib: cfg.plugins.sandbox.max_stdout_kib,
+        entries,
+    };
+    let encoded =
+        serde_json::to_vec(&material).context("failed to encode plugin cache trust material")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn cache_file_digest(repo_root: &Path, raw_path: &str) -> Result<String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Ok("empty".to_string());
+    }
+    let path = resolve_cache_material_path(repo_root, trimmed);
+    if path.is_dir() {
+        return Ok(format!("directory:{trimmed}"));
+    }
+    match fs::read(path.as_path()) {
+        Ok(bytes) => Ok(format!("sha256:{:x}", Sha256::digest(bytes))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(format!("missing:{trimmed}")),
+        Err(err) => Ok(format!("unreadable:{:?}:{trimmed}", err.kind())),
+    }
+}
+
+fn cache_existing_file_digest(repo_root: &Path, raw_path: &str) -> Result<Option<String>> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = resolve_cache_material_path(repo_root, trimmed);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    cache_file_digest(repo_root, trimmed).map(Some)
+}
+
+fn resolve_cache_material_path(repo_root: &Path, raw_path: &str) -> PathBuf {
+    let candidate = PathBuf::from(raw_path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        repo_root.join(candidate)
+    }
+}
+
+fn build_cache_key(
+    diff_fingerprint: &str,
+    policy_hash: &str,
+    plugin_trust_hash: &str,
+    mode: &str,
+    scope: &str,
+) -> String {
     let material = format!(
-        "schema={}|cli={}|diff={}|policy={}|mode={}|scope={}",
+        "schema={}|cli={}|diff={}|policy={}|plugin_trust={}|mode={}|scope={}",
         CACHE_KEY_SCHEMA_VERSION,
         env!("CARGO_PKG_VERSION"),
         diff_fingerprint,
         policy_hash,
+        plugin_trust_hash,
         mode,
         scope
     );
@@ -8047,10 +8181,17 @@ fn load_cache_from_conn(
     conn: &Connection,
     diff_fingerprint: &str,
     policy_hash: &str,
+    plugin_trust_hash: &str,
     mode: &str,
     scope: &str,
 ) -> Result<Option<Report>> {
-    let cache_key = build_cache_key(diff_fingerprint, policy_hash, mode, scope);
+    let cache_key = build_cache_key(
+        diff_fingerprint,
+        policy_hash,
+        plugin_trust_hash,
+        mode,
+        scope,
+    );
     let mut stmt = conn.prepare(
         "SELECT report_json FROM runs
          WHERE fingerprint = ?1
@@ -8067,10 +8208,16 @@ fn load_cache_from_conn(
     }
 }
 
-fn store_cache_to_conn(conn: &Connection, report: &Report, policy_hash: &str) -> Result<()> {
+fn store_cache_to_conn(
+    conn: &Connection,
+    report: &Report,
+    policy_hash: &str,
+    plugin_trust_hash: &str,
+) -> Result<()> {
     let cache_key = build_cache_key(
         &report.fingerprint,
         policy_hash,
+        plugin_trust_hash,
         &report.mode,
         &report.scope,
     );
@@ -8697,14 +8844,15 @@ mod tests {
         detect_sandbox_capabilities, effective_policy_hash, exception_expired,
         exception_governance_artifact_summary, gate_exit_code, is_likely_cache_corruption,
         load_dead_letter_jsonl, load_policy_config, notification_payload, parse_mode,
-        parse_policy_preset, parse_scope, policy_authority_relative_path,
-        pr_head_sha_from_event_payload, pr_number_from_event_payload, pr_number_from_ref,
-        publish_generic_ci_payload, recover_cache_db, redacted_endpoint,
-        registry_provenance_artifact_summary, render_contract_diff_report_json,
-        render_contract_diff_report_text, render_github_comment, resolve_audit_actor,
-        resolve_ci_provider, resolve_ci_provider_for_publish, resolve_comment_suppression_reason,
-        resolve_config_path, resolve_policy_path, resolve_publish_request, resolve_scan_options,
-        resolve_telemetry_repo, resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
+        parse_policy_preset, parse_scope, plugin_cache_trust_material_hash,
+        policy_authority_relative_path, pr_head_sha_from_event_payload,
+        pr_number_from_event_payload, pr_number_from_ref, publish_generic_ci_payload,
+        recover_cache_db, redacted_endpoint, registry_provenance_artifact_summary,
+        render_contract_diff_report_json, render_contract_diff_report_text, render_github_comment,
+        resolve_audit_actor, resolve_ci_provider, resolve_ci_provider_for_publish,
+        resolve_comment_suppression_reason, resolve_config_path, resolve_policy_path,
+        resolve_publish_request, resolve_scan_options, resolve_telemetry_repo,
+        resolve_webhook_signature, run_dead_letter_replay, run_plugin_init,
         run_policy_diff_contract, run_policy_lint, run_policy_verify_v1, run_policy_verify_v2,
         sign_webhook_payload, sorted_findings_for_comment, write_text_atomic, CiProvider, Cli,
         DeadLetterWriteOptions, DeliveryBridgeContext, DeliveryReplayArgs, FailureCode,
@@ -9816,27 +9964,138 @@ mod tests {
 
     #[test]
     fn cache_key_is_deterministic_for_same_inputs() {
-        let key1 = build_cache_key("diff-a", "policy-a", "warn", "staged");
-        let key2 = build_cache_key("diff-a", "policy-a", "warn", "staged");
+        let key1 = build_cache_key("diff-a", "policy-a", "plugin-a", "warn", "staged");
+        let key2 = build_cache_key("diff-a", "policy-a", "plugin-a", "warn", "staged");
         assert_eq!(key1, key2);
     }
 
     #[test]
     fn cache_key_changes_when_any_dimension_changes() {
-        let base = build_cache_key("diff-a", "policy-a", "warn", "staged");
+        let base = build_cache_key("diff-a", "policy-a", "plugin-a", "warn", "staged");
         assert_ne!(
             base,
-            build_cache_key("diff-b", "policy-a", "warn", "staged")
+            build_cache_key("diff-b", "policy-a", "plugin-a", "warn", "staged")
         );
         assert_ne!(
             base,
-            build_cache_key("diff-a", "policy-b", "warn", "staged")
+            build_cache_key("diff-a", "policy-b", "plugin-a", "warn", "staged")
         );
         assert_ne!(
             base,
-            build_cache_key("diff-a", "policy-a", "enforce", "staged")
+            build_cache_key("diff-a", "policy-a", "plugin-b", "warn", "staged")
         );
-        assert_ne!(base, build_cache_key("diff-a", "policy-a", "warn", "repo"));
+        assert_ne!(
+            base,
+            build_cache_key("diff-a", "policy-a", "plugin-a", "enforce", "staged")
+        );
+        assert_ne!(
+            base,
+            build_cache_key("diff-a", "policy-a", "plugin-a", "warn", "repo")
+        );
+    }
+
+    #[test]
+    fn plugin_cache_trust_material_changes_when_manifest_changes() {
+        let repo_root = temp_path("patchgate-cli-plugin-cache");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let manifest_path = repo_root.join("plugin.toml");
+        let lockfile_path = repo_root.join("patchgate-plugin.lock");
+        let plugin_path = repo_root.join("plugin.sh");
+        fs::write(&manifest_path, "version = 1\n").expect("write manifest");
+        fs::write(&lockfile_path, "{}\n").expect("write lockfile");
+        fs::write(&plugin_path, "echo ok\n").expect("write plugin");
+
+        let mut cfg = Config::default();
+        cfg.plugins.enabled = true;
+        cfg.plugins.lockfile_path = lockfile_path.to_string_lossy().to_string();
+        cfg.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+        });
+
+        let before =
+            plugin_cache_trust_material_hash(&repo_root, &cfg).expect("initial trust hash");
+        fs::write(&manifest_path, "version = 2\n").expect("rewrite manifest");
+        let after = plugin_cache_trust_material_hash(&repo_root, &cfg).expect("updated trust hash");
+
+        assert_ne!(before, after);
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_cache_trust_material_ignores_entries_when_plugins_disabled() {
+        let repo_root = temp_path("patchgate-cli-plugin-cache-disabled");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut first = Config::default();
+        first.plugins.enabled = false;
+        first.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: "missing-a.sh".to_string(),
+            args: vec!["--flag".to_string()],
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: "missing-a.sig".to_string(),
+            manifest_path: "missing-a.toml".to_string(),
+        });
+        let mut second = first.clone();
+        second.plugins.entries[0].command = "missing-b.sh".to_string();
+        second.plugins.entries[0].signature_path = "missing-b.sig".to_string();
+        second.plugins.entries[0].manifest_path = "missing-b.toml".to_string();
+
+        let first_hash =
+            plugin_cache_trust_material_hash(&repo_root, &first).expect("first trust hash");
+        let second_hash =
+            plugin_cache_trust_material_hash(&repo_root, &second).expect("second trust hash");
+
+        assert_eq!(first_hash, second_hash);
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_cache_trust_material_tolerates_unreadable_files() {
+        use std::os::unix::net::UnixListener;
+
+        let repo_root = temp_path("patchgate-cli-plugin-cache-unreadable");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        let manifest_path = repo_root.join("plugin.toml");
+        let lockfile_path = repo_root.join("patchgate-plugin.lock");
+        let plugin_socket_path = PathBuf::from(format!(
+            "/tmp/pg-{}-{}.sock",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&manifest_path, "version = 1\n").expect("write manifest");
+        fs::write(&lockfile_path, "{}\n").expect("write lockfile");
+        let _ = fs::remove_file(&plugin_socket_path);
+        let listener = UnixListener::bind(&plugin_socket_path).expect("bind plugin socket");
+
+        let mut cfg = Config::default();
+        cfg.plugins.enabled = true;
+        cfg.plugins.lockfile_path = lockfile_path.to_string_lossy().to_string();
+        cfg.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_socket_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+        });
+
+        let hash = plugin_cache_trust_material_hash(&repo_root, &cfg)
+            .expect("trust hash tolerates unreadable plugin cache material");
+
+        assert_eq!(hash.len(), 64);
+        drop(listener);
+        let _ = fs::remove_file(&plugin_socket_path);
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]
