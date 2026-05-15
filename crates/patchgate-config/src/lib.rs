@@ -691,14 +691,29 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             "must be non-empty or trusted_key_envs must contain at least one env when `plugins.signature.required = true`",
         ));
     }
+    if cfg.plugins.enabled && cfg.plugins.lockfile_path.trim().is_empty() {
+        return Err(validation_error(
+            ValidationCategory::Dependency,
+            "plugins.lockfile_path",
+            "must be non-empty when plugins are enabled",
+        ));
+    }
     validate_plugin_signature_rotation(&cfg.plugins.signature)?;
 
+    let mut plugin_ids = BTreeSet::new();
     for (idx, plugin) in cfg.plugins.entries.iter().enumerate() {
         if plugin.id.trim().is_empty() {
             return Err(validation_error(
                 ValidationCategory::Dependency,
                 "plugins.entries",
                 format!("entry[{idx}] id must be non-empty"),
+            ));
+        }
+        if !plugin_ids.insert(plugin.id.trim().to_string()) {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.entries",
+                format!("entry[{idx}] id duplicates another plugin entry"),
             ));
         }
         if plugin.command.trim().is_empty() {
@@ -723,12 +738,15 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
             100,
             600_000,
         )?;
-        if cfg.plugins.signature.required && plugin.signature_path.trim().is_empty() {
+        if cfg.plugins.signature.required
+            && plugin.signature_path.trim().is_empty()
+            && plugin.manifest_path.trim().is_empty()
+        {
             return Err(validation_error(
                 ValidationCategory::Dependency,
                 "plugins.entries",
                 format!(
-                    "entry[{idx}] signature_path must be non-empty when plugins.signature.required=true"
+                    "entry[{idx}] signature_path or manifest_path must be non-empty when plugins.signature.required=true"
                 ),
             ));
         }
@@ -1620,6 +1638,27 @@ public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
             }
             other => panic!("unexpected error: {other}"),
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_allows_plugin_manifest_path_when_signature_required() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins]
+enabled = true
+entries = [{ id = "sample", command = "plugin.sh", args = [], timeout_ms = 1000, fail_mode = "fail_open", manifest_path = "patchgate-plugin.toml" }]
+[plugins.signature]
+required = true
+public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
+"#,
+        );
+        let loaded = load_from_typed(&path).expect("manifest_path satisfies signature material");
+        assert_eq!(
+            loaded.plugins.entries[0].manifest_path,
+            "patchgate-plugin.toml"
+        );
         let _ = fs::remove_file(path);
     }
 

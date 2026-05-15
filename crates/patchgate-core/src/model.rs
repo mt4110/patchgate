@@ -405,12 +405,40 @@ pub struct PluginInvocation {
     pub duration_ms: u128,
     pub sandbox_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<PluginTrustReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_contract: Option<PluginShadowContract>,
     #[serde(default)]
     pub findings: Vec<PluginFinding>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginTrustReport {
+    pub schema_version: String,
+    pub manifest_path: String,
+    pub manifest_digest: String,
+    pub artifact_digest: String,
+    pub lockfile_path: String,
+    pub lockfile_digest: String,
+    pub signing_key_id: String,
+    pub signing_key_fingerprint: String,
+    pub permission_set_digest: String,
+    pub sandbox_capability: PluginSandboxCapabilityArtifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSandboxCapabilityArtifact {
+    pub schema_version: String,
+    pub profile: String,
+    pub network: bool,
+    pub env: Vec<String>,
+    pub read_paths: Vec<String>,
+    pub write_paths: Vec<String>,
+    pub stdout_limit_kib: u32,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

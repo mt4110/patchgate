@@ -42,7 +42,9 @@
 
 - `[plugins]`
   - `enabled`
-  - `entries = [{ id, command, args, timeout_ms, fail_mode }]`
+  - `lockfile_path`（default: `patchgate-plugin.lock`。enforce mode で manifest-based plugin を実行する場合は必須）
+  - `entries = [{ id, command, args, timeout_ms, fail_mode, signature_path, manifest_path }]`
+  - `manifest_path` を指定した plugin は signed manifest を検証します。enforce mode では `manifest_path` と lockfile がない plugin 実行を拒否します。
 - `[plugins.sandbox]`
   - `profile = "none" | "restricted" | "isolated"`（`isolated` は Linux + `bwrap` 前提）
   - `allow_network`

@@ -181,6 +181,7 @@ entries = []
 
 [plugins]
 enabled = false
+lockfile_path = "patchgate-plugin.lock"
 entries = []
 
 [plugins.sandbox]

@@ -25,10 +25,10 @@ Only stricter changes are accepted:
 - reduce `scope.max_changed_files`
 - change `scope.on_exceed` from `fail_open` to `fail_closed`
 - increase penalties or max penalties
-- add signed `fail_closed` plugins
+- add signed `fail_closed` plugins with `manifest_path` and lockfile pinning
 - remove excludes or generated-code globs
 
-Rejected changes include lowering thresholds, disabling checks, widening excludes, changing trusted keys, adding waivers, and making plugin execution fail open.
+Rejected changes include lowering thresholds, disabling checks, widening excludes, changing trusted keys, adding waivers, removing plugin manifest/lockfile trust material, and making plugin execution fail open.
 
 Every JSON report includes:
 

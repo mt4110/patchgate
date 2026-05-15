@@ -15,19 +15,26 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use patchgate_config::Config;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::model::{
     CheckId, CheckScore, Finding, Location, PluginChangedFile, PluginFinding, PluginInput,
     PluginInputV2Shadow, PluginInvocation, PluginInvocationStatus, PluginOutput,
-    PluginShadowContract, Report, ReportMeta, Severity, SupplyChainSignal,
+    PluginSandboxCapabilityArtifact, PluginShadowContract, PluginTrustReport, Report, ReportMeta,
+    Severity, SupplyChainSignal,
 };
 
 const MAX_STORED_LINE_SAMPLES: usize = 32;
 const MAX_STORED_LINE_CHARS: usize = 240;
 const PLUGIN_SHADOW_BRIDGE_MODE: &str = "shadow";
 const DIFF_SCHEMA_VERSION: &str = "patchgate.diff.v1";
+const PLUGIN_MANIFEST_SCHEMA_VERSION: &str = "patchgate.plugin.manifest.v1";
+const PLUGIN_LOCK_SCHEMA_VERSION: &str = "patchgate.plugin.lock.v1";
+const PLUGIN_TRUST_SCHEMA_VERSION: &str = "patchgate.plugin.trust.v1";
+const PLUGIN_SANDBOX_CAPABILITY_SCHEMA_VERSION: &str = "patchgate.plugin.sandbox_capability.v1";
+const PLUGIN_OUTPUT_SCHEMA_VERSION: &str = "patchgate.evidence.v1";
 
 #[derive(Debug, Clone, Copy)]
 pub enum ScopeMode {
@@ -544,6 +551,93 @@ struct PluginEvaluationOutcome {
     total_duration_ms: Option<u128>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifest {
+    schema_version: String,
+    id: String,
+    version: String,
+    entrypoint: Vec<String>,
+    runtime: String,
+    permissions: PluginManifestPermissions,
+    artifacts: PluginManifestArtifacts,
+    producer: PluginManifestProducer,
+    signature: PluginManifestSignature,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifestPermissions {
+    #[serde(default)]
+    network: bool,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default = "default_plugin_manifest_read_paths")]
+    read_paths: Vec<String>,
+    #[serde(default)]
+    write_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifestArtifacts {
+    main: String,
+    lockfile: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifestProducer {
+    kind: String,
+    emits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifestSignature {
+    key_id: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginManifestSigningPayload<'a> {
+    schema_version: &'a str,
+    id: &'a str,
+    version: &'a str,
+    entrypoint: &'a [String],
+    runtime: &'a str,
+    permissions: &'a PluginManifestPermissions,
+    artifacts: &'a PluginManifestArtifacts,
+    producer: &'a PluginManifestProducer,
+    signature_key_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginLockfile {
+    #[serde(default = "default_plugin_lock_schema_version")]
+    schema_version: String,
+    plugins: Vec<PluginLockfileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginLockfileEntry {
+    id: String,
+    version: String,
+    manifest_digest: String,
+    source: String,
+    signing_key_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedPluginTrust {
+    report: PluginTrustReport,
+    network_allowed: bool,
+    env_allowlist: Vec<String>,
+}
+
+fn default_plugin_manifest_read_paths() -> Vec<String> {
+    vec![".".to_string()]
+}
+
+fn default_plugin_lock_schema_version() -> String {
+    PLUGIN_LOCK_SCHEMA_VERSION.to_string()
+}
+
 fn evaluate_plugins(
     policy: &Config,
     ctx: &Context,
@@ -567,6 +661,16 @@ fn evaluate_plugins(
             Ok(invocation) => {
                 if invocation.status != PluginInvocationStatus::Pass {
                     triggered = true;
+                }
+                if mode == "enforce" && plugin_invocation_is_trust_failure(&invocation) {
+                    let message = invocation
+                        .error
+                        .as_deref()
+                        .unwrap_or("plugin trust verification failed");
+                    return Err(anyhow::anyhow!(
+                        "plugin `{}` failed enforce-mode trust policy: {message}",
+                        plugin.id
+                    ));
                 }
                 if plugin.fail_mode == "fail_closed"
                     && plugin_invocation_is_execution_failure(&invocation.status)
@@ -615,6 +719,7 @@ fn evaluate_plugins(
                     status: PluginInvocationStatus::Error,
                     duration_ms: start.elapsed().as_millis(),
                     sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                    trust: None,
                     shadow_contract: plugin_shadow_contract(policy, ctx, diff, mode, plugin)?,
                     findings: Vec::new(),
                     diagnostics: vec!["execution failed".to_string()],
@@ -647,6 +752,13 @@ fn plugin_invocation_is_execution_failure(status: &PluginInvocationStatus) -> bo
     )
 }
 
+fn plugin_invocation_is_trust_failure(invocation: &PluginInvocation) -> bool {
+    invocation
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("plugin trust verification failed"))
+}
+
 fn execute_plugin(
     policy: &Config,
     ctx: &Context,
@@ -657,18 +769,49 @@ fn execute_plugin(
     let start = Instant::now();
     let input = build_plugin_input(ctx, diff, mode, plugin);
     let shadow_contract = plugin_shadow_contract_from_input(policy, &input)?;
-    if let Err(err) = verify_plugin_signature(policy, ctx, plugin) {
-        return Ok(PluginInvocation {
-            plugin_id: plugin.id.clone(),
-            status: PluginInvocationStatus::Error,
-            duration_ms: start.elapsed().as_millis(),
-            sandbox_profile: policy.plugins.sandbox.profile.clone(),
-            shadow_contract,
-            findings: Vec::new(),
-            diagnostics: vec![format!("signature verification failed: {err:#}")],
-            error: Some(format!("signature verification failed: {err:#}")),
-        });
+    let trust = match verify_plugin_trust_material(policy, ctx, mode, plugin) {
+        Ok(trust) => trust,
+        Err(err) => {
+            let message = format!("plugin trust verification failed: {err:#}");
+            return Ok(PluginInvocation {
+                plugin_id: plugin.id.clone(),
+                status: PluginInvocationStatus::Error,
+                duration_ms: start.elapsed().as_millis(),
+                sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                trust: None,
+                shadow_contract,
+                findings: Vec::new(),
+                diagnostics: vec![message.clone()],
+                error: Some(message),
+            });
+        }
+    };
+    if trust.is_none() {
+        if let Err(err) = verify_plugin_signature(policy, ctx, plugin) {
+            let message = format!("signature verification failed: {err:#}");
+            return Ok(PluginInvocation {
+                plugin_id: plugin.id.clone(),
+                status: PluginInvocationStatus::Error,
+                duration_ms: start.elapsed().as_millis(),
+                sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                trust: None,
+                shadow_contract,
+                findings: Vec::new(),
+                diagnostics: vec![message.clone()],
+                error: Some(message),
+            });
+        }
     }
+
+    let network_allowed = trust
+        .as_ref()
+        .map(|trust| trust.network_allowed)
+        .unwrap_or(policy.plugins.sandbox.allow_network);
+    let env_allowlist = trust
+        .as_ref()
+        .map(|trust| trust.env_allowlist.clone())
+        .unwrap_or_else(|| policy.plugins.sandbox.env_allowlist.clone());
+    let trust_report = trust.as_ref().map(|trust| trust.report.clone());
 
     let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
     let max_output_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
@@ -676,7 +819,7 @@ fn execute_plugin(
     let timeout = Duration::from_millis(plugin.timeout_ms);
 
     let mut command = match sandbox_profile {
-        "isolated" => match build_isolated_plugin_command(policy, ctx, plugin) {
+        "isolated" => match build_isolated_plugin_command(policy, ctx, plugin, network_allowed) {
             Ok(command) => command,
             Err(message) => {
                 return Ok(PluginInvocation {
@@ -684,6 +827,7 @@ fn execute_plugin(
                     status: PluginInvocationStatus::Error,
                     duration_ms: start.elapsed().as_millis(),
                     sandbox_profile: sandbox_profile.to_string(),
+                    trust: trust_report,
                     shadow_contract,
                     findings: Vec::new(),
                     diagnostics: vec![message.clone()],
@@ -706,7 +850,7 @@ fn execute_plugin(
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
-        for key in &policy.plugins.sandbox.env_allowlist {
+        for key in &env_allowlist {
             if let Ok(value) = std::env::var(key) {
                 command.env(key, value);
             }
@@ -716,11 +860,7 @@ fn execute_plugin(
     command.env("PATCHGATE_SANDBOX_PROFILE", sandbox_profile);
     command.env(
         "PATCHGATE_SANDBOX_NETWORK",
-        if policy.plugins.sandbox.allow_network {
-            "allow"
-        } else {
-            "deny"
-        },
+        if network_allowed { "allow" } else { "deny" },
     );
 
     let mut child = command.spawn().with_context(|| {
@@ -777,6 +917,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::TimedOut,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            trust: trust_report,
             shadow_contract,
             findings: Vec::new(),
             diagnostics: vec![format!("timeout after {}ms", plugin.timeout_ms)],
@@ -809,6 +950,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::Error,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            trust: trust_report,
             shadow_contract,
             findings: Vec::new(),
             diagnostics: vec![message.clone()],
@@ -833,6 +975,7 @@ fn execute_plugin(
             status: PluginInvocationStatus::Error,
             duration_ms,
             sandbox_profile: sandbox_profile.to_string(),
+            trust: trust_report,
             shadow_contract,
             findings: Vec::new(),
             diagnostics: vec!["plugin process returned non-zero exit".to_string()],
@@ -865,6 +1008,7 @@ fn execute_plugin(
         status,
         duration_ms,
         sandbox_profile: sandbox_profile.to_string(),
+        trust: trust_report,
         shadow_contract,
         findings: plugin_output.findings,
         diagnostics,
@@ -933,6 +1077,343 @@ fn plugin_shadow_contract_from_input(
     }))
 }
 
+fn verify_plugin_trust_material(
+    policy: &Config,
+    ctx: &Context,
+    mode: &str,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<Option<VerifiedPluginTrust>> {
+    if plugin.manifest_path.trim().is_empty() {
+        if mode == "enforce" {
+            anyhow::bail!(
+                "enforce mode requires plugins.entries[].manifest_path for plugin `{}`",
+                plugin.id
+            );
+        }
+        return Ok(None);
+    }
+
+    let manifest_path = resolve_repo_path(ctx, plugin.manifest_path.as_str());
+    let manifest_bytes = fs::read(&manifest_path)
+        .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
+    let manifest_text = std::str::from_utf8(manifest_bytes.as_slice())
+        .context("plugin manifest must be UTF-8 TOML")?;
+    let manifest: PluginManifest =
+        toml::from_str(manifest_text).context("failed to decode plugin manifest schema")?;
+    validate_plugin_manifest_schema(&manifest, plugin)?;
+
+    let artifact_path = resolve_signed_plugin_artifact_path(ctx, plugin);
+    let artifact_digest = sha256_file_digest(artifact_path.as_path())
+        .with_context(|| format!("failed to hash plugin artifact {}", artifact_path.display()))?;
+    if manifest.artifacts.main.trim() != artifact_digest {
+        anyhow::bail!(
+            "plugin manifest artifact digest mismatch for `{}`: manifest={} actual={}",
+            plugin.id,
+            manifest.artifacts.main.trim(),
+            artifact_digest
+        );
+    }
+
+    let signing_payload = plugin_manifest_signing_payload(&manifest)?;
+    let signature_bytes = decode_base64_material(
+        manifest.signature.signature.as_str(),
+        "plugin manifest signature",
+    )?;
+    let signing_key_fingerprint = verify_plugin_signature_bytes(
+        policy,
+        signing_payload.as_slice(),
+        signature_bytes.as_slice(),
+        "plugin manifest",
+    )?;
+
+    let manifest_digest = sha256_bytes_digest(manifest_bytes.as_slice());
+    let (lockfile_path, lockfile_digest) = verify_plugin_lockfile(
+        policy,
+        ctx,
+        mode,
+        &manifest,
+        manifest_digest.as_str(),
+        signing_key_fingerprint.as_str(),
+    )?;
+    let (network_allowed, env_allowlist) = resolve_plugin_permissions(policy, &manifest, plugin)?;
+    let permission_set_digest = plugin_permission_set_digest(policy, &manifest, plugin)?;
+    let sandbox_capability = PluginSandboxCapabilityArtifact {
+        schema_version: PLUGIN_SANDBOX_CAPABILITY_SCHEMA_VERSION.to_string(),
+        profile: policy.plugins.sandbox.profile.clone(),
+        network: network_allowed,
+        env: env_allowlist.clone(),
+        read_paths: manifest.permissions.read_paths.clone(),
+        write_paths: manifest.permissions.write_paths.clone(),
+        stdout_limit_kib: policy.plugins.sandbox.max_stdout_kib,
+        timeout_ms: plugin.timeout_ms,
+    };
+
+    Ok(Some(VerifiedPluginTrust {
+        report: PluginTrustReport {
+            schema_version: PLUGIN_TRUST_SCHEMA_VERSION.to_string(),
+            manifest_path: manifest_path.display().to_string(),
+            manifest_digest,
+            artifact_digest,
+            lockfile_path,
+            lockfile_digest,
+            signing_key_id: manifest.signature.key_id,
+            signing_key_fingerprint,
+            permission_set_digest,
+            sandbox_capability,
+        },
+        network_allowed,
+        env_allowlist,
+    }))
+}
+
+fn validate_plugin_manifest_schema(
+    manifest: &PluginManifest,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<()> {
+    if manifest.schema_version != PLUGIN_MANIFEST_SCHEMA_VERSION {
+        anyhow::bail!(
+            "plugin manifest schema_version must be `{}`",
+            PLUGIN_MANIFEST_SCHEMA_VERSION
+        );
+    }
+    if manifest.id.trim().is_empty() || manifest.id != plugin.id {
+        anyhow::bail!(
+            "plugin manifest id `{}` must match policy plugin id `{}`",
+            manifest.id,
+            plugin.id
+        );
+    }
+    if manifest.version.trim().is_empty() {
+        anyhow::bail!("plugin manifest version must be non-empty");
+    }
+    let expected_entrypoint = plugin_entrypoint(plugin);
+    if manifest.entrypoint != expected_entrypoint {
+        anyhow::bail!("plugin manifest entrypoint must match policy command and args");
+    }
+    if manifest.runtime.trim().is_empty() {
+        anyhow::bail!("plugin manifest runtime must be non-empty");
+    }
+    if !is_sha256_digest(manifest.artifacts.main.trim()) {
+        anyhow::bail!("plugin manifest artifacts.main must be a sha256: digest");
+    }
+    if !manifest.artifacts.lockfile.trim().is_empty()
+        && !is_sha256_digest(manifest.artifacts.lockfile.trim())
+    {
+        anyhow::bail!("plugin manifest artifacts.lockfile must be a sha256: digest when set");
+    }
+    if manifest.producer.kind.trim().is_empty() {
+        anyhow::bail!("plugin manifest producer.kind must be non-empty");
+    }
+    if !manifest
+        .producer
+        .emits
+        .iter()
+        .any(|schema| schema == PLUGIN_OUTPUT_SCHEMA_VERSION)
+    {
+        anyhow::bail!(
+            "plugin manifest producer.emits must include `{}`",
+            PLUGIN_OUTPUT_SCHEMA_VERSION
+        );
+    }
+    if manifest.signature.key_id.trim().is_empty() {
+        anyhow::bail!("plugin manifest signature.key_id must be non-empty");
+    }
+    if manifest.signature.signature.trim().is_empty() {
+        anyhow::bail!("plugin manifest signature.signature must be non-empty");
+    }
+    Ok(())
+}
+
+fn plugin_entrypoint(plugin: &patchgate_config::PluginEntry) -> Vec<String> {
+    let mut entrypoint = Vec::with_capacity(1 + plugin.args.len());
+    entrypoint.push(plugin.command.clone());
+    entrypoint.extend(plugin.args.clone());
+    entrypoint
+}
+
+fn plugin_manifest_signing_payload(manifest: &PluginManifest) -> Result<Vec<u8>> {
+    let payload = PluginManifestSigningPayload {
+        schema_version: manifest.schema_version.as_str(),
+        id: manifest.id.as_str(),
+        version: manifest.version.as_str(),
+        entrypoint: manifest.entrypoint.as_slice(),
+        runtime: manifest.runtime.as_str(),
+        permissions: &manifest.permissions,
+        artifacts: &manifest.artifacts,
+        producer: &manifest.producer,
+        signature_key_id: manifest.signature.key_id.as_str(),
+    };
+    serde_json::to_vec(&payload).context("failed to encode plugin manifest signing payload")
+}
+
+fn verify_plugin_lockfile(
+    policy: &Config,
+    ctx: &Context,
+    mode: &str,
+    manifest: &PluginManifest,
+    manifest_digest: &str,
+    signing_key_fingerprint: &str,
+) -> Result<(String, String)> {
+    let lockfile_path = resolve_repo_path(ctx, policy.plugins.lockfile_path.as_str());
+    let lockfile_display = lockfile_path.display().to_string();
+    let lockfile_bytes = match fs::read(lockfile_path.as_path()) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && mode != "enforce" => {
+            return Ok((lockfile_display, "sha256:missing".to_string()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read plugin lockfile {}", lockfile_path.display())
+            });
+        }
+    };
+    let lockfile_digest = sha256_bytes_digest(lockfile_bytes.as_slice());
+    let lockfile: PluginLockfile = serde_json::from_slice(lockfile_bytes.as_slice())
+        .context("failed to decode plugin lockfile JSON")?;
+    if lockfile.schema_version != PLUGIN_LOCK_SCHEMA_VERSION {
+        anyhow::bail!(
+            "plugin lockfile schema_version must be `{}`",
+            PLUGIN_LOCK_SCHEMA_VERSION
+        );
+    }
+    let signing_key_fingerprint = normalize_sha256_fingerprint(signing_key_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!("internal error: signing key fingerprint was not sha256 hex")
+        })?;
+    let Some(entry) = lockfile.plugins.iter().find(|entry| {
+        entry.id == manifest.id
+            && entry.version == manifest.version
+            && entry.manifest_digest == manifest_digest
+    }) else {
+        anyhow::bail!(
+            "plugin lockfile has no entry for {}@{} with manifest_digest {}",
+            manifest.id,
+            manifest.version,
+            manifest_digest
+        );
+    };
+    let lock_fingerprint = normalize_sha256_fingerprint(entry.signing_key_fingerprint.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plugin lockfile signing_key_fingerprint for {}@{} must be sha256 hex",
+                entry.id,
+                entry.version
+            )
+        })?;
+    if lock_fingerprint != signing_key_fingerprint {
+        anyhow::bail!(
+            "plugin lockfile signing key fingerprint mismatch for {}@{}",
+            manifest.id,
+            manifest.version
+        );
+    }
+    if entry.source.trim().is_empty() {
+        anyhow::bail!(
+            "plugin lockfile source must be non-empty for {}@{}",
+            manifest.id,
+            manifest.version
+        );
+    }
+    Ok((lockfile_display, lockfile_digest))
+}
+
+fn resolve_plugin_permissions(
+    policy: &Config,
+    manifest: &PluginManifest,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<(bool, Vec<String>)> {
+    if manifest.permissions.network && !policy.plugins.sandbox.allow_network {
+        anyhow::bail!(
+            "plugin `{}` manifest requests network access but plugins.sandbox.allow_network=false",
+            plugin.id
+        );
+    }
+    validate_plugin_paths("permissions.read_paths", &manifest.permissions.read_paths)?;
+    validate_plugin_paths("permissions.write_paths", &manifest.permissions.write_paths)?;
+    if !manifest.permissions.write_paths.is_empty() {
+        anyhow::bail!(
+            "plugin `{}` manifest requests write_paths; write access is denied in trust v1",
+            plugin.id
+        );
+    }
+
+    let policy_env = policy
+        .plugins
+        .sandbox
+        .env_allowlist
+        .iter()
+        .map(|env| env.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut env_allowlist = Vec::new();
+    let mut seen = BTreeSet::new();
+    for env in &manifest.permissions.env {
+        let trimmed = env.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!(
+                "plugin `{}` manifest permissions.env contains an empty entry",
+                plugin.id
+            );
+        }
+        if !policy_env.contains(trimmed) {
+            anyhow::bail!(
+                "plugin `{}` manifest requests env `{}` but it is not in plugins.sandbox.env_allowlist",
+                plugin.id,
+                trimmed
+            );
+        }
+        if seen.insert(trimmed.to_string()) {
+            env_allowlist.push(trimmed.to_string());
+        }
+    }
+
+    Ok((manifest.permissions.network, env_allowlist))
+}
+
+fn validate_plugin_paths(field: &str, paths: &[String]) -> Result<()> {
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("plugin manifest {field} contains an empty path");
+        }
+        let candidate = Path::new(trimmed);
+        if candidate.is_absolute() {
+            anyhow::bail!("plugin manifest {field} path `{trimmed}` must be repo-relative");
+        }
+        if candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("plugin manifest {field} path `{trimmed}` must not contain `..`");
+        }
+    }
+    Ok(())
+}
+
+fn plugin_permission_set_digest(
+    policy: &Config,
+    manifest: &PluginManifest,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct PermissionDigestMaterial<'a> {
+        plugin_id: &'a str,
+        sandbox_profile: &'a str,
+        max_stdout_kib: u32,
+        timeout_ms: u64,
+        permissions: &'a PluginManifestPermissions,
+    }
+    let material = PermissionDigestMaterial {
+        plugin_id: plugin.id.as_str(),
+        sandbox_profile: policy.plugins.sandbox.profile.as_str(),
+        max_stdout_kib: policy.plugins.sandbox.max_stdout_kib,
+        timeout_ms: plugin.timeout_ms,
+        permissions: &manifest.permissions,
+    };
+    let encoded =
+        serde_json::to_vec(&material).context("failed to encode plugin permission material")?;
+    Ok(sha256_bytes_digest(encoded.as_slice()))
+}
+
 fn verify_plugin_signature(
     policy: &Config,
     ctx: &Context,
@@ -940,10 +1421,6 @@ fn verify_plugin_signature(
 ) -> Result<()> {
     if !policy.plugins.signature.required {
         return Ok(());
-    }
-    let key_envs = plugin_signature_key_envs(&policy.plugins.signature);
-    if key_envs.is_empty() {
-        anyhow::bail!("plugins.signature.public_key_env or trusted_key_envs is empty");
     }
 
     let command_path = resolve_signed_plugin_artifact_path(ctx, plugin);
@@ -964,10 +1441,27 @@ fn verify_plugin_signature(
             signature_path.display()
         )
     })?;
-    let signature_bytes = base64::engine::general_purpose::STANDARD
-        .decode(signature_text.trim())
-        .context("failed to decode plugin signature (base64)")?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
+    let signature_bytes = decode_base64_material(signature_text.trim(), "plugin signature")?;
+    verify_plugin_signature_bytes(
+        policy,
+        command_bytes.as_slice(),
+        signature_bytes.as_slice(),
+        "plugin artifact",
+    )?;
+    Ok(())
+}
+
+fn verify_plugin_signature_bytes(
+    policy: &Config,
+    signed_bytes: &[u8],
+    signature_bytes: &[u8],
+    subject: &str,
+) -> Result<String> {
+    let key_envs = plugin_signature_key_envs(&policy.plugins.signature);
+    if key_envs.is_empty() {
+        anyhow::bail!("plugins.signature.public_key_env or trusted_key_envs is empty");
+    }
+    let signature = Signature::try_from(signature_bytes)
         .context("failed to parse plugin signature (ed25519)")?;
 
     let revoked_key_sha256 = policy
@@ -975,7 +1469,7 @@ fn verify_plugin_signature(
         .signature
         .revoked_key_sha256
         .iter()
-        .map(|fingerprint| fingerprint.trim().to_ascii_lowercase())
+        .filter_map(|fingerprint| normalize_sha256_fingerprint(fingerprint))
         .collect::<BTreeSet<_>>();
     let mut attempts = Vec::new();
     for key_env in key_envs {
@@ -992,14 +1486,11 @@ fn verify_plugin_signature(
             ));
             continue;
         }
-        if verifying_key
-            .verify(command_bytes.as_slice(), &signature)
-            .is_ok()
-        {
-            return Ok(());
+        if verifying_key.verify(signed_bytes, &signature).is_ok() {
+            return Ok(fingerprint);
         }
         attempts.push(format!(
-            "{key_env}: signature mismatch for key fingerprint {fingerprint}"
+            "{key_env}: signature mismatch for {subject} with key fingerprint {fingerprint}"
         ));
     }
 
@@ -1043,6 +1534,49 @@ fn load_plugin_public_key_from_env(env_name: &str) -> Result<(String, VerifyingK
 
 fn plugin_public_key_fingerprint(key_bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(key_bytes))
+}
+
+fn resolve_repo_path(ctx: &Context, raw: &str) -> PathBuf {
+    let candidate = PathBuf::from(raw.trim());
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        ctx.repo_root.join(candidate)
+    }
+}
+
+fn sha256_file_digest(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(sha256_bytes_digest(bytes.as_slice()))
+}
+
+fn sha256_bytes_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn decode_base64_material(raw: &str, label: &str) -> Result<Vec<u8>> {
+    let trimmed = raw.trim();
+    let encoded = trimmed.strip_prefix("base64:").unwrap_or(trimmed);
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("failed to decode {label} (base64)"))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .trim()
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| normalize_sha256_fingerprint(hex).is_some())
+}
+
+fn normalize_sha256_fingerprint(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 fn resolve_signed_plugin_artifact_path(
@@ -1217,9 +1751,10 @@ fn maybe_append_readonly_bind(
 }
 
 fn build_isolated_plugin_command(
-    policy: &Config,
+    _policy: &Config,
     ctx: &Context,
     plugin: &patchgate_config::PluginEntry,
+    allow_network: bool,
 ) -> std::result::Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1246,16 +1781,16 @@ fn build_isolated_plugin_command(
             .arg(repo.as_str())
             .arg("--chdir")
             .arg(repo.as_str());
-        append_isolated_runtime_mounts(&mut command, policy.plugins.sandbox.allow_network);
+        append_isolated_runtime_mounts(&mut command, allow_network);
         command.arg("--").arg(plugin.command.as_str());
         command.args(&plugin.args);
         Ok(command)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = policy;
         let _ = ctx;
         let _ = plugin;
+        let _ = allow_network;
         Err("sandbox profile `isolated` is currently supported only on Linux".to_string())
     }
 }
@@ -3367,6 +3902,110 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
 
+    fn plugin_test_diff(fingerprint: &str) -> DiffData {
+        DiffData {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".to_string(),
+                status: ChangeStatus::Modified,
+                old_path: None,
+                added: 1,
+                deleted: 0,
+                added_lines: vec!["let x = 1;".to_string()],
+                removed_lines: Vec::new(),
+                metadata: DiffFileMetadata::default(),
+            }],
+            fingerprint: fingerprint.to_string(),
+            base_ref: None,
+            head_ref: None,
+            merge_base: None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn chmod_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod +x");
+    }
+
+    #[cfg(not(windows))]
+    fn write_signed_manifest_and_lock(
+        temp_root: &Path,
+        policy: &mut Config,
+        plugin: &patchgate_config::PluginEntry,
+        signing_key: &ed25519_dalek::SigningKey,
+        version: &str,
+        network: bool,
+    ) -> (PathBuf, PathBuf, String) {
+        let manifest_path = temp_root.join("patchgate-plugin.toml");
+        let lockfile_path = temp_root.join("patchgate-plugin.lock");
+        let artifact_digest = sha256_file_digest(
+            resolve_signed_plugin_artifact_path(
+                &Context {
+                    repo_root: temp_root.to_path_buf(),
+                    scope: ScopeMode::Worktree,
+                },
+                plugin,
+            )
+            .as_path(),
+        )
+        .expect("artifact digest");
+        let mut manifest = PluginManifest {
+            schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION.to_string(),
+            id: plugin.id.clone(),
+            version: version.to_string(),
+            entrypoint: plugin_entrypoint(plugin),
+            runtime: "sh".to_string(),
+            permissions: PluginManifestPermissions {
+                network,
+                env: Vec::new(),
+                read_paths: vec![".".to_string()],
+                write_paths: Vec::new(),
+            },
+            artifacts: PluginManifestArtifacts {
+                main: artifact_digest,
+                lockfile: String::new(),
+            },
+            producer: PluginManifestProducer {
+                kind: "scanner-adapter".to_string(),
+                emits: vec![PLUGIN_OUTPUT_SCHEMA_VERSION.to_string()],
+            },
+            signature: PluginManifestSignature {
+                key_id: "test-key".to_string(),
+                signature: String::new(),
+            },
+        };
+        let signing_payload = plugin_manifest_signing_payload(&manifest).expect("signing payload");
+        let signature = signing_key.sign(signing_payload.as_slice());
+        manifest.signature.signature = format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+        );
+        let manifest_toml = toml::to_string(&manifest).expect("manifest toml");
+        std::fs::write(&manifest_path, manifest_toml).expect("write manifest");
+
+        let manifest_digest = sha256_file_digest(manifest_path.as_path()).expect("manifest digest");
+        let signing_fingerprint =
+            plugin_public_key_fingerprint(signing_key.verifying_key().as_bytes());
+        let lockfile_json = format!(
+            r#"{{
+  "schema_version": "{}",
+  "plugins": [{{
+    "id": "{}",
+    "version": "{}",
+    "manifest_digest": "{}",
+    "source": "local-test",
+    "signing_key_fingerprint": "sha256:{}"
+  }}]
+}}"#,
+            PLUGIN_LOCK_SCHEMA_VERSION, plugin.id, version, manifest_digest, signing_fingerprint
+        );
+        std::fs::write(&lockfile_path, lockfile_json).expect("write lockfile");
+        policy.plugins.lockfile_path = lockfile_path.to_string_lossy().to_string();
+        (manifest_path, lockfile_path, signing_fingerprint)
+    }
+
     #[test]
     fn parse_name_status_supports_rename() {
         let parsed = parse_name_status("R100\told.txt\tnew.txt\nM\tsrc/main.rs\n");
@@ -4686,6 +5325,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 100,
             fail_mode: "fail_closed".to_string(),
             signature_path: String::new(),
+            manifest_path: String::new(),
         };
         let ctx = Context {
             repo_root: temp_root.clone(),
@@ -4744,6 +5384,348 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
 
     #[cfg(not(windows))]
     #[test]
+    fn enforce_rejects_unsigned_plugin_before_execution() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = false;
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-enforce-unsigned-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let marker = temp_root.join("plugin-ran");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            format!(
+                "#!/usr/bin/env sh\ncat >/dev/null\ntouch '{}'\necho '{{\"findings\":[],\"diagnostics\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        policy.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "unsigned".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        });
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, plugin_test_diff("unsigned-enforce"), "enforce")
+            .expect_err("enforce must reject unsigned plugin trust material");
+        assert!(format!("{err:#}").contains("manifest_path"));
+        assert!(!marker.exists(), "unsigned plugin must not be executed");
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn enforce_accepts_signed_manifest_and_lockfile() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_MANIFEST_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-manifest-pass-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            "#!/usr/bin/env sh\ncat >/dev/null\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+        let public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let mut plugin = patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_closed".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        };
+        let (manifest_path, _lockfile_path, signing_fingerprint) = write_signed_manifest_and_lock(
+            &temp_root,
+            &mut policy,
+            &plugin,
+            &signing_key,
+            "0.1.0",
+            false,
+        );
+        plugin.manifest_path = manifest_path.to_string_lossy().to_string();
+        policy.plugins.entries.push(plugin);
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let report = runner
+            .evaluate(&ctx, plugin_test_diff("signed-manifest"), "enforce")
+            .expect("signed manifest should run");
+        let invocation = report
+            .plugin_invocations
+            .iter()
+            .find(|invocation| invocation.plugin_id == "sample")
+            .expect("plugin invocation");
+        assert_eq!(invocation.status, PluginInvocationStatus::Pass);
+        let trust = invocation.trust.as_ref().expect("trust report");
+        assert_eq!(trust.signing_key_fingerprint, signing_fingerprint);
+        assert!(!trust.sandbox_capability.network);
+        assert_eq!(trust.sandbox_capability.profile, "restricted");
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn enforce_rejects_tampered_plugin_artifact_before_execution() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_TAMPERED_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-manifest-tampered-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let marker = temp_root.join("plugin-ran");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            "#!/usr/bin/env sh\ncat >/dev/null\necho '{\"findings\":[],\"diagnostics\":[\"ok\"]}'\n",
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[32u8; 32]);
+        let public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let mut plugin = patchgate_config::PluginEntry {
+            id: "tampered".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        };
+        let (manifest_path, _lockfile_path, _fingerprint) = write_signed_manifest_and_lock(
+            &temp_root,
+            &mut policy,
+            &plugin,
+            &signing_key,
+            "0.1.0",
+            false,
+        );
+        plugin.manifest_path = manifest_path.to_string_lossy().to_string();
+        std::fs::write(
+            &plugin_path,
+            format!(
+                "#!/usr/bin/env sh\ncat >/dev/null\ntouch '{}'\necho '{{\"findings\":[],\"diagnostics\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("tamper plugin");
+        chmod_executable(plugin_path.as_path());
+        policy.plugins.entries.push(plugin);
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, plugin_test_diff("tampered-manifest"), "enforce")
+            .expect_err("tampered artifact must not run");
+        assert!(format!("{err:#}").contains("artifact digest mismatch"));
+        assert!(!marker.exists(), "tampered plugin must not be executed");
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn enforce_rejects_manifest_network_request_when_policy_denies() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        policy.plugins.sandbox.allow_network = false;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_NETWORK_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-manifest-network-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let marker = temp_root.join("plugin-ran");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            format!(
+                "#!/usr/bin/env sh\ncat >/dev/null\ntouch '{}'\necho '{{\"findings\":[],\"diagnostics\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[33u8; 32]);
+        let public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let mut plugin = patchgate_config::PluginEntry {
+            id: "networked".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        };
+        let (manifest_path, _lockfile_path, _fingerprint) = write_signed_manifest_and_lock(
+            &temp_root,
+            &mut policy,
+            &plugin,
+            &signing_key,
+            "0.1.0",
+            true,
+        );
+        plugin.manifest_path = manifest_path.to_string_lossy().to_string();
+        policy.plugins.entries.push(plugin);
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, plugin_test_diff("network-denied"), "enforce")
+            .expect_err("network request must be rejected by permission model");
+        assert!(format!("{err:#}").contains("requests network access"));
+        assert!(
+            !marker.exists(),
+            "network-denied plugin must not be executed"
+        );
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn enforce_rejects_manifest_signed_by_revoked_key() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_MANIFEST_REVOKED_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-manifest-revoked-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let marker = temp_root.join("plugin-ran");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            format!(
+                "#!/usr/bin/env sh\ncat >/dev/null\ntouch '{}'\necho '{{\"findings\":[],\"diagnostics\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[34u8; 32]);
+        let public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let mut plugin = patchgate_config::PluginEntry {
+            id: "revoked-manifest".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        };
+        let (manifest_path, _lockfile_path, signing_fingerprint) = write_signed_manifest_and_lock(
+            &temp_root,
+            &mut policy,
+            &plugin,
+            &signing_key,
+            "0.1.0",
+            false,
+        );
+        plugin.manifest_path = manifest_path.to_string_lossy().to_string();
+        policy
+            .plugins
+            .signature
+            .revoked_key_sha256
+            .push(signing_fingerprint);
+        policy.plugins.entries.push(plugin);
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, plugin_test_diff("manifest-revoked"), "enforce")
+            .expect_err("revoked manifest key must be rejected");
+        assert!(format!("{err:#}").contains("is revoked"));
+        assert!(!marker.exists(), "revoked-key plugin must not be executed");
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn plugin_contract_harness_and_signature_verification_pass() {
         use std::os::unix::fs::PermissionsExt;
         let mut policy = Config::default();
@@ -4790,6 +5772,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         });
 
         let ctx = Context {
@@ -4875,6 +5858,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         });
 
         let ctx = Context {
@@ -4961,6 +5945,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         };
         let ctx = Context {
             repo_root: temp_root.clone(),
@@ -5026,6 +6011,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         });
 
         let ctx = Context {
@@ -5112,6 +6098,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         });
 
         let ctx = Context {
@@ -5168,6 +6155,20 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_runtime_mounts_deny_network_by_default() {
+        let mut command = Command::new("bwrap");
+        append_isolated_runtime_mounts(&mut command, false);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(!args.contains(&"--share-net".to_string()));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn plugin_signature_verification_rejects_revoked_key() {
@@ -5211,6 +6212,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         };
         let ctx = Context {
             repo_root: temp_root.clone(),
@@ -5270,6 +6272,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             timeout_ms: 3_000,
             fail_mode: "fail_closed".to_string(),
             signature_path: signature_path.to_string_lossy().to_string(),
+            manifest_path: String::new(),
         });
 
         let ctx = Context {

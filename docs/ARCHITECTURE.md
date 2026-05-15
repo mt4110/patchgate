@@ -41,6 +41,8 @@
 - Output: `PluginOutput` JSON (stdout)
 - timeout/max stdout/fail mode は policy 管理
 - `restricted` sandbox は env allowlist 方式
+- `enforce` mode では signed manifest と `patchgate-plugin.lock` で entrypoint/artifact digest/permissions/signing key を固定してから実行する
+- plugin trust material は cache key に含まれ、manifest・lockfile・artifact の変更は cache miss になる
 
 ## CI provider boundary
 

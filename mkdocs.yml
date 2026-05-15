@@ -22,6 +22,7 @@ nav:
   - V2 Support Model: 22_v2_support_model.md
   - SIEM Handoff Reference: 23_siem_handoff_reference.md
   - V2 GA Go No-Go: 25_v2_ga_go_no_go.md
+  - Plugin Trust: 26_plugin_trust.md
   - Phase201+ Backcast: 20_phase201_plus_backcast.md
   - Release Checklist: 99_release_checklist.md
 markdown_extensions:

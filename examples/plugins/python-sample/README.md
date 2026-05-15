@@ -5,6 +5,7 @@
 ```toml
 [plugins]
 enabled = true
+lockfile_path = "patchgate-plugin.lock"
 entries = [
   { id = "python-sample", command = "python3", args = ["examples/plugins/python-sample/plugin.py"], timeout_ms = 3000, fail_mode = "fail_open" }
 ]
@@ -15,3 +16,5 @@ allow_network = false
 env_allowlist = []
 max_stdout_kib = 256
 ```
+
+`enforce` mode でこの plugin を使う場合は、entry に `manifest_path` を追加し、signed manifest と `patchgate-plugin.lock` で artifact digest と signing key fingerprint を固定してください。

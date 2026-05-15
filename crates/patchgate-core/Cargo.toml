@@ -12,6 +12,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 globset = "0.4"
 sha2 = "0.10"
 base64 = "0.22"
