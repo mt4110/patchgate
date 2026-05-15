@@ -8065,31 +8065,35 @@ fn plugin_cache_trust_material_hash(repo_root: &Path, cfg: &Config) -> Result<St
     } else {
         "disabled".to_string()
     };
-    let entries = cfg
-        .plugins
-        .entries
-        .iter()
-        .map(|plugin| {
-            let arg_file_digests = plugin
-                .args
-                .iter()
-                .map(|arg| cache_file_digest(repo_root, arg).map(|digest| (arg.clone(), digest)))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(PluginCacheEntryMaterial {
-                id: plugin.id.as_str(),
-                command: plugin.command.as_str(),
-                args: plugin.args.as_slice(),
-                timeout_ms: plugin.timeout_ms,
-                fail_mode: plugin.fail_mode.as_str(),
-                signature_path: plugin.signature_path.as_str(),
-                signature_digest: cache_file_digest(repo_root, plugin.signature_path.as_str())?,
-                manifest_path: plugin.manifest_path.as_str(),
-                manifest_digest: cache_file_digest(repo_root, plugin.manifest_path.as_str())?,
-                command_digest: cache_file_digest(repo_root, plugin.command.as_str())?,
-                arg_file_digests,
+    let entries = if cfg.plugins.enabled {
+        cfg.plugins
+            .entries
+            .iter()
+            .map(|plugin| {
+                let mut arg_file_digests = Vec::new();
+                for arg in &plugin.args {
+                    if let Some(digest) = cache_existing_file_digest(repo_root, arg)? {
+                        arg_file_digests.push((arg.clone(), digest));
+                    }
+                }
+                Ok(PluginCacheEntryMaterial {
+                    id: plugin.id.as_str(),
+                    command: plugin.command.as_str(),
+                    args: plugin.args.as_slice(),
+                    timeout_ms: plugin.timeout_ms,
+                    fail_mode: plugin.fail_mode.as_str(),
+                    signature_path: plugin.signature_path.as_str(),
+                    signature_digest: cache_file_digest(repo_root, plugin.signature_path.as_str())?,
+                    manifest_path: plugin.manifest_path.as_str(),
+                    manifest_digest: cache_file_digest(repo_root, plugin.manifest_path.as_str())?,
+                    command_digest: cache_file_digest(repo_root, plugin.command.as_str())?,
+                    arg_file_digests,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
 
     let material = PluginCacheTrustMaterial {
         enabled: cfg.plugins.enabled,
@@ -8121,6 +8125,18 @@ fn cache_file_digest(repo_root: &Path, raw_path: &str) -> Result<String> {
         Err(err) => Err(err)
             .with_context(|| format!("failed to read plugin cache material {}", path.display())),
     }
+}
+
+fn cache_existing_file_digest(repo_root: &Path, raw_path: &str) -> Result<Option<String>> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = resolve_cache_material_path(repo_root, trimmed);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    cache_file_digest(repo_root, trimmed).map(Some)
 }
 
 fn resolve_cache_material_path(repo_root: &Path, raw_path: &str) -> PathBuf {
@@ -10009,6 +10025,36 @@ mod tests {
         let after = plugin_cache_trust_material_hash(&repo_root, &cfg).expect("updated trust hash");
 
         assert_ne!(before, after);
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn plugin_cache_trust_material_ignores_entries_when_plugins_disabled() {
+        let repo_root = temp_path("patchgate-cli-plugin-cache-disabled");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+
+        let mut first = Config::default();
+        first.plugins.enabled = false;
+        first.plugins.entries.push(patchgate_config::PluginEntry {
+            id: "sample".to_string(),
+            command: "missing-a.sh".to_string(),
+            args: vec!["--flag".to_string()],
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: "missing-a.sig".to_string(),
+            manifest_path: "missing-a.toml".to_string(),
+        });
+        let mut second = first.clone();
+        second.plugins.entries[0].command = "missing-b.sh".to_string();
+        second.plugins.entries[0].signature_path = "missing-b.sig".to_string();
+        second.plugins.entries[0].manifest_path = "missing-b.toml".to_string();
+
+        let first_hash =
+            plugin_cache_trust_material_hash(&repo_root, &first).expect("first trust hash");
+        let second_hash =
+            plugin_cache_trust_material_hash(&repo_root, &second).expect("second trust hash");
+
+        assert_eq!(first_hash, second_hash);
         let _ = fs::remove_dir_all(repo_root);
     }
 

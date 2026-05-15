@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
@@ -615,7 +616,6 @@ struct PluginManifestSigningPayload<'a> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginLockfile {
-    #[serde(default = "default_plugin_lock_schema_version")]
     schema_version: String,
     plugins: Vec<PluginLockfileEntry>,
 }
@@ -633,16 +633,13 @@ struct PluginLockfileEntry {
 #[derive(Debug, Clone)]
 struct VerifiedPluginTrust {
     report: PluginTrustReport,
+    artifact_path: PathBuf,
     network_allowed: bool,
     env_allowlist: Vec<String>,
 }
 
 fn default_plugin_manifest_read_paths() -> Vec<String> {
     vec![".".to_string()]
-}
-
-fn default_plugin_lock_schema_version() -> String {
-    PLUGIN_LOCK_SCHEMA_VERSION.to_string()
 }
 
 fn evaluate_plugins(
@@ -755,15 +752,17 @@ fn evaluate_plugins(
 fn plugin_invocation_is_execution_failure(status: &PluginInvocationStatus) -> bool {
     matches!(
         status,
-        PluginInvocationStatus::Error | PluginInvocationStatus::TimedOut
+        PluginInvocationStatus::Error
+            | PluginInvocationStatus::TrustVerificationFailed
+            | PluginInvocationStatus::TimedOut
     )
 }
 
 fn plugin_invocation_is_trust_failure(invocation: &PluginInvocation) -> bool {
-    invocation
-        .error
-        .as_deref()
-        .is_some_and(|error| error.starts_with("plugin trust verification failed"))
+    matches!(
+        invocation.status,
+        PluginInvocationStatus::TrustVerificationFailed
+    )
 }
 
 fn execute_plugin(
@@ -782,7 +781,7 @@ fn execute_plugin(
             let message = format!("plugin trust verification failed: {err:#}");
             return Ok(PluginInvocation {
                 plugin_id: plugin.id.clone(),
-                status: PluginInvocationStatus::Error,
+                status: PluginInvocationStatus::TrustVerificationFailed,
                 duration_ms: start.elapsed().as_millis(),
                 sandbox_profile: policy.plugins.sandbox.profile.clone(),
                 trust: None,
@@ -818,6 +817,30 @@ fn execute_plugin(
         .as_ref()
         .map(|trust| trust.env_allowlist.clone())
         .unwrap_or_else(|| policy.plugins.sandbox.env_allowlist.clone());
+    let execution_artifact = match trust.as_ref() {
+        Some(trust) => match prepare_verified_plugin_execution_artifact(ctx, plugin, trust) {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                let message = format!("plugin trust verification failed: {err:#}");
+                return Ok(PluginInvocation {
+                    plugin_id: plugin.id.clone(),
+                    status: PluginInvocationStatus::TrustVerificationFailed,
+                    duration_ms: start.elapsed().as_millis(),
+                    sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                    trust: Some(trust.report.clone()),
+                    shadow_contract,
+                    findings: Vec::new(),
+                    diagnostics: vec![message.clone()],
+                    error: Some(message),
+                });
+            }
+        },
+        None => None,
+    };
+    let command_plugin = execution_artifact
+        .as_ref()
+        .map(|artifact| &artifact.plugin)
+        .unwrap_or(plugin);
     let trust_report = trust.as_ref().map(|trust| trust.report.clone());
 
     let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
@@ -826,25 +849,27 @@ fn execute_plugin(
     let timeout = Duration::from_millis(plugin.timeout_ms);
 
     let mut command = match sandbox_profile {
-        "isolated" => match build_isolated_plugin_command(policy, ctx, plugin, network_allowed) {
-            Ok(command) => command,
-            Err(message) => {
-                return Ok(PluginInvocation {
-                    plugin_id: plugin.id.clone(),
-                    status: PluginInvocationStatus::Error,
-                    duration_ms: start.elapsed().as_millis(),
-                    sandbox_profile: sandbox_profile.to_string(),
-                    trust: trust_report,
-                    shadow_contract,
-                    findings: Vec::new(),
-                    diagnostics: vec![message.clone()],
-                    error: Some(message),
-                });
+        "isolated" => {
+            match build_isolated_plugin_command(policy, ctx, command_plugin, network_allowed) {
+                Ok(command) => command,
+                Err(message) => {
+                    return Ok(PluginInvocation {
+                        plugin_id: plugin.id.clone(),
+                        status: PluginInvocationStatus::Error,
+                        duration_ms: start.elapsed().as_millis(),
+                        sandbox_profile: sandbox_profile.to_string(),
+                        trust: trust_report,
+                        shadow_contract,
+                        findings: Vec::new(),
+                        diagnostics: vec![message.clone()],
+                        error: Some(message),
+                    });
+                }
             }
-        },
+        }
         _ => {
-            let mut command = Command::new(plugin.command.as_str());
-            command.args(&plugin.args);
+            let mut command = Command::new(command_plugin.command.as_str());
+            command.args(&command_plugin.args);
             command
         }
     };
@@ -1173,6 +1198,7 @@ fn verify_plugin_trust_material(
             permission_set_digest,
             sandbox_capability,
         },
+        artifact_path,
         network_allowed,
         env_allowlist,
     }))
@@ -1269,7 +1295,7 @@ fn verify_plugin_lockfile(
     let lockfile_bytes = match fs::read(lockfile_path.as_path()) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && mode != "enforce" => {
-            return Ok((lockfile_display, "sha256:missing".to_string(), None));
+            return Ok((lockfile_display, "missing".to_string(), None));
         }
         Err(err) => {
             return Err(err).with_context(|| {
@@ -1576,6 +1602,114 @@ fn verify_plugin_signature_bytes(
         "plugin signature verification failed with configured keyring: {}",
         attempts.join("; ")
     )
+}
+
+struct PluginExecutionArtifact {
+    dir: PathBuf,
+    plugin: patchgate_config::PluginEntry,
+}
+
+impl Drop for PluginExecutionArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.dir.as_path());
+    }
+}
+
+fn prepare_verified_plugin_execution_artifact(
+    ctx: &Context,
+    plugin: &patchgate_config::PluginEntry,
+    trust: &VerifiedPluginTrust,
+) -> Result<Option<PluginExecutionArtifact>> {
+    let artifact_name = trust
+        .artifact_path
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("plugin-artifact"));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = ctx
+        .repo_root
+        .join("target")
+        .join("patchgate-plugin-exec")
+        .join(format!("{}-{nonce}", std::process::id()));
+    fs::create_dir_all(dir.as_path()).with_context(|| {
+        format!(
+            "failed to create verified plugin execution directory {}",
+            dir.display()
+        )
+    })?;
+    let copied_artifact_path = dir.join(artifact_name);
+    fs::copy(
+        trust.artifact_path.as_path(),
+        copied_artifact_path.as_path(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to copy plugin artifact {} to {}",
+            trust.artifact_path.display(),
+            copied_artifact_path.display()
+        )
+    })?;
+    if let Ok(metadata) = fs::metadata(trust.artifact_path.as_path()) {
+        fs::set_permissions(copied_artifact_path.as_path(), metadata.permissions()).with_context(
+            || {
+                format!(
+                    "failed to preserve plugin artifact permissions on {}",
+                    copied_artifact_path.display()
+                )
+            },
+        )?;
+    }
+    let copied_digest = sha256_file_digest(copied_artifact_path.as_path()).with_context(|| {
+        format!(
+            "failed to hash verified plugin execution artifact {}",
+            copied_artifact_path.display()
+        )
+    })?;
+    if copied_digest != trust.report.artifact_digest {
+        anyhow::bail!(
+            "plugin artifact digest mismatch after preparing execution copy for `{}`: expected={} actual={}",
+            plugin.id,
+            trust.report.artifact_digest,
+            copied_digest
+        );
+    }
+
+    let mut execution_plugin = plugin.clone();
+    let command_path = resolve_repo_path(ctx, plugin.command.as_str());
+    if paths_match_for_artifact(command_path.as_path(), trust.artifact_path.as_path()) {
+        execution_plugin.command = copied_artifact_path.display().to_string();
+        return Ok(Some(PluginExecutionArtifact {
+            dir,
+            plugin: execution_plugin,
+        }));
+    }
+
+    for arg in &mut execution_plugin.args {
+        let arg_path = resolve_repo_path(ctx, arg.as_str());
+        if paths_match_for_artifact(arg_path.as_path(), trust.artifact_path.as_path()) {
+            *arg = copied_artifact_path.display().to_string();
+            return Ok(Some(PluginExecutionArtifact {
+                dir,
+                plugin: execution_plugin,
+            }));
+        }
+    }
+
+    let _ = fs::remove_dir_all(dir.as_path());
+    anyhow::bail!(
+        "verified plugin artifact for `{}` did not match command or args",
+        plugin.id
+    )
+}
+
+fn paths_match_for_artifact(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn plugin_signature_key_envs(signature: &patchgate_config::PluginSignatureConfig) -> Vec<String> {
@@ -4136,6 +4270,23 @@ extra = "ignored"
     }
 
     #[test]
+    fn plugin_lockfile_schema_requires_schema_version() {
+        let lockfile_json = r#"{
+  "plugins": [{
+    "id": "sample",
+    "version": "0.1.0",
+    "manifest_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "source": "local-test",
+    "signing_key_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  }]
+}"#;
+
+        let err = serde_json::from_str::<PluginLockfile>(lockfile_json)
+            .expect_err("missing schema_version");
+        assert!(format!("{err:#}").contains("schema_version"));
+    }
+
+    #[test]
     fn parse_name_status_supports_rename() {
         let parsed = parse_name_status("R100\told.txt\tnew.txt\nM\tsrc/main.rs\n");
         let renamed = parsed.get("new.txt").expect("missing renamed file");
@@ -5320,6 +5471,9 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
     fn plugin_execution_failure_status_detection() {
         assert!(plugin_invocation_is_execution_failure(
             &PluginInvocationStatus::Error
+        ));
+        assert!(plugin_invocation_is_execution_failure(
+            &PluginInvocationStatus::TrustVerificationFailed
         ));
         assert!(plugin_invocation_is_execution_failure(
             &PluginInvocationStatus::TimedOut

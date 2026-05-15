@@ -394,6 +394,7 @@ pub enum PluginInvocationStatus {
     Pass,
     Fail,
     Error,
+    TrustVerificationFailed,
     TimedOut,
     Skipped,
 }

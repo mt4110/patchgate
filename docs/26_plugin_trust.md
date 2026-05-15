@@ -10,7 +10,7 @@ PatchGate treats plugins as evidence producers. In `enforce` mode, a plugin must
 schema_version = "patchgate.plugin.manifest.v1"
 id = "sample"
 version = "0.1.0"
-entrypoint = ["./plugins/sample/plugin.sh"]
+entrypoint = ["sh", "./plugins/sample/plugin.sh"]
 runtime = "sh"
 
 [permissions]
@@ -33,6 +33,8 @@ signature = "base64:..."
 ```
 
 The signature covers the manifest fields that define execution identity: id, version, entrypoint, runtime, artifact digests, permissions, producer output schema, and key id. The `signature.signature` value itself is excluded from the signed payload.
+
+`entrypoint` must exactly mirror the policy entry as `[plugins.entries[].command, ...plugins.entries[].args]`. `runtime` is descriptive metadata and does not prepend or rewrite the command.
 
 `artifacts.lockfile` is the digest of the canonical lock entry binding: lockfile schema version, plugin id, plugin version, source, and signing key fingerprint. Runtime also verifies the concrete `manifest_digest` in `patchgate-plugin.lock`, which avoids a circular manifest-to-lockfile hash while still binding the signed manifest to the lock material.
 
@@ -76,6 +78,8 @@ Trust v1 is deny-by-default:
 ## Cache Material
 
 The scan cache key includes plugin trust material: manifest bytes, lockfile bytes, signature file bytes, command/argument file bytes, sandbox profile, network setting, env allowlist, and output cap. Changing a plugin artifact or trust file causes a cache miss.
+
+When manifest trust is active, PatchGate copies the verified plugin artifact to a private execution path, hashes that copy, and executes the copy. This keeps the executed bytes tied to the manifest digest instead of relying on the original workspace path after verification.
 
 ## Enforce Behavior
 

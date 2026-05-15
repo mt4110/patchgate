@@ -750,6 +750,17 @@ pub fn validate_config(cfg: &Config) -> Result<()> {
                 ),
             ));
         }
+        if !plugin.manifest_path.trim().is_empty()
+            && !plugin_signature_has_any_key_env(&cfg.plugins.signature)
+        {
+            return Err(validation_error(
+                ValidationCategory::Dependency,
+                "plugins.signature",
+                format!(
+                    "entry[{idx}] manifest_path requires public_key_env or trusted_key_envs for manifest verification"
+                ),
+            ));
+        }
     }
 
     for (idx, url) in cfg.integrations.webhook.urls.iter().enumerate() {
@@ -1659,6 +1670,31 @@ public_key_env = "PATCHGATE_PLUGIN_PUBLIC_KEY"
             loaded.plugins.entries[0].manifest_path,
             "patchgate-plugin.toml"
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_rejects_manifest_path_without_signature_key_env() {
+        let path = write_temp_policy(
+            r#"
+policy_version = 2
+[plugins]
+enabled = true
+entries = [{ id = "sample", command = "plugin.sh", args = [], timeout_ms = 1000, fail_mode = "fail_open", manifest_path = "patchgate-plugin.toml" }]
+[plugins.signature]
+required = false
+public_key_env = "   "
+"#,
+        );
+        let err = load_from_typed(&path).expect_err("manifest_path requires verifying key env");
+        assert_eq!(err.category(), Some(ValidationCategory::Dependency));
+        match err {
+            ConfigError::Validation { field, message, .. } => {
+                assert_eq!(field, "plugins.signature");
+                assert!(message.contains("manifest_path"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
         let _ = fs::remove_file(path);
     }
 
