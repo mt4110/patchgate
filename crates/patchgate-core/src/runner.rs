@@ -817,40 +817,61 @@ fn execute_plugin(
         .as_ref()
         .map(|trust| trust.env_allowlist.clone())
         .unwrap_or_else(|| policy.plugins.sandbox.env_allowlist.clone());
-    let execution_artifact = match trust.as_ref() {
-        Some(trust) => match prepare_verified_plugin_execution_artifact(ctx, plugin, trust) {
-            Ok(artifact) => artifact,
-            Err(err) => {
-                let message = format!("plugin trust verification failed: {err:#}");
-                return Ok(PluginInvocation {
-                    plugin_id: plugin.id.clone(),
-                    status: PluginInvocationStatus::TrustVerificationFailed,
-                    duration_ms: start.elapsed().as_millis(),
-                    sandbox_profile: policy.plugins.sandbox.profile.clone(),
-                    trust: Some(trust.report.clone()),
-                    shadow_contract,
-                    findings: Vec::new(),
-                    diagnostics: vec![message.clone()],
-                    error: Some(message),
-                });
-            }
-        },
-        None => None,
-    };
-    let command_plugin = execution_artifact
-        .as_ref()
-        .map(|artifact| &artifact.plugin)
-        .unwrap_or(plugin);
     let trust_report = trust.as_ref().map(|trust| trust.report.clone());
-
     let input_json = serde_json::to_vec(&input).context("failed to encode plugin input")?;
     let max_output_bytes = (policy.plugins.sandbox.max_stdout_kib as usize).saturating_mul(1024);
     let sandbox_profile = policy.plugins.sandbox.profile.as_str();
     let timeout = Duration::from_millis(plugin.timeout_ms);
+    let execution_artifact = match (trust.as_ref(), sandbox_profile) {
+        (Some(trust), "isolated") => {
+            match prepare_verified_plugin_execution_artifact(ctx, plugin, trust) {
+                Ok(artifact) => artifact,
+                Err(err) => {
+                    let message = format!("plugin trust verification failed: {err:#}");
+                    return Ok(PluginInvocation {
+                        plugin_id: plugin.id.clone(),
+                        status: PluginInvocationStatus::TrustVerificationFailed,
+                        duration_ms: start.elapsed().as_millis(),
+                        sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                        trust: Some(trust.report.clone()),
+                        shadow_contract,
+                        findings: Vec::new(),
+                        diagnostics: vec![message.clone()],
+                        error: Some(message),
+                    });
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(trust) = trust.as_ref() {
+        if let Err(err) =
+            verify_plugin_artifact_ready_for_execution(plugin, trust, execution_artifact.as_ref())
+        {
+            let message = format!("plugin trust verification failed: {err:#}");
+            return Ok(PluginInvocation {
+                plugin_id: plugin.id.clone(),
+                status: PluginInvocationStatus::TrustVerificationFailed,
+                duration_ms: start.elapsed().as_millis(),
+                sandbox_profile: policy.plugins.sandbox.profile.clone(),
+                trust: Some(trust.report.clone()),
+                shadow_contract,
+                findings: Vec::new(),
+                diagnostics: vec![message.clone()],
+                error: Some(message),
+            });
+        }
+    }
 
     let mut command = match sandbox_profile {
         "isolated" => {
-            match build_isolated_plugin_command(policy, ctx, command_plugin, network_allowed) {
+            match build_isolated_plugin_command(
+                policy,
+                ctx,
+                plugin,
+                network_allowed,
+                execution_artifact.as_ref(),
+            ) {
                 Ok(command) => command,
                 Err(message) => {
                     return Ok(PluginInvocation {
@@ -868,8 +889,8 @@ fn execute_plugin(
             }
         }
         _ => {
-            let mut command = Command::new(command_plugin.command.as_str());
-            command.args(&command_plugin.args);
+            let mut command = Command::new(plugin.command.as_str());
+            command.args(&plugin.args);
             command
         }
     };
@@ -1604,9 +1625,11 @@ fn verify_plugin_signature_bytes(
     )
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct PluginExecutionArtifact {
     dir: PathBuf,
-    plugin: patchgate_config::PluginEntry,
+    original_artifact_path: PathBuf,
+    copied_artifact_path: PathBuf,
 }
 
 impl Drop for PluginExecutionArtifact {
@@ -1677,23 +1700,22 @@ fn prepare_verified_plugin_execution_artifact(
         );
     }
 
-    let mut execution_plugin = plugin.clone();
     let command_path = resolve_repo_path(ctx, plugin.command.as_str());
     if paths_match_for_artifact(command_path.as_path(), trust.artifact_path.as_path()) {
-        execution_plugin.command = copied_artifact_path.display().to_string();
         return Ok(Some(PluginExecutionArtifact {
             dir,
-            plugin: execution_plugin,
+            original_artifact_path: trust.artifact_path.clone(),
+            copied_artifact_path,
         }));
     }
 
-    for arg in &mut execution_plugin.args {
+    for arg in &plugin.args {
         let arg_path = resolve_repo_path(ctx, arg.as_str());
         if paths_match_for_artifact(arg_path.as_path(), trust.artifact_path.as_path()) {
-            *arg = copied_artifact_path.display().to_string();
             return Ok(Some(PluginExecutionArtifact {
                 dir,
-                plugin: execution_plugin,
+                original_artifact_path: trust.artifact_path.clone(),
+                copied_artifact_path,
             }));
         }
     }
@@ -1703,6 +1725,31 @@ fn prepare_verified_plugin_execution_artifact(
         "verified plugin artifact for `{}` did not match command or args",
         plugin.id
     )
+}
+
+fn verify_plugin_artifact_ready_for_execution(
+    plugin: &patchgate_config::PluginEntry,
+    trust: &VerifiedPluginTrust,
+    execution_artifact: Option<&PluginExecutionArtifact>,
+) -> Result<()> {
+    if execution_artifact.is_some() {
+        return Ok(());
+    }
+    let current_digest = sha256_file_digest(trust.artifact_path.as_path()).with_context(|| {
+        format!(
+            "failed to hash plugin artifact before execution {}",
+            trust.artifact_path.display()
+        )
+    })?;
+    if current_digest != trust.report.artifact_digest {
+        anyhow::bail!(
+            "plugin artifact digest mismatch before execution for `{}`: expected={} actual={}",
+            plugin.id,
+            trust.report.artifact_digest,
+            current_digest
+        );
+    }
+    Ok(())
 }
 
 fn paths_match_for_artifact(left: &Path, right: &Path) -> bool {
@@ -1987,6 +2034,7 @@ fn build_isolated_plugin_command(
     ctx: &Context,
     plugin: &patchgate_config::PluginEntry,
     allow_network: bool,
+    execution_artifact: Option<&PluginExecutionArtifact>,
 ) -> std::result::Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -2014,6 +2062,12 @@ fn build_isolated_plugin_command(
             .arg("--chdir")
             .arg(repo.as_str());
         append_isolated_runtime_mounts(&mut command, allow_network);
+        if let Some(execution_artifact) = execution_artifact {
+            command
+                .arg("--ro-bind")
+                .arg(execution_artifact.copied_artifact_path.as_path())
+                .arg(execution_artifact.original_artifact_path.as_path());
+        }
         command.arg("--").arg(plugin.command.as_str());
         command.args(&plugin.args);
         Ok(command)
@@ -2023,6 +2077,7 @@ fn build_isolated_plugin_command(
         let _ = ctx;
         let _ = plugin;
         let _ = allow_network;
+        let _ = execution_artifact;
         Err("sandbox profile `isolated` is currently supported only on Linux".to_string())
     }
 }

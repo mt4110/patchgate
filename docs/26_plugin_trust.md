@@ -79,7 +79,7 @@ Trust v1 is deny-by-default:
 
 The scan cache key includes plugin trust material: manifest bytes, lockfile bytes, signature file bytes, command/argument file bytes, sandbox profile, network setting, env allowlist, and output cap. Changing a plugin artifact or trust file causes a cache miss.
 
-When manifest trust is active, PatchGate copies the verified plugin artifact to a private execution path, hashes that copy, and executes the copy. This keeps the executed bytes tied to the manifest digest instead of relying on the original workspace path after verification.
+When manifest trust runs under the `isolated` profile, PatchGate copies the verified plugin artifact to a private temp directory, hashes that copy, and bind-mounts the copy over the original artifact path inside the sandbox. This preserves script-relative resource lookup while tying the executed bytes to the manifest digest. Portable profiles re-hash the original artifact immediately before process start.
 
 ## Enforce Behavior
 
