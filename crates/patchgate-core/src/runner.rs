@@ -1127,13 +1127,18 @@ fn verify_plugin_trust_material(
     )?;
 
     let manifest_digest = sha256_bytes_digest(manifest_bytes.as_slice());
-    let (lockfile_path, lockfile_digest) = verify_plugin_lockfile(
+    let (lockfile_path, lockfile_digest, lockfile_binding_digest) = verify_plugin_lockfile(
         policy,
         ctx,
         mode,
         &manifest,
         manifest_digest.as_str(),
         signing_key_fingerprint.as_str(),
+    )?;
+    verify_plugin_manifest_lockfile_artifact(
+        &manifest,
+        lockfile_binding_digest.as_deref(),
+        plugin,
     )?;
     let (network_allowed, env_allowlist) = resolve_plugin_permissions(policy, &manifest, plugin)?;
     let permission_set_digest = plugin_permission_set_digest(policy, &manifest, plugin)?;
@@ -1196,10 +1201,8 @@ fn validate_plugin_manifest_schema(
     if !is_sha256_digest(manifest.artifacts.main.trim()) {
         anyhow::bail!("plugin manifest artifacts.main must be a sha256: digest");
     }
-    if !manifest.artifacts.lockfile.trim().is_empty()
-        && !is_sha256_digest(manifest.artifacts.lockfile.trim())
-    {
-        anyhow::bail!("plugin manifest artifacts.lockfile must be a sha256: digest when set");
+    if !is_sha256_digest(manifest.artifacts.lockfile.trim()) {
+        anyhow::bail!("plugin manifest artifacts.lockfile must be a sha256: digest");
     }
     if manifest.producer.kind.trim().is_empty() {
         anyhow::bail!("plugin manifest producer.kind must be non-empty");
@@ -1253,13 +1256,13 @@ fn verify_plugin_lockfile(
     manifest: &PluginManifest,
     manifest_digest: &str,
     signing_key_fingerprint: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Option<String>)> {
     let lockfile_path = resolve_repo_path(ctx, policy.plugins.lockfile_path.as_str());
     let lockfile_display = lockfile_path.display().to_string();
     let lockfile_bytes = match fs::read(lockfile_path.as_path()) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && mode != "enforce" => {
-            return Ok((lockfile_display, "sha256:missing".to_string()));
+            return Ok((lockfile_display, "sha256:missing".to_string(), None));
         }
         Err(err) => {
             return Err(err).with_context(|| {
@@ -1314,7 +1317,75 @@ fn verify_plugin_lockfile(
             manifest.version
         );
     }
-    Ok((lockfile_display, lockfile_digest))
+    let lockfile_binding_digest =
+        plugin_lockfile_entry_binding_digest(lockfile.schema_version.as_str(), entry)?;
+    Ok((
+        lockfile_display,
+        lockfile_digest,
+        Some(lockfile_binding_digest),
+    ))
+}
+
+fn verify_plugin_manifest_lockfile_artifact(
+    manifest: &PluginManifest,
+    lockfile_binding_digest: Option<&str>,
+    plugin: &patchgate_config::PluginEntry,
+) -> Result<()> {
+    let Some(lockfile_binding_digest) = lockfile_binding_digest else {
+        return Ok(());
+    };
+    if manifest.artifacts.lockfile.trim() != lockfile_binding_digest {
+        anyhow::bail!(
+            "plugin manifest lockfile digest mismatch for `{}`: manifest={} actual={}",
+            plugin.id,
+            manifest.artifacts.lockfile.trim(),
+            lockfile_binding_digest
+        );
+    }
+    Ok(())
+}
+
+fn plugin_lockfile_entry_binding_digest(
+    schema_version: &str,
+    entry: &PluginLockfileEntry,
+) -> Result<String> {
+    plugin_lockfile_binding_digest(
+        schema_version,
+        entry.id.as_str(),
+        entry.version.as_str(),
+        entry.source.as_str(),
+        entry.signing_key_fingerprint.as_str(),
+    )
+}
+
+fn plugin_lockfile_binding_digest(
+    schema_version: &str,
+    id: &str,
+    version: &str,
+    source: &str,
+    signing_key_fingerprint: &str,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct LockfileBindingDigestMaterial<'a> {
+        schema_version: &'a str,
+        id: &'a str,
+        version: &'a str,
+        source: &'a str,
+        signing_key_fingerprint: String,
+    }
+    let fingerprint = normalize_sha256_fingerprint(signing_key_fingerprint).ok_or_else(|| {
+        anyhow::anyhow!("plugin lockfile signing_key_fingerprint must be sha256 hex")
+    })?;
+    let material = LockfileBindingDigestMaterial {
+        schema_version,
+        id,
+        version,
+        source,
+        signing_key_fingerprint: format!("sha256:{fingerprint}"),
+    };
+    let encoded = serde_json::to_vec(&material)
+        .context("failed to encode plugin lockfile binding digest material")?;
+    Ok(sha256_bytes_digest(encoded.as_slice()))
 }
 
 fn resolve_plugin_permissions(
@@ -3937,6 +4008,7 @@ mod tests {
         signing_key: &ed25519_dalek::SigningKey,
         version: &str,
         network: bool,
+        lockfile_binding_override: Option<&str>,
     ) -> (PathBuf, PathBuf, String) {
         let manifest_path = temp_root.join("patchgate-plugin.toml");
         let lockfile_path = temp_root.join("patchgate-plugin.lock");
@@ -3951,6 +4023,20 @@ mod tests {
             .as_path(),
         )
         .expect("artifact digest");
+        let signing_fingerprint =
+            plugin_public_key_fingerprint(signing_key.verifying_key().as_bytes());
+        let lockfile_binding_digest = lockfile_binding_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                plugin_lockfile_binding_digest(
+                    PLUGIN_LOCK_SCHEMA_VERSION,
+                    plugin.id.as_str(),
+                    version,
+                    "local-test",
+                    signing_fingerprint.as_str(),
+                )
+                .expect("lockfile binding digest")
+            });
         let mut manifest = PluginManifest {
             schema_version: PLUGIN_MANIFEST_SCHEMA_VERSION.to_string(),
             id: plugin.id.clone(),
@@ -3965,7 +4051,7 @@ mod tests {
             },
             artifacts: PluginManifestArtifacts {
                 main: artifact_digest,
-                lockfile: String::new(),
+                lockfile: lockfile_binding_digest,
             },
             producer: PluginManifestProducer {
                 kind: "scanner-adapter".to_string(),
@@ -3986,8 +4072,6 @@ mod tests {
         std::fs::write(&manifest_path, manifest_toml).expect("write manifest");
 
         let manifest_digest = sha256_file_digest(manifest_path.as_path()).expect("manifest digest");
-        let signing_fingerprint =
-            plugin_public_key_fingerprint(signing_key.verifying_key().as_bytes());
         let lockfile_json = format!(
             r#"{{
   "schema_version": "{}",
@@ -5475,6 +5559,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             &signing_key,
             "0.1.0",
             false,
+            None,
         );
         plugin.manifest_path = manifest_path.to_string_lossy().to_string();
         policy.plugins.entries.push(plugin);
@@ -5497,6 +5582,79 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
         assert_eq!(trust.signing_key_fingerprint, signing_fingerprint);
         assert!(!trust.sandbox_capability.network);
         assert_eq!(trust.sandbox_capability.profile, "restricted");
+
+        std::env::remove_var(public_key_env);
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn enforce_rejects_manifest_lockfile_digest_mismatch_before_execution() {
+        let mut policy = Config::default();
+        policy.plugins.enabled = true;
+        policy.plugins.signature.required = true;
+        let public_key_env = format!(
+            "PATCHGATE_PLUGIN_PUBLIC_KEY_TEST_LOCK_BINDING_{}",
+            std::process::id()
+        );
+        policy.plugins.signature.public_key_env = public_key_env.clone();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "patchgate-plugin-manifest-lock-mismatch-{}",
+            current_unix_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        let marker = temp_root.join("plugin-ran");
+        let plugin_path = temp_root.join("plugin.sh");
+        std::fs::write(
+            &plugin_path,
+            format!(
+                "#!/usr/bin/env sh\ncat >/dev/null\ntouch '{}'\necho '{{\"findings\":[],\"diagnostics\":[]}}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write plugin");
+        chmod_executable(plugin_path.as_path());
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[35u8; 32]);
+        let public_key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
+        std::env::set_var(public_key_env.as_str(), public_key_b64);
+
+        let mut plugin = patchgate_config::PluginEntry {
+            id: "lock-mismatch".to_string(),
+            command: plugin_path.to_string_lossy().to_string(),
+            args: Vec::new(),
+            timeout_ms: 3_000,
+            fail_mode: "fail_open".to_string(),
+            signature_path: String::new(),
+            manifest_path: String::new(),
+        };
+        let (manifest_path, _lockfile_path, _fingerprint) = write_signed_manifest_and_lock(
+            &temp_root,
+            &mut policy,
+            &plugin,
+            &signing_key,
+            "0.1.0",
+            false,
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+        plugin.manifest_path = manifest_path.to_string_lossy().to_string();
+        policy.plugins.entries.push(plugin);
+
+        let ctx = Context {
+            repo_root: temp_root.clone(),
+            scope: ScopeMode::Worktree,
+        };
+        let runner = Runner::new(policy);
+        let err = runner
+            .evaluate(&ctx, plugin_test_diff("lockfile-mismatch"), "enforce")
+            .expect_err("manifest lockfile digest mismatch must not run");
+        assert!(format!("{err:#}").contains("lockfile digest mismatch"));
+        assert!(
+            !marker.exists(),
+            "lock-mismatch plugin must not be executed"
+        );
 
         std::env::remove_var(public_key_env);
         let _ = std::fs::remove_dir_all(temp_root);
@@ -5549,6 +5707,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             &signing_key,
             "0.1.0",
             false,
+            None,
         );
         plugin.manifest_path = manifest_path.to_string_lossy().to_string();
         std::fs::write(
@@ -5628,6 +5787,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             &signing_key,
             "0.1.0",
             true,
+            None,
         );
         plugin.manifest_path = manifest_path.to_string_lossy().to_string();
         policy.plugins.entries.push(plugin);
@@ -5700,6 +5860,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,
             &signing_key,
             "0.1.0",
             false,
+            None,
         );
         plugin.manifest_path = manifest_path.to_string_lossy().to_string();
         policy

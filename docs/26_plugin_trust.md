@@ -21,7 +21,7 @@ write_paths = []
 
 [artifacts]
 main = "sha256:..."
-lockfile = ""
+lockfile = "sha256:..."
 
 [producer]
 kind = "scanner-adapter"
@@ -33,6 +33,8 @@ signature = "base64:..."
 ```
 
 The signature covers the manifest fields that define execution identity: id, version, entrypoint, runtime, artifact digests, permissions, producer output schema, and key id. The `signature.signature` value itself is excluded from the signed payload.
+
+`artifacts.lockfile` is the digest of the canonical lock entry binding: lockfile schema version, plugin id, plugin version, source, and signing key fingerprint. Runtime also verifies the concrete `manifest_digest` in `patchgate-plugin.lock`, which avoids a circular manifest-to-lockfile hash while still binding the signed manifest to the lock material.
 
 ## Lockfile
 
@@ -53,7 +55,7 @@ The signature covers the manifest fields that define execution identity: id, ver
 }
 ```
 
-In `enforce` mode, the lockfile must contain the plugin id, version, manifest digest, and signing key fingerprint that were verified at runtime.
+In `enforce` mode, the lockfile must contain the plugin id, version, manifest digest, source, and signing key fingerprint that were verified at runtime.
 
 ## Permissions
 
